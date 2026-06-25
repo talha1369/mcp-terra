@@ -19,6 +19,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
+import sys
 from urllib.parse import urlparse
 
 import httpx
@@ -85,3 +88,60 @@ def send_slack(text: str, blocks: list | None = None) -> dict:
         raise NotifyError(
             f"Slack post rejected: HTTP {resp.status_code} {resp.text[:150]!r}")
     return {"sent": True, "transport": "slack-webhook"}
+
+
+# ── macOS Notification Center (local, no network) ───────────────────────────
+
+# AppleScript run once with argv passed as PARAMETERS — the title/message are
+# never interpolated into the script source, so they cannot inject AppleScript.
+_OSA_SCRIPT = (
+    "on run {t, m, s}\n"
+    "  if s is \"\" then\n"
+    "    display notification m with title t\n"
+    "  else\n"
+    "    display notification m with title t subtitle s\n"
+    "  end if\n"
+    "end run"
+)
+
+
+def macos_notifications_available() -> bool:
+    """True iff a macOS desktop notification can be posted (darwin + osascript)."""
+    return sys.platform == "darwin" and shutil.which("osascript") is not None
+
+
+def _clean_notif(s: str, n: int) -> str:
+    """Strip control chars (incl. newlines) and cap length for a notification."""
+    cleaned = "".join(ch for ch in (s or "") if 0x20 <= ord(ch) and ord(ch) != 0x7f)
+    return cleaned[:n]
+
+
+def send_macos_notification(title: str, message: str, *, subtitle: str = "") -> dict:
+    """Post a macOS Notification Center alert. Local only — no network, no data.
+
+    Returns {sent, transport} on success, {sent: False, reason} off-macOS or if
+    osascript is missing. Raises NotifyError on an osascript failure. Strings
+    are control-char-stripped, length-capped, and passed to osascript as ARGV
+    (never interpolated → no AppleScript injection).
+    """
+    if sys.platform != "darwin":
+        return {"sent": False, "reason": "macOS notifications only available on darwin"}
+    osa = shutil.which("osascript")
+    if not osa:
+        return {"sent": False, "reason": "osascript not found on PATH"}
+
+    t = _clean_notif(title, 120) or "mcp-terra"
+    m = _clean_notif(message, 500)
+    s = _clean_notif(subtitle, 200)
+    if not m:
+        raise NotifyError("notification message is empty after sanitization")
+    try:
+        r = subprocess.run([osa, "-e", _OSA_SCRIPT, t, m, s],
+                           capture_output=True, timeout=15, check=False)
+    except subprocess.TimeoutExpired:
+        raise NotifyError("osascript timed out")
+    if r.returncode != 0:
+        raise NotifyError(
+            f"osascript failed (rc {r.returncode}): "
+            f"{r.stderr.decode('utf-8', 'replace')[:200]}")
+    return {"sent": True, "transport": "macos-notification"}

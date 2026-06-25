@@ -2391,6 +2391,37 @@ def terra_notify_slack(text: str, run_id: str = "") -> str:
     return _ok(result)
 
 
+@server.tool(title="Send a macOS desktop notification (completion ping)",
+             annotations=ANN_WRITE_NEW)
+def terra_notify_desktop(title: str, text: str, run_id: str = "") -> str:
+    """Post a macOS Notification Center alert on the user's machine — a local,
+    no-network completion ping (alternative/complement to Slack + email).
+
+    *** WRITE-SAFE — local UI side-effect only (no network, no data write). ***
+
+    Off macOS, returns {sent: false, reason}. Title/text are control-char
+    stripped and length-capped, and passed to osascript as ARGV (never
+    interpolated into AppleScript), so they cannot inject script.
+
+    Args:
+        title: short notification title (<=120 chars).
+        text: notification body (<=500 chars; compose from the run record).
+        run_id: optional run id, shown as the subtitle + audit detail.
+    """
+    if not text or not text.strip():
+        raise ValueError("text is empty")
+    if run_id:
+        safety.validate_identifier(run_id, "run_id")
+    _pre("terra_notify_desktop", WRITE_SAFE, f"desktop ping run_id={run_id or '-'}")
+    try:
+        result = nt.send_macos_notification(
+            title or "mcp-terra", text,
+            subtitle=(f"run {run_id}" if run_id else ""))
+    except nt.NotifyError as e:
+        raise RuntimeError(str(e))
+    return _ok(result)
+
+
 @server.tool(title="Register a WDL as an Agora method", annotations=ANN_WRITE_NEW)
 def terra_register_method(method_namespace: str, method_name: str,
                           wdl: str, synopsis: str = "") -> str:
@@ -2516,11 +2547,12 @@ def terra_render_audio_summary(job_id: str, bucket_uri: str,
             "concrete evidence the verifier cross-checked (e.g. specific "
             "runner.stderr lines, traceback excerpts, output cells)."
         )
-    if not audio_summary.is_configured():
+    if not (audio_summary.is_configured() or audio_summary.say_available()):
         raise PermissionError(
-            "Gemini TTS not configured. Set GEMINI_API_KEY (or "
-            "GOOGLE_API_KEY) and restart the MCP. Get a free key at "
-            "https://aistudio.google.com/apikey."
+            "No audio backend available. Cloud TTS uses your gcloud "
+            "credentials (run `gcloud auth application-default login` and "
+            "enable texttospeech.googleapis.com); or run on macOS where the "
+            "local `say` fallback works with no setup."
         )
 
     _pre("terra_render_audio_summary", WRITE_SAFE,
@@ -2533,15 +2565,19 @@ def terra_render_audio_summary(job_id: str, bucket_uri: str,
         # workspace's google project; overridable via MCP_TERRA_TTS_QUOTA_PROJECT.
         _lock = policy.resolve_locked_workspace()
         _qp = (_lock or {}).get("googleProject", "") if isinstance(_lock, dict) else ""
-        audio_bytes = audio_summary.synthesize(
-            summary_text, voice_name=voice_name or None, quota_project=_qp,
+        import os as _os_audio
+        _backend = _os_audio.environ.get("MCP_TERRA_TTS_BACKEND", "auto")
+        audio_bytes, _ext, _backend_used = audio_summary.render(
+            summary_text, voice_name=voice_name or "", quota_project=_qp,
+            backend=_backend,
         )
     except audio_summary.AudioSummaryError as e:
         raise PermissionError(safety.sanitize_output(str(e)))
 
-    # Upload to GCS with no-clobber (file path includes job_id; UUID-collision ~0)
+    # Upload to GCS with no-clobber (file path includes job_id; UUID-collision ~0).
+    # Extension tracks the backend: .mp3 (Cloud TTS) or .m4a (macOS say).
     paths = nbr.job_gcs_paths(bucket_uri, job_id)
-    audio_gcs = f"{paths['spec'].rsplit('/', 1)[0]}/summary.mp3"
+    audio_gcs = f"{paths['spec'].rsplit('/', 1)[0]}/summary.{_ext}"
     if safety.bucket_object_exists(audio_gcs):
         raise safety.SafetyError(
             f"audio already exists at {audio_gcs!r}. The MCP refuses to "
@@ -2550,7 +2586,7 @@ def terra_render_audio_summary(job_id: str, bucket_uri: str,
     # Write bytes to a temp file then gsutil cp -n (no-clobber).
     import tempfile as _tf
     import os as _os
-    fd, tmp = _tf.mkstemp(prefix="mcp_audio_", suffix=".mp3")
+    fd, tmp = _tf.mkstemp(prefix="mcp_audio_", suffix=f".{_ext}")
     try:
         with _os.fdopen(fd, "wb") as fh:
             fh.write(audio_bytes)
@@ -2561,12 +2597,14 @@ def terra_render_audio_summary(job_id: str, bucket_uri: str,
 
     return _ok({
         "audio_gcs": audio_gcs,
-        "voice": voice_name or audio_summary._TTS_VOICE,
-        "model": audio_summary._TTS_MODEL,
+        "backend": _backend_used,
+        "voice": (voice_name or "en-US-Studio-O") if _backend_used == "cloud-tts" else "system",
+        "format": _ext,
         "bytes": len(audio_bytes),
         "text_length": len(summary_text),
-        "hint": ("Pass audio_gcs to terra_send_run_report_email's "
-                 "audio_gcs param to attach + link in the run report email."),
+        "hint": ("Link audio_gcs in the run report email/Slack/desktop ping. "
+                 "Cloud TTS gives Studio-quality .mp3 once IAM is granted; the "
+                 "macOS `say` fallback produces .m4a locally with no setup."),
     })
 
 

@@ -185,3 +185,91 @@ def synthesize(text: str, *, voice_name: str = "en-US-Studio-O",
             f"TTS returned suspiciously short audio ({len(audio)} bytes)"
         )
     return audio
+
+
+# ── Local fallback: macOS `say` (no cloud, no IAM) ──────────────────────────
+
+def say_available() -> bool:
+    """True iff the macOS `say` command is usable (darwin + on PATH)."""
+    import shutil
+    import sys
+    return sys.platform == "darwin" and shutil.which("say") is not None
+
+
+def synthesize_say(text: str, *, voice: str = "") -> bytes:
+    """Render `text` to .m4a (AAC) bytes using the macOS `say` command.
+
+    A zero-dependency local fallback when Cloud TTS isn't authorized: no API,
+    no IAM, no network. Same text-safety gate as the cloud path. The text is
+    passed to `say` as an ARGV element (never via a shell), so it cannot inject
+    a command. Returns m4a bytes.
+    """
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
+
+    _validate_text(text)
+    safe_text = safety.sanitize_output(text)
+    if sys.platform != "darwin":
+        raise AudioSummaryError("macOS `say` backend is only available on macOS")
+    say_bin = shutil.which("say")
+    if not say_bin:
+        raise AudioSummaryError("`say` not found on PATH")
+
+    fd, tmp = tempfile.mkstemp(prefix="mcp_say_", suffix=".m4a")
+    os.close(fd)
+    try:
+        args = [say_bin, "-o", tmp]
+        if voice:
+            args += ["-v", voice]
+        args.append(safe_text)          # ARGV — no shell, no injection
+        try:
+            r = subprocess.run(args, capture_output=True, timeout=120, check=False)
+        except subprocess.TimeoutExpired:
+            raise AudioSummaryError("`say` timed out")
+        if r.returncode != 0:
+            raise AudioSummaryError(
+                f"`say` failed (rc {r.returncode}): "
+                f"{r.stderr.decode('utf-8', 'replace')[:200]}")
+        with open(tmp, "rb") as fh:
+            audio = fh.read()
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+    if len(audio) < 100:
+        raise AudioSummaryError(
+            f"`say` produced suspiciously short audio ({len(audio)} bytes)")
+    if len(audio) > _MAX_AUDIO_BYTES:
+        raise AudioSummaryError(
+            f"`say` produced {len(audio)} bytes (> {_MAX_AUDIO_BYTES} cap)")
+    return audio
+
+
+def render(text: str, *, voice_name: str = "", quota_project: str = "",
+           backend: str = "auto") -> tuple[bytes, str, str]:
+    """Render audio, choosing a backend. Returns (audio_bytes, ext, backend_used).
+
+    backend:
+      • 'auto'  — try Cloud TTS (Studio quality); on ANY failure (e.g. the IAM
+                  403), fall back to macOS `say` when available.
+      • 'cloud' — Cloud TTS only (raises if unavailable).
+      • 'say'   — macOS `say` only (local).
+    """
+    backend = (backend or "auto").lower()
+    if backend == "say":
+        return synthesize_say(text), "m4a", "macos-say"
+    if backend == "cloud":
+        return (synthesize(text, voice_name=voice_name or None,
+                           quota_project=quota_project), "mp3", "cloud-tts")
+    # auto
+    try:
+        return (synthesize(text, voice_name=voice_name or None,
+                           quota_project=quota_project), "mp3", "cloud-tts")
+    except AudioSummaryError:
+        if say_available():
+            return synthesize_say(text), "m4a", "macos-say"
+        raise
