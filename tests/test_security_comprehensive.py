@@ -2580,7 +2580,8 @@ _GOOD_REC = {
 @case("CC-RunRecord", "build_record stamps schema/type/version + derived counts")
 def _():
     rec = _rr.build_record(_GOOD_REC, mcp_version="9.9.9",
-                           module_hashes={"a.py": "h1", "b.py": "h2"})
+                           module_hashes={"a.py": "h1", "b.py": "h2"},
+                           user_email="u@x.org")
     assert rec["_schema_version"] == _rr.SCHEMA_VERSION
     assert rec["record_type"] == "mcp_terra_run_record"
     assert rec["agent"]["mcp_version"] == "9.9.9"
@@ -2593,7 +2594,7 @@ def _():
 def _():
     forged = dict(_GOOD_REC, agent={"mcp_version": "evil", "code_integrity_digest": "sha256:forged"})
     rec = _rr.build_record(forged, mcp_version="1.2.3",
-                           module_hashes={"a.py": "real"})
+                           module_hashes={"a.py": "real"}, user_email="u@x.org")
     assert rec["agent"]["mcp_version"] == "1.2.3", "must overwrite forged version"
     assert rec["agent"]["code_integrity_digest"] != "sha256:forged", "must recompute digest"
 
@@ -2602,6 +2603,7 @@ def _():
 def _():
     rec = _rr.build_record(dict(_GOOD_REC, workspace={"namespace": "FORGED"}),
                            mcp_version="1", module_hashes={"a.py": "h"},
+                           user_email="u@x.org",
                            workspace={"namespace": "ns", "name": "ws",
                                       "googleProject": "proj", "bucketName": "fc-secure-x"})
     assert rec["workspace"]["namespace"] == "ns", "lock workspace must win"
@@ -2783,6 +2785,100 @@ def _():
 
     # 4) The persistent disk is never deletable — no runtime-delete primitive.
     assert not hasattr(_tc, "leo_delete_runtime")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# CC-CodexFixes — regressions for the 6 findings from the adversarial review
+# ──────────────────────────────────────────────────────────────────────────
+import os as _os_cf
+import tempfile as _tf_cf
+
+
+@case("CC-CodexFixes", "F1[critical] write-policy refuses blocked paths exist-independently")
+def _():
+    for p in ("~/.ssh/id_rsa", "~/.zshrc", "/etc/passwd",
+              "~/Library/LaunchAgents/eve.plist", "~/.aws/credentials"):
+        must_raise(safety.assert_local_write_policy, safety.SafetyError, p)
+
+
+@case("CC-CodexFixes", "F1[critical] write-policy refuses symlink + non-regular node")
+def _():
+    d = _tf_cf.mkdtemp(prefix="mcp_cf_")
+    link = _os_cf.path.join(d, "link")
+    _os_cf.symlink("/tmp", link)
+    must_raise(safety.assert_local_write_policy, safety.SafetyError, link)
+    fifo = _os_cf.path.join(d, "fifo")
+    try:
+        _os_cf.mkfifo(fifo)
+        must_raise(safety.assert_local_write_policy, safety.SafetyError, fifo)
+    except AttributeError:
+        pass  # os.mkfifo unavailable (non-POSIX) — symlink case still covered
+
+
+@case("CC-CodexFixes", "F1[critical] write-policy allows a normal non-existent temp path")
+def _():
+    d = _tf_cf.mkdtemp(prefix="mcp_cf_")
+    out = safety.assert_local_write_policy(_os_cf.path.join(d, "ok.txt"))
+    assert str(out).endswith("ok.txt")
+
+
+@case("CC-CodexFixes", "F1[critical] download tool runs write-policy BEFORE the existence branch")
+def _():
+    import inspect
+    src = inspect.getsource(server.terra_download_from_bucket)
+    assert "assert_local_write_policy(local_path)" in src
+    pre = src.split("target_exists =")[0]
+    assert "assert_local_write_policy(local_path)" in pre, \
+        "policy check must run before/independent of version_existing branch"
+
+
+@case("CC-CodexFixes", "F2[high] audio text fails closed on a non-Google secret shape")
+def _():
+    from mcp_terra import audio_summary as _as
+    text = ("Run summary: the analysis finished cleanly, and here is an "
+            "embedded AKIAIOSFODNN7EXAMPLE that the scanner must refuse.")
+    must_raise(_as._validate_text, _as.AudioSummaryError, text)
+
+
+@case("CC-CodexFixes", "F3[high] build_record drops caller-forged agent identity")
+def _():
+    forged = dict(_GOOD_REC, agent={"terra_user_email": "attacker@evil.com",
+                                    "terra_user_subject_id": "forged",
+                                    "mcp_version": "evil"})
+    rec = _rr.build_record(forged, mcp_version="1.2.3",
+                           module_hashes={"a.py": "h"}, user_email="real@x.org")
+    assert rec["agent"]["terra_user_email"] == "real@x.org", "forged email must be dropped"
+    assert rec["agent"]["mcp_version"] == "1.2.3"
+    assert "terra_user_subject_id" not in rec["agent"], "forged subject_id must be dropped"
+
+
+@case("CC-CodexFixes", "F3[high] build_record fails closed when identity unresolved")
+def _():
+    must_raise(_rr.build_record, _rr.RunRecordError, _GOOD_REC,
+               mcp_version="1", module_hashes={"a.py": "h"}, user_email="")
+
+
+@case("CC-CodexFixes", "F4[med] write_run_record binds embedded run_id to the path arg")
+def _():
+    import inspect
+    src = inspect.getsource(server.terra_write_run_record)
+    assert "!= run_id" in src and 'record_in["run_id"] = run_id' in src
+
+
+@case("CC-CodexFixes", "F5[med] write_run_record unlinks its temp blob in finally")
+def _():
+    import inspect
+    src = inspect.getsource(server.terra_write_run_record)
+    assert "finally:" in src and "unlink(tmp)" in src
+
+
+@case("CC-CodexFixes", "F6[med] write_run_record preflights no-clobber before upload")
+def _():
+    import inspect
+    src = inspect.getsource(server.terra_write_run_record)
+    assert "bucket_object_exists(dest)" in src
+    assert src.index("bucket_object_exists(dest)") < src.index("bk.upload_file(tmp"), \
+        "no-clobber preflight must precede the upload"
 
 
 # ──────────────────────────────────────────────────────────────────────────

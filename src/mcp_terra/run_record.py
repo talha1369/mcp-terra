@@ -69,13 +69,21 @@ def build_record(record_in: dict, *, mcp_version: str,
     rec["_schema_version"] = SCHEMA_VERSION
     rec["record_type"] = RECORD_TYPE
 
-    # ── provenance: agent identity + code integrity (authoritative) ──
-    agent = dict(rec.get("agent") or {})
-    agent["mcp_version"] = mcp_version
-    agent["code_integrity_digest"] = code_integrity_digest(module_hashes)
-    if user_email:
-        agent["terra_user_email"] = user_email
-    rec["agent"] = agent
+    # ── provenance: agent identity + code integrity (authoritative ONLY) ──
+    # Build the agent block from scratch from TRUSTED inputs. The caller's
+    # `agent` object (if any) is DROPPED ENTIRELY so terra_user_email,
+    # subject_id, mcp_version, or the integrity digest can never be forged.
+    # Identity must be resolved — fail closed rather than write an
+    # unverifiable "who". (Codex high finding.)
+    if not user_email:
+        raise RunRecordError(
+            "cannot resolve the authenticated Terra user; refusing to write a "
+            "provenance record with an unverifiable agent identity.")
+    rec["agent"] = {
+        "mcp_version": mcp_version,
+        "code_integrity_digest": code_integrity_digest(module_hashes),
+        "terra_user_email": user_email,
+    }
 
     # ── workspace: from the lock, authoritative (overwrites any caller value) ──
     if workspace:

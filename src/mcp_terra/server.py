@@ -904,7 +904,12 @@ def terra_download_from_bucket(bucket_uri: str, local_path: str,
     from pathlib import Path
     target = Path(local_path).expanduser()
     target = (Path.cwd() / target if not target.is_absolute() else target).resolve(strict=False)
-    # Validate (without side effects) BEFORE the _pre() gate.
+    # SECURITY (Codex critical): enforce the write path-policy ALWAYS — blocklist,
+    # credentials/persistence dirs, symlink, non-regular node — regardless of
+    # whether the target exists. version_existing must NEVER be an escape hatch
+    # that renames or overwrites a blocked target (e.g. ~/.ssh/id_rsa) or a
+    # symlink/device. This runs BEFORE any side effect and before the _pre gate.
+    safety.assert_local_write_policy(local_path)
     target_exists = target.exists()
     if target_exists and (not version_existing or recursive):
         raise safety.SafetyError(
@@ -914,8 +919,8 @@ def terra_download_from_bucket(bucket_uri: str, local_path: str,
             f"Or delete the existing path manually outside the MCP."
         )
     if not target_exists:
-        # Normal validation (also catches blocklist paths). This raises if
-        # parent missing or path is blocked.
+        # Adds the parent-exists + no-overwrite guards on top of the policy
+        # checks already enforced above.
         safety.safe_local_write_path(local_path)
     action_detail = (
         f"{bucket_uri} → {local_path}  recursive={recursive}"
@@ -2323,6 +2328,17 @@ def terra_write_run_record(run_id: str, record_json: str,
         record_in = json.loads(record_json)
     except json.JSONDecodeError as e:
         raise ValueError(f"record_json is not valid JSON: {e}")
+    if not isinstance(record_in, dict):
+        raise ValueError("record_json must be a JSON object")
+    # Bind the record's identity to the path it is stored under: a record under
+    # mcp_terra_jobs/<run_id>/ must describe THAT run. Refuse a mismatch loudly
+    # rather than let run A's path hold run B's content. (Codex finding.)
+    _embedded = record_in.get("run_id")
+    if _embedded is not None and _embedded != run_id:
+        raise ValueError(
+            f"record_json.run_id ({_embedded!r}) != run_id argument ({run_id!r}); "
+            f"the record's identity must match the path it is stored under.")
+    record_in["run_id"] = run_id   # authoritative — path and content always agree
     if not bucket_uri:
         _lock = policy.resolve_locked_workspace()
         if not _lock or not _lock.get("bucketName"):
@@ -2331,10 +2347,14 @@ def terra_write_run_record(run_id: str, record_json: str,
     safety.safe_bucket_uri(bucket_uri)
     _pre("terra_write_run_record", WRITE_SAFE, f"{bucket_uri} run_id={run_id}")
 
+    # Identity must be RESOLVABLE — fail closed rather than persist forgeable
+    # provenance with an unknown "who". (Codex finding: do not swallow auth.)
     try:
         _user_email = auth.get_user_email()
-    except Exception:
-        _user_email = ""
+    except auth.AuthError as e:
+        raise PermissionError(
+            f"cannot resolve the Terra user identity for the run record; "
+            f"provenance must not be forgeable: {e}")
     rec = rr.build_record(
         record_in,
         mcp_version=SERVER_VERSION,
@@ -2352,11 +2372,25 @@ def terra_write_run_record(run_id: str, record_json: str,
             f"refusing to write run record: it contains {len(hits)} "
             f"secret-shaped value(s). Remove credentials from the record.")
     dest = f"{bucket_uri.rstrip('/')}/{nbr.JOBS_PREFIX}/{run_id}/run_record.json"
+    # No-clobber PREFLIGHT: refuse loudly on an existing record rather than let
+    # `gsutil cp -n` silently skip while we report success. Records are
+    # immutable provenance. (Codex finding.)
+    if safety.bucket_object_exists(dest):
+        raise safety.SafetyError(
+            f"run record already exists at {dest!r}. The MCP refuses to "
+            f"overwrite provenance (records are immutable). Use a fresh run_id.")
+    import os as _os_rr
     import tempfile
-    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
-        fh.write(blob)
-        tmp = fh.name
-    bk.upload_file(tmp, dest, recursive=False)
+    fd, tmp = tempfile.mkstemp(prefix="mcp_runrec_", suffix=".json")
+    try:
+        with _os_rr.fdopen(fd, "w") as fh:
+            fh.write(blob)
+        bk.upload_file(tmp, dest, recursive=False)
+    finally:                              # never leave the metadata blob on disk
+        try:
+            _os_rr.unlink(tmp)
+        except OSError:
+            pass
     return _ok({"written": dest, "run_record": rec})
 
 

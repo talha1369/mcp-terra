@@ -34,7 +34,7 @@ import unicodedata
 
 import httpx
 
-from . import auth, safety
+from . import auth, safety, secret_scan
 
 
 class AudioSummaryError(RuntimeError):
@@ -92,6 +92,19 @@ def _validate_text(text: str) -> None:
     if "\r" in text:
         raise AudioSummaryError("summary_text contains CR (refusing).")
     _nfkc_check_token_shape(text)
+    # Full secret scan before this text leaves via TTS / persisted audio — the
+    # ya29 check above only covers Google OAuth tokens. Scan raw AND NFKC-
+    # normalized (homoglyph defense), fail closed on ANY hit (AWS keys, GitHub
+    # PATs, Slack tokens, PEM private keys, …). (Codex high finding.)
+    hits = secret_scan.scan_bytes(text.encode("utf-8"), "audio-summary")
+    normalized = unicodedata.normalize("NFKC", text)
+    if normalized != text:
+        hits = hits + secret_scan.scan_bytes(normalized.encode("utf-8"),
+                                             "audio-summary-nfkc")
+    if hits:
+        raise AudioSummaryError(
+            f"summary_text contains {len(hits)} secret-shaped value(s); "
+            f"refusing to render/persist audio (no secret exfil via TTS).")
 
 
 def synthesize(text: str, *, voice_name: str = "en-US-Studio-O",

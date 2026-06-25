@@ -42,6 +42,7 @@ adversarial review. Highlights:
 | Codex adversarial pass (WDL) | A `deleteIntermediateOutputFiles` parameter could express a destructive intent. | Fixed — parameter removed; value hard-wired `False` at the client layer (CC-WDL). |
 | **Live execution on a real Terra VM** | 6 latent bugs that only surface end-to-end (macOS `gsutil -m` deadlock; lowercase-only spec-filter regex rejecting all job ids; runaway re-exec on result-upload failure; `terra_list_runtimes` filtering on a non-existent label; job stuck at `running`; Cloud-TTS quota-project 403). | All fixed and regression-tested. See CHANGELOG "Fixed". |
 | Two-reviewer publication-readiness review (security engineer + senior SWE) | Doc drift (stale test/tool counts, contradictory `terra_fetch_url` action class, version single-source fiction), missing secret-scanning in CI. | Fixed — counts regenerated from the suite; `terra_fetch_url` annotation reconciled with its gate; `pyproject` version made dynamic from `__init__`; `detect-secrets` added to CI + pre-commit with a committed baseline. |
+| Codex adversarial review (run-record / Slack / desktop / audio changes) | **CRITICAL**: `terra_download_from_bucket(version_existing=True)` skipped the local-path policy when the target existed → could rename/overwrite a blocked target (`~/.ssh/id_rsa`, shell rc, symlink, device). **HIGH**: audio text not secret-scanned before TTS/persist; run-record agent identity still caller-forgeable on auth failure. **MED**: run_id not bound to the record path; temp metadata blob left on disk; run-record no-clobber could report success without persisting. | All fixed — `safety.assert_local_write_policy` now runs regardless of existence (blocklist + symlink + non-regular); audio runs `secret_scan` (raw + NFKC) fail-closed; run-record agent block is built from authoritative data only and fails closed on unresolved identity; embedded run_id bound to the path; temp blob unlinked in `finally`; no-clobber preflight added. 10 regression tests (CC-CodexFixes). |
 
 ## Acknowledged limitations
 
@@ -61,7 +62,7 @@ These are real but either out of scope or fundamentally hard:
 
 ## Comprehensive attack-class coverage (`tests/test_security_comprehensive.py`)
 
-**254/254 tests pass** across 36 attack classes. The table below is generated
+**271/271 tests pass** across 38 attack classes. The table below is generated
 from the suite itself; the test file is the authoritative source. Run yourself:
 
 ```bash
@@ -76,7 +77,7 @@ python tests/test_security_comprehensive.py
 | C-PromptInjection | 9 | ASCII `<\|im_start\|>`, Unicode full-width (U+FF5C), `[INST]`, `<system>`, C0/C1/DEL stripping; newline+tab preserved; output truncation |
 | D-Bucket | 6 | Non-`gs://` scheme, `http://`, non-workspace bucket, empty URI, bare `gs://`, CRLF in bucket URI |
 | E-Policy | 5 | Writes default OFF; ON only with `MCP_TERRA_ALLOW_WRITES=1`; non-truthy stays OFF; rate limiter raises on burst |
-| F-Tools | 3 | No destruction primitive registered; **41 tools** registered exactly; every spend/write tool has the correct action class |
+| F-Tools | 3 | No destruction primitive registered; **42 tools** registered exactly; every spend/write tool has the correct action class |
 | G-Edge | 6 | Valid identifiers accepted; empty/leading-non-alphanum refused; name-length cap; versioned-name shape; `Path(None)` handled |
 | H-Supply | 5 | No `eval`/`exec`/`pickle.load*`/`shell=True` anywhere; dependency upper bounds present |
 | I-Output | 1 | Token-leak defense-in-depth wired into `_ok()` |
@@ -107,6 +108,8 @@ python tests/test_security_comprehensive.py
 | CC-Reads | 10 | fiss-mcp-superset read tools: READ-class, no write/delete, paging clamps, call-tree summary, byte-range read, allowlist, Batch logging command |
 | CC-RunRecord | 6 | Provenance run record: schema/version stamping, derived counts, agent-forged provenance overwritten, workspace from the lock, malformed-record rejection, order-independent integrity digest, secret-scan before persist |
 | CC-Notify | 4 | Slack ping: no-webhook safe return, host/https-locked webhook, secret-shaped payload refused before network, no `url` param (webhook env-locked, anti-exfil) |
+| CC-NoDeleteAttack | 7 | Social-engineering "delete the malware-infected files" request achieves nothing: no delete-capable tool, bucket layer uses only non-destructive verbs, no rmtree/rmdir call, os.unlink only on temp files, no delete primitive on any client layer, LLM-patch validator blocklists destructive tokens, attack has no callable to fulfill it |
+| CC-CodexFixes | 10 | Regressions for the 6 adversarial-review findings: version_existing write-policy bypass (blocked paths / symlink / non-regular, exist-independent), audio secret-scan fail-closed, non-forgeable run-record agent identity (+ fail-closed), run_id↔path binding, temp-blob cleanup, run-record no-clobber preflight |
 
 ## Single-workspace lock (`MCP_TERRA_WORKSPACE`)
 

@@ -363,6 +363,65 @@ def safe_local_write_path(p: str) -> Path:
     return target
 
 
+def assert_local_write_policy(p: str) -> Path:
+    """Enforce the WRITE path-policy (blocklist, credentials/persistence dirs,
+    symlink, non-regular node) on `p` — REGARDLESS of whether it exists, and
+    WITHOUT the no-overwrite/parent-exists guards.
+
+    This is the check that must hold even when a caller opts into
+    `version_existing` (rename-then-write): version_existing must never become
+    an escape hatch that lets the MCP rename or overwrite a blocked target such
+    as ~/.ssh/id_rsa, a shell rc, a LaunchAgent, a symlink, or a device node.
+
+    Checks BOTH the literal (pre-symlink-resolution) absolute path AND the
+    fully-resolved path against the blocklists, so a symlink named like a
+    blocked target (~/.ssh/id_rsa -> /tmp/x) is still refused at its literal
+    location. Returns the resolved Path on success.
+    """
+    import stat as _stat
+    if not p:
+        raise SafetyError("path is empty")
+    _check_path_length(p, "local path")
+    expanded = Path(p).expanduser()
+    if not expanded.is_absolute():
+        expanded = Path.cwd() / expanded
+    try:
+        resolved = expanded.resolve(strict=False)
+    except OSError as e:
+        raise SafetyError(
+            f"path resolution failed for {p!r}: {type(e).__name__}: {e}. "
+            f"The MCP refuses to operate on unresolvable paths.")
+    home = str(Path.home())
+    # Check the literal absolute path AND the resolved path.
+    for candidate in {str(expanded), str(resolved)}:
+        c_norm = _norm(candidate)
+        for prefix in _LOCAL_BLOCKLIST_PREFIXES:
+            if c_norm.startswith(_norm(prefix)):
+                raise SafetyError(
+                    f"destination {candidate!r} is under blocked system prefix "
+                    f"{prefix!r}. version_existing is NOT an override.")
+        for name in _HOME_BLOCKLIST_NAMES:
+            forbidden = str(Path(home) / name)
+            f_norm = _norm(forbidden)
+            if c_norm == f_norm or c_norm.startswith(f_norm + "/"):
+                raise SafetyError(
+                    f"destination {candidate!r} is at/under credentials or "
+                    f"persistence dir {forbidden!r}. version_existing is NOT an "
+                    f"override.")
+    # Refuse a symlink or non-regular node at the LITERAL target — never rename
+    # or overwrite a symlink/device/FIFO/socket.
+    try:
+        lst = expanded.lstat()
+    except (OSError, ValueError):
+        lst = None
+    if lst is not None and not _stat.S_ISDIR(lst.st_mode):
+        if _stat.S_ISLNK(lst.st_mode) or not _stat.S_ISREG(lst.st_mode):
+            raise SafetyError(
+                f"destination {expanded!r} is a symlink or non-regular node "
+                f"(mode {oct(lst.st_mode)}); the MCP refuses to write/rename it.")
+    return resolved
+
+
 # ── Workspace-bucket allowlist ──────────────────────────────────────────────
 
 import threading as _threading

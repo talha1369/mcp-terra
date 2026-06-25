@@ -175,6 +175,25 @@ tests exercise the templates in isolation, so these were latent):
 
 ### Security / invariants
 
+- **Adversarial-review hardening (Codex)** — fixed 6 findings against the
+  run-record / Slack / desktop / audio work:
+  - **CRITICAL** — `terra_download_from_bucket(version_existing=True)` skipped
+    the local-path policy when the target already existed, so it could rename
+    and overwrite a *blocked* target (`~/.ssh/id_rsa`, a shell rc, a symlink, a
+    device node). New `safety.assert_local_write_policy` enforces the blocklist
+    + symlink + non-regular checks **regardless of existence**; `version_existing`
+    is no longer an escape hatch.
+  - **HIGH** — the audio explainer now runs the full secret scanner (raw +
+    NFKC) and fails closed before any TTS/persist (the prior ya29-only check
+    let AWS keys / GitHub PATs / Slack tokens / PEM keys through an external
+    channel); the run-record agent identity is now built from authoritative
+    data only and fails closed on unresolved identity (was caller-forgeable on
+    auth failure).
+  - **MEDIUM** — the run record's embedded `run_id` is bound to its storage
+    path; the local metadata temp blob is unlinked in `finally`; and
+    `terra_write_run_record` does a no-clobber **preflight** so it can't report
+    success while `gsutil cp -n` silently skipped.
+  - Guarded by 10 new regression tests (`CC-CodexFixes`).
 - **No delete primitive, by design** — no tool (and no `leo_delete_runtime`
   at any layer) deletes a runtime or persistent disk; teardown is the user's
   action in the Terra UI ("Keep persistent disk"). The MCP detects a
