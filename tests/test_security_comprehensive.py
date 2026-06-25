@@ -38,6 +38,25 @@ policy._audit_prev_hash = None
 policy._killed_flag = False
 policy._killed_reason = None
 
+# ── Hermetic test setup (must pass on a fresh CI runner with no gcloud ADC
+#    and no knowledge of the checkout path) ────────────────────────────────
+REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO = str(REPO_ROOT)
+
+import mcp_terra.auth as _auth
+# Offline default token so validation/behaviour tests reach their logic
+# without real gcloud credentials. Tests that exercise auth/email specifics
+# override these locally and restore them; none depend on the real token
+# raising. Deliberately NOT a `ya29.` shape so it isn't a secret-scan hit.
+_auth.get_access_token = lambda: "offline-test-token-not-a-real-credential"
+
+import mcp_terra.terra_client as _tc_mod
+# Hermetic workspace-bucket allowlist: never hit Rawls during tests. An empty
+# list means EVERY well-formed bucket is correctly refused (not in any of the
+# user's workspaces) — which is exactly what every `safe_bucket_uri` test
+# asserts. Tests that need a specific Rawls response stub `_request` locally.
+_tc_mod.rawls_list_workspaces = lambda *a, **k: []
+
 
 PASS, FAIL = "✓", "✘"
 results: list[tuple[str, str, bool, str]] = []  # (group, test, passed, detail)
@@ -149,10 +168,17 @@ def _():
 
 @case("B-Path", "case-insensitive bypass ~/.SSH/id_rsa (macOS)")
 def _():
+    # Only meaningful on a case-insensitive FS (macOS/Windows). On Linux,
+    # `~/.SSH` is genuinely a different file from `~/.ssh`, so the read-path
+    # guard correctly does NOT treat it as the SSH key — skip there.
+    if sys.platform not in ("darwin", "win32"):
+        return
     must_raise(safety.safe_local_read_path, safety.SafetyError, "~/.SSH/id_rsa")
 
 @case("B-Path", "case-insensitive bypass ~/.SsH/id_rsa")
 def _():
+    if sys.platform not in ("darwin", "win32"):
+        return
     must_raise(safety.safe_local_read_path, safety.SafetyError, "~/.SsH/id_rsa")
 
 @case("B-Path", "block ~/.aws/credentials")
@@ -188,12 +214,12 @@ def _():
 @case("B-Path", "write-path overwrite refused (existing file)")
 def _():
     must_raise(safety.safe_local_write_path, safety.SafetyError,
-               "/Users/trehman/projects/mcp-terra/README.md")
+               f"{REPO}/README.md")
 
 @case("B-Path", "write to missing parent dir refused")
 def _():
     must_raise(safety.safe_local_write_path, safety.SafetyError,
-               "/Users/trehman/this_does_not_exist_xyz/file.txt")
+               f"{REPO}/this_does_not_exist_xyz/file.txt")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -451,7 +477,7 @@ def _():
 @case("H-Supply", "no eval() anywhere in mcp_terra source")
 def _():
     import glob
-    for f in glob.glob("/Users/trehman/projects/mcp-terra/src/mcp_terra/*.py"):
+    for f in glob.glob(f"{REPO}/src/mcp_terra/*.py"):
         src = open(f).read()
         # `eval(` would be the call; allow harmless strings like 'evaluation'
         for ln_no, ln in enumerate(src.splitlines(), 1):
@@ -463,7 +489,7 @@ def _():
 def _():
     import glob
     import re
-    for f in glob.glob("/Users/trehman/projects/mcp-terra/src/mcp_terra/*.py"):
+    for f in glob.glob(f"{REPO}/src/mcp_terra/*.py"):
         src = open(f).read()
         for ln_no, ln in enumerate(src.splitlines(), 1):
             if re.search(r"\bexec\(", ln) and not ln.strip().startswith("#"):
@@ -472,7 +498,7 @@ def _():
 @case("H-Supply", "no pickle.load anywhere")
 def _():
     import glob
-    for f in glob.glob("/Users/trehman/projects/mcp-terra/src/mcp_terra/*.py"):
+    for f in glob.glob(f"{REPO}/src/mcp_terra/*.py"):
         src = open(f).read()
         assert "pickle.load" not in src, f"pickle.load in {f}"
         assert "pickle.loads" not in src, f"pickle.loads in {f}"
@@ -480,13 +506,13 @@ def _():
 @case("H-Supply", "no shell=True in subprocess calls")
 def _():
     import glob
-    for f in glob.glob("/Users/trehman/projects/mcp-terra/src/mcp_terra/*.py"):
+    for f in glob.glob(f"{REPO}/src/mcp_terra/*.py"):
         src = open(f).read()
         assert "shell=True" not in src, f"shell=True in {f}"
 
 @case("H-Supply", "dependency upper bounds present")
 def _():
-    toml = open("/Users/trehman/projects/mcp-terra/pyproject.toml").read()
+    toml = open(f"{REPO}/pyproject.toml").read()
     assert "<2.0.0" in toml and "<1.0.0" in toml and "<3.0" in toml
 
 
@@ -1081,17 +1107,17 @@ def _():
 @case("T-Docker", "Dockerfile exists at project root")
 def _():
     from pathlib import Path
-    assert (Path("/Users/trehman/projects/mcp-terra/Dockerfile")).exists()
+    assert (Path(f"{REPO}/Dockerfile")).exists()
 
 @case("T-Docker", "Dockerfile uses non-root USER")
 def _():
-    txt = open("/Users/trehman/projects/mcp-terra/Dockerfile").read()
+    txt = open(f"{REPO}/Dockerfile").read()
     assert "USER mcp" in txt
     assert "useradd" in txt and "uid 10001" in txt.lower() or "uid=10001" in txt.lower() or "--uid 10001" in txt
 
 @case("T-Docker", "Dockerfile sets read-only env defaults")
 def _():
-    txt = open("/Users/trehman/projects/mcp-terra/Dockerfile").read()
+    txt = open(f"{REPO}/Dockerfile").read()
     assert "MCP_TERRA_ALLOW_WRITES=0" in txt
 
 @case("T-Docker", "policy.harden_process_runtime exists and refuses root")
