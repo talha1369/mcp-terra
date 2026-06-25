@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 🔒 Report a security vulnerability
+    url: https://github.com/talha1369/mcp-terra/security/advisories/new
+    about: >-
+      Do NOT open a public issue for security problems. Email
+      trehman@broadinstitute.org with "[mcp-terra security]" in the subject,
+      or use GitHub private vulnerability reporting. See SECURITY.md.
+  - name: 💬 Question / usage help
+    url: https://github.com/talha1369/mcp-terra/discussions
+    about: Ask usage questions in Discussions (adjust org/repo if it moves).

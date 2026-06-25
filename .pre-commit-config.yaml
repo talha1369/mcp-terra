@@ -1,0 +1,40 @@
+# Pre-commit hooks for mcp-terra.
+#
+# Install once:   pip install pre-commit && pre-commit install
+# Run on demand:  pre-commit run --all-files
+#
+# These mirror the CI gates so problems are caught BEFORE they ever reach a
+# commit — most importantly, a credential can never enter git history locally.
+# Hook versions are pinned (rev:) for reproducibility, matching the CI tool
+# versions.
+repos:
+  # ── Secret scanning (the most important local gate) ──────────────────────
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        name: detect-secrets (block credentials)
+        args: ["--baseline", ".secrets.baseline"]
+        # The baseline acknowledges intentional test fixtures; any NEW
+        # secret-shaped string fails the commit.
+
+  # ── Lint (matches CI: ruff 0.7.4) ────────────────────────────────────────
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.7.4
+    hooks:
+      - id: ruff
+        name: ruff (lint)
+        args: ["--fix"]
+
+  # ── Hygiene basics ───────────────────────────────────────────────────────
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+      - id: check-yaml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: detect-private-key

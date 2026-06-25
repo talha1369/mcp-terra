@@ -1,0 +1,72 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+*.eggs/
+.eggs/
+build/
+dist/
+sdist/
+wheels/
+share/python-wheels/
+*.manifest
+*.spec
+MANIFEST
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# Type checkers / linters
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# MCP runtime state (NEVER commit — contains report .eml files which may
+# include traceback / variable values from notebook executions)
+.mcp-terra/
+~/.mcp-terra/
+
+# Secrets / local config — do NOT commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+service-account*.json
+
+# Build / packaging artifacts that piptools or build leave around
+.pip-cache/
+node_modules/
+
+# Claude Code machine-local state — do NOT commit (records per-machine
+# permission grants + command history; noise/leak risk in a public repo).
+# NOTE: .claude/skills/ IS part of the project and is intentionally tracked.
+.claude/settings.local.json

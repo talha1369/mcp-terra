@@ -1,0 +1,54 @@
+[project]
+name = "mcp-terra"
+# Version is the SINGLE source of truth in src/mcp_terra/__init__.py
+# (`__version__`). `dynamic` makes the build read it from there so the package
+# metadata, the MCP serverInfo.version, and the schema version can never drift.
+dynamic = ["version"]
+description = "MCP server exposing Terra (terra.bio) workspace + runtime operations to Claude agents and other MCP clients."
+authors = [{ name = "Talha Rehman", email = "trehman@broadinstitute.org" }]
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    # Bounded ranges so a surprise major bump doesn't introduce breakage or
+    # an unvetted transitive dep with a fresh CVE. Re-bump these knowingly.
+    "mcp>=1.0.0,<2.0.0",
+    "httpx>=0.27.0,<1.0.0",
+    "pydantic>=2.0,<3.0",
+]
+
+[project.scripts]
+mcp-terra = "mcp_terra.server:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = { attr = "mcp_terra.__version__" }
+
+[tool.ruff]
+target-version = "py310"
+# src/ and tests/ are the only first-party trees; nothing else is linted.
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# The default rule set (pyflakes `F` + a curated pycodestyle `E`/`W` subset)
+# stays ON — it catches real defects (dead imports, undefined names, unused
+# variables). We disable ONLY three cosmetic rules that conflict with the
+# project's deliberate, consistent house style; everything else still fails CI.
+ignore = [
+    # E701/E702 — the codebase intentionally uses single-line guard clauses
+    # (`if not x: return ...`) and compact `a = 1; b = 2` fixtures in tests.
+    # This is applied consistently and is more readable here than the
+    # multi-line expansion; it is a style choice, not a lint we are hiding.
+    "E701",
+    "E702",
+    # E402 — several modules intentionally place a narrowly-scoped import
+    # directly above its first use (e.g. `import re as _re` next to the regex
+    # it compiles), after a section banner. This "import near use" layout is
+    # deliberate; the imports are still module-level and side-effect-free.
+    "E402",
+]
