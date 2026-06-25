@@ -9,6 +9,26 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **Consolidated run record + multi-channel completion delivery, with a
+  metadata spec.** A completed run now produces ONE provenance-bearing record
+  (`mcp_terra_jobs/<run_id>/run_record.json`) that the email, Slack, and audio
+  channels all render from — so the channels agree and the verifier gate covers
+  all three at once.
+  - **`docs/metadata.md`** — v1 run-record schema, projecting W3C PROV-O,
+    RO-Crate-lite, Dublin Core / schema.org / Bioschemas, and GA4GH; with
+    integrity, sensitivity-classification, and schema-versioning rules.
+  - **`terra_write_run_record`** — the agent supplies the descriptive body; the
+    MCP STAMPS the un-forgeable provenance (schema version, MCP version +
+    code-integrity digest, the authenticated user, the locked workspace, the
+    audit-chain head), secret-scans it, and writes it no-clobber.
+  - **`terra_notify_slack`** — a second completion ping alongside email. The
+    webhook is hard-locked to `MCP_TERRA_SLACK_WEBHOOK` (no `url` parameter, so
+    it can't post to an arbitrary host); host/https-validated; the payload is
+    secret-scanned before send.
+  - **Audio explainer** stays `terra_render_audio_summary` (Cloud TTS, with the
+    `X-Goog-User-Project` quota-project header) — render "what the results mean"
+    from the run record's verified `results[]`.
+
 - **Read-only superset of `broadinstitute/fiss-mcp`** — nine new READ-class
   tools (no spend, no write, no destruction) close fiss-mcp's read-side lead so
   this MCP is a strict superset of its reads (it already exceeds fiss-mcp on

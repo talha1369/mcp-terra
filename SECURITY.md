@@ -61,7 +61,7 @@ These are real but either out of scope or fundamentally hard:
 
 ## Comprehensive attack-class coverage (`tests/test_security_comprehensive.py`)
 
-**244/244 tests pass** across 34 attack classes. The table below is generated
+**254/254 tests pass** across 36 attack classes. The table below is generated
 from the suite itself; the test file is the authoritative source. Run yourself:
 
 ```bash
@@ -76,7 +76,7 @@ python tests/test_security_comprehensive.py
 | C-PromptInjection | 9 | ASCII `<\|im_start\|>`, Unicode full-width (U+FF5C), `[INST]`, `<system>`, C0/C1/DEL stripping; newline+tab preserved; output truncation |
 | D-Bucket | 6 | Non-`gs://` scheme, `http://`, non-workspace bucket, empty URI, bare `gs://`, CRLF in bucket URI |
 | E-Policy | 5 | Writes default OFF; ON only with `MCP_TERRA_ALLOW_WRITES=1`; non-truthy stays OFF; rate limiter raises on burst |
-| F-Tools | 3 | No destruction primitive registered; **39 tools** registered exactly; every spend/write tool has the correct action class |
+| F-Tools | 3 | No destruction primitive registered; **41 tools** registered exactly; every spend/write tool has the correct action class |
 | G-Edge | 6 | Valid identifiers accepted; empty/leading-non-alphanum refused; name-length cap; versioned-name shape; `Path(None)` handled |
 | H-Supply | 5 | No `eval`/`exec`/`pickle.load*`/`shell=True` anywhere; dependency upper bounds present |
 | I-Output | 1 | Token-leak defense-in-depth wired into `_ok()` |
@@ -105,6 +105,8 @@ python tests/test_security_comprehensive.py
 | CC-WDL | 7 | WDL submission primitives: entity-less body, no abort/delete, workspace-lock, SPEND gate, no delete-outputs switch, bool `method_version` rejected |
 | CC-Email | 1 | SMTP modes: A `.eml` (no creds), B authenticated, C relay (explicit opt-in only) |
 | CC-Reads | 10 | fiss-mcp-superset read tools: READ-class, no write/delete, paging clamps, call-tree summary, byte-range read, allowlist, Batch logging command |
+| CC-RunRecord | 6 | Provenance run record: schema/version stamping, derived counts, agent-forged provenance overwritten, workspace from the lock, malformed-record rejection, order-independent integrity digest, secret-scan before persist |
+| CC-Notify | 4 | Slack ping: no-webhook safe return, host/https-locked webhook, secret-shaped payload refused before network, no `url` param (webhook env-locked, anti-exfil) |
 
 ## Single-workspace lock (`MCP_TERRA_WORKSPACE`)
 

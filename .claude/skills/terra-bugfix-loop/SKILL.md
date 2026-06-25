@@ -2,7 +2,7 @@
 name: terra-bugfix-loop
 description: The end-to-end "run my Terra notebook" loop — what Claude Code does on a laptop, but on Terra. Provisions the right-sized VM, runs the notebook on it, auto-fixes bugs with deterministic Tier-0 triage (escalating to Claude only when needed), then emails a verified report PLUS a NotebookLM-style audio explainer of what the results mean. Closes the gap that Claude Code alone can only copy a notebook into the GCS bucket — it cannot provision a VM or run it.
 argument-hint: [notebook_path_or_gcs] [bucket_uri] [--email] [--audio]
-allowed-tools: mcp-terra:terra_health, mcp-terra:terra_get_workspace, mcp-terra:terra_recommend_runtime_for_notebook, mcp-terra:terra_list_runtimes, mcp-terra:terra_get_runtime, mcp-terra:terra_create_runtime, mcp-terra:terra_start_runtime, mcp-terra:terra_list_bucket, mcp-terra:terra_upload_to_bucket, mcp-terra:terra_download_from_bucket, mcp-terra:terra_install_notebook_runner, mcp-terra:terra_start_runner_on_vm, mcp-terra:terra_submit_notebook_job, mcp-terra:terra_get_notebook_job_result, mcp-terra:terra_get_run_log, mcp-terra:terra_render_audio_summary, mcp-terra:terra_send_run_report_email, Read, Edit, Task
+allowed-tools: mcp-terra:terra_health, mcp-terra:terra_get_workspace, mcp-terra:terra_recommend_runtime_for_notebook, mcp-terra:terra_list_runtimes, mcp-terra:terra_get_runtime, mcp-terra:terra_create_runtime, mcp-terra:terra_start_runtime, mcp-terra:terra_list_bucket, mcp-terra:terra_upload_to_bucket, mcp-terra:terra_download_from_bucket, mcp-terra:terra_install_notebook_runner, mcp-terra:terra_start_runner_on_vm, mcp-terra:terra_submit_notebook_job, mcp-terra:terra_get_notebook_job_result, mcp-terra:terra_get_run_log, mcp-terra:terra_render_audio_summary, mcp-terra:terra_write_run_record, mcp-terra:terra_send_run_report_email, mcp-terra:terra_notify_slack, Read, Edit, Task
 ---
 
 # terra-bugfix-loop — the end-to-end Terra notebook loop
@@ -165,14 +165,30 @@ On success:
 
    The verifier returns an acknowledgment ≥ 50 chars describing concrete
    evidence. If it refuses, fix the artifacts and re-verify — do NOT send.
-4. **Audio (`--audio` / user asked for a recording):**
+4. **Write the run record FIRST (single source of truth).** Build the
+   descriptive record per `docs/metadata.md` — `run_id` = the FIRST job's id of
+   the loop; `iterations[]` with each job_id/status, the `failure` + the `fix`
+   (summary + before→after diff), and the SUCCEEDED iteration's verified
+   `results[]`; plus `subject`, `runtime`, `verification` (the ack), and
+   `deliveries`. Call `terra_write_run_record(run_id, record_json)`. The MCP
+   stamps the provenance (version, code-integrity digest, user, workspace,
+   audit head) and writes it no-clobber. **Render every channel below FROM this
+   record** so they agree.
+5. **Audio (`--audio` / user asked for a recording):**
    `terra_render_audio_summary(job_id, bucket_uri, summary_text=<audio
    script>, verification_acknowledgment=<verifier ack>)` → renders a Studio-
-   voice `.mp3` to the bucket; note its `gs://` path.
-5. **Email (`--email`):** `terra_send_run_report_email(subject=<short>,
+   voice `.mp3` to the bucket; note its `gs://` path. (Cloud TTS needs
+   `texttospeech.googleapis.com` enabled + `MCP_TERRA_TTS_QUOTA_PROJECT`.)
+6. **Email (`--email`):** `terra_send_run_report_email(subject=<short>,
    body=<report + a line pointing to the audio's gs:// path and how to play
    it>, job_id=<final>, verification_acknowledgment=<verifier ack>)`.
    Recipient is hard-locked to the user's Terra email — no `to` param.
+7. **Slack ping (if `MCP_TERRA_SLACK_WEBHOOK` is set):**
+   `terra_notify_slack(text=<compact summary: outcome, bugs-fixed count, key
+   results, the run-record + executed-notebook gs:// links>, run_id=<run_id>)`.
+   The webhook is env-locked (no url param). If unset, it returns
+   `{sent:false}` — skip silently. Reflect what was sent in the record's
+   `deliveries`.
 
 ## Robustness rules
 

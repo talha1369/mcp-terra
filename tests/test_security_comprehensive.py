@@ -378,10 +378,10 @@ def _():
     bad = [t for t in tools if "delete" in t.lower() or "remove" in t.lower() or "rm" in t.lower()]
     assert not bad, f"destructive tools found: {bad}"
 
-@case("F-Tools", "39 tools registered (incl. WDL + fiss-mcp-superset reads)")
+@case("F-Tools", "41 tools registered (incl. WDL, reads, run-record + Slack)")
 def _():
     tools = [t.name for t in server.server._tool_manager.list_tools()]
-    assert len(tools) == 39, f"expected 39, got {len(tools)}: {tools}"
+    assert len(tools) == 41, f"expected 41, got {len(tools)}: {tools}"
     expected = {
         "terra_whoami", "terra_list_workspaces", "terra_get_workspace",
         "terra_list_runtimes", "terra_get_runtime",
@@ -406,6 +406,8 @@ def _():
         "terra_get_workflow_metadata", "terra_get_workflow_cost",
         "terra_get_method_config", "terra_read_bucket_object",
         "terra_get_bucket_object_metadata", "terra_get_batch_job_status",
+        # completion record + delivery channels
+        "terra_write_run_record", "terra_notify_slack",
     }
     assert set(tools) == expected, f"missing={expected-set(tools)}, extra={set(tools)-expected}"
 
@@ -2558,6 +2560,125 @@ def _():
         server.auth.get_access_token = orig_tok
         server.policy.assert_project_allowed = orig_pol
     assert "gcloud logging read" in out and "job-abc" in out
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# CC-RunRecord — provenance-bearing completion record (docs/metadata.md)
+# ──────────────────────────────────────────────────────────────────────────
+from mcp_terra import run_record as _rr
+from mcp_terra import notify as _nt
+
+_GOOD_REC = {
+    "run_id": "20260625T172041Z-a877749a", "outcome": "succeeded",
+    "iterations": [
+        {"job_id": "j-fail", "status": "FAILED", "fix": {"summary": "import pandas"}},
+        {"job_id": "j-ok", "status": "COMPLETE"},
+    ],
+}
+
+
+@case("CC-RunRecord", "build_record stamps schema/type/version + derived counts")
+def _():
+    rec = _rr.build_record(_GOOD_REC, mcp_version="9.9.9",
+                           module_hashes={"a.py": "h1", "b.py": "h2"})
+    assert rec["_schema_version"] == _rr.SCHEMA_VERSION
+    assert rec["record_type"] == "mcp_terra_run_record"
+    assert rec["agent"]["mcp_version"] == "9.9.9"
+    assert rec["agent"]["code_integrity_digest"].startswith("sha256:")
+    assert rec["iteration_count"] == 2 and rec["bugs_fixed"] == 1
+    assert rec["sensitivity"] == "fc-secure"  # default
+
+
+@case("CC-RunRecord", "build_record OVERWRITES agent-forged provenance")
+def _():
+    forged = dict(_GOOD_REC, agent={"mcp_version": "evil", "code_integrity_digest": "sha256:forged"})
+    rec = _rr.build_record(forged, mcp_version="1.2.3",
+                           module_hashes={"a.py": "real"})
+    assert rec["agent"]["mcp_version"] == "1.2.3", "must overwrite forged version"
+    assert rec["agent"]["code_integrity_digest"] != "sha256:forged", "must recompute digest"
+
+
+@case("CC-RunRecord", "build_record workspace comes from the lock (authoritative)")
+def _():
+    rec = _rr.build_record(dict(_GOOD_REC, workspace={"namespace": "FORGED"}),
+                           mcp_version="1", module_hashes={"a.py": "h"},
+                           workspace={"namespace": "ns", "name": "ws",
+                                      "googleProject": "proj", "bucketName": "fc-secure-x"})
+    assert rec["workspace"]["namespace"] == "ns", "lock workspace must win"
+    assert rec["workspace"]["bucket"] == "gs://fc-secure-x"
+    assert rec["workspace"]["google_project"] == "proj"
+
+
+@case("CC-RunRecord", "build_record rejects malformed records")
+def _():
+    must_raise(_rr.build_record, _rr.RunRecordError,
+               {"outcome": "succeeded", "iterations": [{"job_id": "x"}]},  # no run_id
+               mcp_version="1", module_hashes={})
+    must_raise(_rr.build_record, _rr.RunRecordError,
+               {"run_id": "r", "outcome": "WAT", "iterations": [{"job_id": "x"}]},
+               mcp_version="1", module_hashes={})
+    must_raise(_rr.build_record, _rr.RunRecordError,
+               {"run_id": "r", "outcome": "succeeded", "iterations": []},  # empty
+               mcp_version="1", module_hashes={})
+    must_raise(_rr.build_record, _rr.RunRecordError,
+               {"run_id": "r", "outcome": "succeeded", "iterations": [{"no_job": 1}]},
+               mcp_version="1", module_hashes={})
+
+
+@case("CC-RunRecord", "code_integrity_digest is order-independent")
+def _():
+    d1 = _rr.code_integrity_digest({"a.py": "1", "b.py": "2"})
+    d2 = _rr.code_integrity_digest({"b.py": "2", "a.py": "1"})
+    assert d1 == d2 and d1.startswith("sha256:")
+
+
+@case("CC-RunRecord", "terra_write_run_record is WRITE-SAFE + run_id is path-validated")
+def _():
+    import inspect
+    src = inspect.getsource(server.terra_write_run_record)
+    assert '_pre("terra_write_run_record", WRITE_SAFE' in src
+    assert "validate_identifier(run_id" in src, "run_id is a path component — must be validated"
+    assert "secret_scan.scan_bytes" in src, "must secret-scan before persisting metadata"
+
+
+@case("CC-Notify", "send_slack returns sent=False when no webhook configured")
+def _():
+    saved = _nt._SLACK_WEBHOOK
+    _nt._SLACK_WEBHOOK = ""
+    try:
+        r = _nt.send_slack("hi")
+        assert r["sent"] is False and "not set" in r["reason"]
+    finally:
+        _nt._SLACK_WEBHOOK = saved
+
+
+@case("CC-Notify", "_validate_webhook refuses non-Slack / non-https hosts")
+def _():
+    must_raise(_nt._validate_webhook, _nt.NotifyError, "https://evil.example.com/x")
+    must_raise(_nt._validate_webhook, _nt.NotifyError, "http://hooks.slack.com/x")
+    _nt._validate_webhook("https://hooks.slack.com/services/T/B/xxx")  # ok: no raise
+
+
+@case("CC-Notify", "send_slack refuses a payload containing a secret shape (no network)")
+def _():
+    saved = _nt._SLACK_WEBHOOK
+    _nt._SLACK_WEBHOOK = "https://hooks.slack.com/services/T/B/xxx"
+    try:
+        # A ya29 token in the body must be refused BEFORE any HTTP call.
+        must_raise(_nt.send_slack, _nt.NotifyError,
+                   "run done. token=ya29.A0" + "a" * 40)
+    finally:
+        _nt._SLACK_WEBHOOK = saved
+
+
+@case("CC-Notify", "terra_notify_slack has NO url param (webhook locked to env)")
+def _():
+    import inspect
+    params = set(inspect.signature(server.terra_notify_slack).parameters)
+    assert "url" not in params and "webhook" not in params, \
+        "must not accept an arbitrary destination (anti-exfil)"
+    src = inspect.getsource(server.terra_notify_slack)
+    assert '_pre("terra_notify_slack", WRITE_SAFE' in src
 
 
 # ──────────────────────────────────────────────────────────────────────────

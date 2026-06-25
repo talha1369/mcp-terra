@@ -245,6 +245,8 @@ hijack). To change a value, restart the MCP process.
 | `MCP_TERRA_SMTP_RELAY` | *(unset)* | Email send | `1` = no-auth relay (mode C): send without USER/PASS (relay authorizes by IP). Explicit opt-in only. |
 | `MCP_TERRA_EMAIL_RECIPIENT_OVERRIDE` | *(unset)* | Test only | Must equal the auth'd Terra email; useful only if `gcloud account` differs from the desired inbox. Refused otherwise. |
 | `MCP_TERRA_TTS_VOICE` | `en-US-Studio-O` | Audio summary | Cloud TTS voice id. Override e.g. `en-US-Studio-Q` (male), `en-US-Neural2-J`. Audio summary tool also requires `gcloud services enable texttospeech.googleapis.com`. |
+| `MCP_TERRA_TTS_QUOTA_PROJECT` | = locked project | Audio summary | Quota/billing project for Cloud TTS (sent as `X-Goog-User-Project`). Needs `serviceusage.services.use` on that project. |
+| `MCP_TERRA_SLACK_WEBHOOK` | *(unset)* | Slack ping | `https://hooks.slack.com/services/...` incoming-webhook URL. Locked at startup; the `terra_notify_slack` tool has no URL parameter (anti-exfil). Unset ⇒ Slack ping is skipped. |
 
 ## Tool reference
 
@@ -333,6 +335,20 @@ terra_create_runtime(google_project, runtime_name,
 ```
 terra_upload_to_bucket(local_path, bucket_uri, recursive=False)
 terra_download_from_bucket(bucket_uri, local_path, recursive=False)
+```
+
+### Completion record + delivery channels
+
+On run completion the loop writes ONE provenance-bearing record (see
+[docs/metadata.md](docs/metadata.md)) that the email, Slack, and audio channels
+all render from — so every channel agrees and the verifier gate covers all
+three at once.
+
+```
+terra_write_run_record(run_id, record_json, bucket_uri="")  # WRITE; no-clobber; MCP stamps provenance
+terra_send_run_report_email(subject, body, job_id, verification_acknowledgment)  # recipient-locked
+terra_notify_slack(text, run_id="")                         # WRITE; webhook env-locked (no url param)
+terra_render_audio_summary(...)                             # "what the results mean" via Cloud TTS
 ```
 
 ## The bug-fix loop (notebook execution + `.BAK` versioning)

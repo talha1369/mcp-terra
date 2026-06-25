@@ -32,6 +32,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from . import auth, terra_client as tc, bucket as bk, safety, policy
+from . import run_record as rr, notify as nt
 from . import notebook_runner as nbr
 from . import fetch as ft
 from . import email_send
@@ -2287,6 +2288,107 @@ def terra_get_batch_job_status(google_project: str, region: str,
     state = (job.get("status") or {}).get("state") if isinstance(job, dict) else None
     return _ok({"job_name": job_name, "status": state, "job": job,
                 "logging_command": logging_cmd})
+
+
+# ── Completion record + delivery channels (run record · Slack ping) ─────────
+# The run record (docs/metadata.md) is the single provenance-bearing record a
+# completed run produces; the email/Slack/audio channels all render from it.
+
+@server.tool(title="Write the consolidated run record (provenance)",
+             annotations=ANN_WRITE_NEW)
+def terra_write_run_record(run_id: str, record_json: str,
+                           bucket_uri: str = "") -> str:
+    """Write the consolidated, provenance-bearing run record for a completed
+    Terra run to <bucket>/mcp_terra_jobs/<run_id>/run_record.json (no-clobber).
+
+    *** WRITE-SAFE — writes one JSON object to the workspace bucket. ***
+
+    You supply the DESCRIPTIVE body as `record_json` (a JSON object per
+    docs/metadata.md: run_id, title, subject, runtime, iterations[], outputs[],
+    verification, deliveries, sensitivity). The MCP STAMPS the provenance you
+    cannot forge — schema version, MCP version + code-integrity digest, the
+    authenticated user, the locked workspace, and the audit-chain head — then
+    secret-scans and writes it. This one record is what the email, Slack, and
+    audio channels should render from (so all three agree).
+
+    Args:
+        run_id: the run id — use the FIRST job's id of the bug-fix loop.
+        record_json: JSON object string (the descriptive run record).
+        bucket_uri: workspace bucket; defaults to the locked workspace bucket.
+    """
+    safety.validate_identifier(run_id, "run_id")  # also a path component — no traversal
+    if len(record_json) > 256 * 1024:
+        raise ValueError(f"record_json too large ({len(record_json)} bytes; cap 256 KiB)")
+    try:
+        record_in = json.loads(record_json)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"record_json is not valid JSON: {e}")
+    if not bucket_uri:
+        _lock = policy.resolve_locked_workspace()
+        if not _lock or not _lock.get("bucketName"):
+            raise ValueError("bucket_uri empty and no workspace lock to derive it")
+        bucket_uri = f"gs://{_lock['bucketName']}"
+    safety.safe_bucket_uri(bucket_uri)
+    _pre("terra_write_run_record", WRITE_SAFE, f"{bucket_uri} run_id={run_id}")
+
+    try:
+        _user_email = auth.get_user_email()
+    except Exception:
+        _user_email = ""
+    rec = rr.build_record(
+        record_in,
+        mcp_version=SERVER_VERSION,
+        module_hashes=policy.compute_code_integrity(),
+        user_email=_user_email,
+        workspace=policy.resolve_locked_workspace(),
+        audit_last_hmac=getattr(policy, "_audit_prev_hash", None),
+    )
+    # Defense in depth: metadata must never carry a credential.
+    from . import secret_scan
+    blob = json.dumps(rec, indent=2, default=str)
+    hits = secret_scan.scan_bytes(blob.encode("utf-8"), "run_record")
+    if hits:
+        raise PermissionError(
+            f"refusing to write run record: it contains {len(hits)} "
+            f"secret-shaped value(s). Remove credentials from the record.")
+    dest = f"{bucket_uri.rstrip('/')}/{nbr.JOBS_PREFIX}/{run_id}/run_record.json"
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+        fh.write(blob)
+        tmp = fh.name
+    bk.upload_file(tmp, dest, recursive=False)
+    return _ok({"written": dest, "run_record": rec})
+
+
+@server.tool(title="Send a Slack completion ping", annotations=ANN_WRITE_NEW)
+def terra_notify_slack(text: str, run_id: str = "") -> str:
+    """Post a run-completion ping to the configured Slack channel.
+
+    *** WRITE-SAFE — network side-effect (posts to Slack). ***
+
+    Render `text` from the run record (outcome, bugs fixed, key results, the
+    bucket artifact links). The webhook is HARD-LOCKED to
+    MCP_TERRA_SLACK_WEBHOOK — there is NO url parameter, so this cannot post to
+    an arbitrary host. The payload is secret-scanned before send. If no webhook
+    is configured, returns {sent: false, reason} (not an error).
+
+    Args:
+        text: the message body (compose from the run record; Slack mrkdwn ok).
+        run_id: optional run id, for the audit-log detail line.
+    """
+    if not text or not text.strip():
+        raise ValueError("text is empty")
+    if len(text) > 40000:
+        raise ValueError(f"text too long ({len(text)} chars; cap 40000)")
+    if run_id:
+        safety.validate_identifier(run_id, "run_id")
+    _pre("terra_notify_slack", WRITE_SAFE,
+         f"slack ping run_id={run_id or '-'} ({len(text)} chars)")
+    try:
+        result = nt.send_slack(text)
+    except nt.NotifyError as e:
+        raise RuntimeError(str(e))
+    return _ok(result)
 
 
 @server.tool(title="Register a WDL as an Agora method", annotations=ANN_WRITE_NEW)
