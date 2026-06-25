@@ -51,25 +51,21 @@ FROM python:3.12-slim@sha256:6c4dd321d176d61ea848dc8c73a4f7dbae8f70e0ee48bb411ea
 #   * google-cloud-sdk: gsutil for bucket I/O + gcloud for ADC token.
 #   * ca-certificates: HTTPS to Terra services.
 #
-# apt versions are pinned to specific Debian bookworm point-release
-# values. The form `pkg=version` requires the version to be present in
-# the configured archive — when bookworm rolls a point release these
-# pins MUST be bumped (failure is loud: apt errors with "Version X is
-# not available"). Pin currency:
-#   ca-certificates    20230311+deb12u1  (bookworm)
-#   curl               7.88.1-10+deb12u14
-#   gnupg              2.2.40-1.1
-#   apt-transport-https 2.6.1
-# google-cloud-sdk is NOT version-pinned because its archive only ships
-# the latest stream; Google rotates point-releases out of the index
-# within days. The package is signed by the cloud.google.com gpg key we
-# install above, which is the supply-chain anchor for that one dep.
+# apt package versions are intentionally NOT pinned with `pkg=version`.
+# Debian stable keeps only the LATEST point release of each package in the
+# archive, so an exact pin breaks every time bookworm rolls a security
+# update (apt errors "Version X not available") — brittleness with no real
+# benefit. Reproducibility/supply-chain integrity is anchored elsewhere:
+#   * the base image is pinned by sha256 digest (FROM ... @sha256:...),
+#   * Python deps install via --require-hashes against requirements.lock,
+#   * google-cloud-sdk is verified by the cloud.google.com gpg key below,
+#   * all apt packages come from Debian's signed bookworm repositories.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        ca-certificates=20230311+deb12u1 \
-        curl=7.88.1-10+deb12u14 \
-        gnupg=2.2.40-1.1 \
-        apt-transport-https=2.6.1 && \
+        ca-certificates \
+        curl \
+        gnupg \
+        apt-transport-https && \
     echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
         > /etc/apt/sources.list.d/google-cloud-sdk.list && \
     curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
