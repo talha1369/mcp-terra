@@ -248,7 +248,7 @@ hijack). To change a value, restart the MCP process.
 | `MCP_TERRA_TTS_QUOTA_PROJECT` | = locked project | Audio summary | Quota/billing project for Cloud TTS (sent as `X-Goog-User-Project`). Needs `serviceusage.services.use` on that project. |
 | `MCP_TERRA_SLACK_WEBHOOK` | *(unset)* | Slack ping (text) | `https://hooks.slack.com/services/...` incoming-webhook URL. Locked at startup; the `terra_notify_slack` tool has no URL parameter (anti-exfil). Unset ⇒ Slack ping is skipped. |
 | `MCP_TERRA_SLACK_BOT_TOKEN` | *(unset)* | Slack file upload | `xoxb-…` bot token (Slack app with `files:write`). Required to attach the audio file to Slack (webhooks can't upload files). |
-| `MCP_TERRA_SLACK_CHANNEL` | *(unset)* | Slack file upload | Channel **ID** (e.g. `C0123ABCD`, from the channel's "Copy link" / details) the bot uploads into. The bot must be a member of it. |
+| `MCP_TERRA_SLACK_CHANNEL` | *(unset)* | Slack file upload | One **or more** targets (comma/space-separated) the bot uploads into — DM **and/or** channel. A **channel ID** (`C…`/`G…`; bot must be a member — `/invite @bot`), and/or a **user ID** (`U…`) to DM that user (no invite needed; requires the `im:write` bot scope). E.g. `U0123ABCD, C0456WXYZ`. Each target's outcome is reported independently. |
 
 ## Tool reference
 

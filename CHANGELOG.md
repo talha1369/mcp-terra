@@ -42,7 +42,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     (no tool params), the file path is derived from the job (never arbitrary),
     the comment is secret-scanned, and the size is capped. Without a bot token
     it falls back to the webhook text + a note. Per-user/collaborator config —
-    each sets their own token + channel.
+    each sets their own token + channel. `MCP_TERRA_SLACK_CHANNEL` accepts
+    MULTIPLE comma/space-separated targets — a DM **and/or** a channel: a user
+    id `U…` is opened as a DM via `conversations.open` (needs the `im:write`
+    scope; no `/invite`), a channel id `C…/G…` posts to that channel (bot must
+    be invited). Each target is delivered independently and its success/failure
+    surfaced (partial delivery is never hidden).
 
 - **Read-only superset of `broadinstitute/fiss-mcp`** — nine new READ-class
   tools (no spend, no write, no destruction) close fiss-mcp's read-side lead so

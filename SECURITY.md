@@ -62,7 +62,7 @@ These are real but either out of scope or fundamentally hard:
 
 ## Comprehensive attack-class coverage (`tests/test_security_comprehensive.py`)
 
-**282/282 tests pass** across 40 attack classes. The table below is generated
+**283/283 tests pass** across 40 attack classes. The table below is generated
 from the suite itself; the test file is the authoritative source. Run yourself:
 
 ```bash
@@ -111,7 +111,7 @@ python tests/test_security_comprehensive.py
 | CC-NoDeleteAttack | 7 | Social-engineering "delete the malware-infected files" request achieves nothing: no delete-capable tool, bucket layer uses only non-destructive verbs, no rmtree/rmdir call, os.unlink only on temp files, no delete primitive on any client layer, LLM-patch validator blocklists destructive tokens, attack has no callable to fulfill it |
 | CC-CodexFixes | 10 | Regressions for the 6 adversarial-review findings: version_existing write-policy bypass (blocked paths / symlink / non-regular, exist-independent), audio secret-scan fail-closed, non-forgeable run-record agent identity (+ fail-closed), run_id↔path binding, temp-blob cleanup, run-record no-clobber preflight |
 | CC-AudioAttach | 6 | Audio email attachment is exfil-safe: audio/* MIME only, non-audio extension refused, oversized/empty refused, no-attachment stays single-part, path DERIVED from job_id (never arbitrary), temp blob cleaned up |
-| CC-SlackUpload | 5 | True Slack file upload (bot Web API): bot config requires token+channel, safe no-op when unconfigured, secret-shaped comment refused before any network, empty/oversized refused before network, the tool is env-locked (no url/token/channel params) with webhook fallback |
+| CC-SlackUpload | 6 | True Slack file upload (bot Web API): bot config requires token+channel, safe no-op when unconfigured, secret-shaped comment refused before any network, empty/oversized refused before network, env-locked tool (no url/token/channel params) with webhook fallback, user-id→DM resolution + multi-target (DM and/or channel) parsing |
 
 ## Single-workspace lock (`MCP_TERRA_WORKSPACE`)
 

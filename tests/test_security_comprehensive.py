@@ -2996,6 +2996,26 @@ def _():
         (_n._SLACK_BOT_TOKEN, _n._SLACK_CHANNEL) = saved
 
 
+@case("CC-SlackUpload", "user-id target is detected + resolved to a DM channel")
+def _():
+    from mcp_terra import notify as _n
+    assert _n._is_slack_user_id("U012345") is True
+    assert _n._is_slack_user_id("W012345") is True
+    assert _n._is_slack_user_id("C012345") is False
+    assert _n._is_slack_user_id("") is False
+    import inspect
+    src = inspect.getsource(_n._slack_resolve_channel)
+    assert "conversations.open" in src, "user-id target must open a DM channel"
+    assert "im:write" in src, "must hint the im:write scope on failure"
+    # multi-target: DM and/or channel, comma/space separated
+    saved = _n._SLACK_CHANNEL
+    try:
+        _n._SLACK_CHANNEL = "U0123, C0456 D0789"
+        assert _n._slack_targets() == ["U0123", "C0456", "D0789"]
+    finally:
+        _n._SLACK_CHANNEL = saved
+
+
 @case("CC-SlackUpload", "notify_slack tool: env-locked, exfil-safe, webhook fallback")
 def _():
     import inspect
