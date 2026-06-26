@@ -43,6 +43,7 @@ from . import notebook_runner as nbr
 from . import fetch as ft
 from . import email_send
 from . import bug_triager
+from . import workflow_triager
 from . import cheap_llm
 from . import audio_summary
 from . import runtime_recommender
@@ -2459,6 +2460,33 @@ def terra_get_submission(namespace: str, name: str, submission_id: str) -> str:
                 "(MCP_TERRA_CONTROLLED_ACCESS); ids + statuses only"),
         }
     return _ok(sub)
+
+
+@server.tool(title="Classify a workflow failure", annotations=ANN_LOCAL_READ)
+def terra_classify_workflow_failure(failure_text: str) -> str:
+    """Deterministically classify a Cromwell/Google-Batch (WDL) failure message.
+
+    The WDL analogue of the notebook bug-triager: turns a verbose failure string
+    into {"category", "recommended_action"} so the auto-fix loop acts on a
+    2-token signal instead of an LLM read of every failure. Categories:
+    localization_failure, oom_disk, task_failed, bad_input, wdl_error,
+    quota_transient, aborted, unknown.
+
+    PURE + LOCAL: classifies the text YOU pass (from terra_get_submission /
+    terra_get_workflow_logs) — it performs NO network call and NO data fetch, so
+    it egresses nothing. Returns category + a recommended next step only (it does
+    not echo the input back), so it is safe under MCP_TERRA_CONTROLLED_ACCESS.
+    """
+    # failure_text is free-form Cromwell output (newlines, spaces, paths) — it is
+    # ONLY regex-scanned (never shelled/pathed/eval'd) and the tool returns fixed
+    # category strings, never echoing the input — so a light type/length check is
+    # the correct validation, not the identifier-grade validate_freeform_string.
+    if not isinstance(failure_text, str):
+        raise ValueError("failure_text must be a string")
+    if len(failure_text) > 200_000:
+        failure_text = failure_text[:200_000]
+    _pre("terra_classify_workflow_failure", READ, "local-classify")
+    return _ok(workflow_triager.classify(failure_text))
 
 
 @server.tool(title="Get workflow outputs", annotations=ANN_READ_REMOTE)

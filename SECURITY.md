@@ -108,7 +108,7 @@ default 3000).
 
 ## Comprehensive attack-class coverage (`tests/test_security_comprehensive.py`)
 
-**357/357 tests pass** across 50 attack classes. The table below is generated
+**360/360 tests pass** across 50 attack classes. The table below is generated
 from the suite itself; the test file is the authoritative source. Run yourself:
 
 ```bash

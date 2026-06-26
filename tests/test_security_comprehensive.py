@@ -393,10 +393,10 @@ def _():
     bad = [t for t in tools if "delete" in t.lower() or "remove" in t.lower() or "rm" in t.lower()]
     assert not bad, f"destructive tools found: {bad}"
 
-@case("F-Tools", "44 tools registered (incl. WDL, reads, run-record, pings, logs)")
+@case("F-Tools", "45 tools registered (incl. WDL, reads, run-record, pings, logs)")
 def _():
     tools = [t.name for t in server.server._tool_manager.list_tools()]
-    assert len(tools) == 44, f"expected 44, got {len(tools)}: {tools}"
+    assert len(tools) == 45, f"expected 45, got {len(tools)}: {tools}"
     expected = {
         "terra_whoami", "terra_list_workspaces", "terra_get_workspace",
         "terra_list_runtimes", "terra_get_runtime",
@@ -415,6 +415,7 @@ def _():
         "terra_fetch_url",
         "terra_list_method_configs", "terra_submit_workflow",
         "terra_get_submission", "terra_get_workflow_outputs",
+        "terra_classify_workflow_failure",
         "terra_register_method", "terra_create_method_config",
         # comprehensive-read read-only tools (all READ-class)
         "terra_list_data_tables", "terra_get_entities", "terra_list_submissions",
@@ -1649,6 +1650,49 @@ def _():
     for bad in (None, "", 0, 12345, [], {}):
         out = bug_triager.triage("src", bad)  # type: ignore[arg-type]
         assert out["category"] == "unknown"
+
+@case("X-Triage", "workflow_triager classifies Cromwell/PAPI categories")
+def _():
+    from mcp_terra import workflow_triager as wt
+    cases = {
+        "localization_failure": "Failed to localize files: gs://bucket/in.bam No such object",
+        "oom_disk": "Task wf.align:NA:1 failed. Job exited with return code 137",
+        "oom_disk_papi": "The job failed. PAPI error code 10. Insufficient memory",
+        "task_failed": "Task wf.run:NA:1 failed. Job exited with return code 1\nstderr at gs://...",
+        "bad_input": "Required workflow input 'Wf.sample' not specified and has no default",
+        "wdl_error": "ERROR: Unexpected symbol (line 12) — failed to import sub.wdl",
+        "quota_transient": "Quota exceeded for quota metric 'CPUs'. Resource exhausted.",
+        "aborted": "Workflow was aborted by user.",
+    }
+    expect = {
+        "localization_failure": "localization_failure",
+        "oom_disk": "oom_disk", "oom_disk_papi": "oom_disk",
+        "task_failed": "task_failed", "bad_input": "bad_input",
+        "wdl_error": "wdl_error", "quota_transient": "quota_transient",
+        "aborted": "aborted",
+    }
+    for key, msg in cases.items():
+        got = wt.classify(msg)["category"]
+        assert got == expect[key], f"{key!r}: expected {expect[key]}, got {got} for {msg!r}"
+
+@case("X-Triage", "workflow_triager: empty/None/giant inputs safe → unknown")
+def _():
+    from mcp_terra import workflow_triager as wt
+    for bad in (None, "", "   ", "a totally unremarkable line"):
+        assert wt.classify(bad)["category"] == "unknown"  # type: ignore[arg-type]
+    # a pathological multi-MB message must not hang or raise
+    out = wt.classify("x" * 5_000_000 + "\nJob exited with return code 137")
+    assert out["category"] in {"oom_disk", "unknown"}  # scan is capped; never raises
+
+@case("X-Triage", "terra_classify_workflow_failure tool: local, no remote, returns category")
+def _():
+    tool = server.server._tool_manager._tools["terra_classify_workflow_failure"]
+    out = tool.fn(failure_text="Failed to localize gs://x/y No such object")
+    payload = json.loads(out)
+    assert payload["category"] == "localization_failure"
+    assert "recommended_action" in payload
+    # never echoes the input path back
+    assert "gs://x/y" not in out
 
 # ── Y-SecretScan ──────────────────────────────────────────────────────────
 
@@ -3552,6 +3596,9 @@ _NO_DATA_TOOLS = {
     "terra_whoami", "terra_killswitch_status",
     # external doc fetch (ingest from an allowlisted host, not Terra egress)
     "terra_fetch_url",
+    # pure-local deterministic classifier of caller-provided text (no remote
+    # fetch, returns fixed category strings, never echoes the input)
+    "terra_classify_workflow_failure",
 }
 
 # _NO_DATA tools that DO call a remote service (tc.*/bk.*) but provably return

@@ -9,6 +9,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **Deterministic WDL/Cromwell failure classifier** (`terra_classify_workflow_failure`,
+  tool #45). The WDL analogue of the notebook bug-triager: turns a verbose
+  Cromwell/Google-Batch failure message into `{category, recommended_action}`
+  (localization_failure, oom_disk, task_failed, bad_input, wdl_error,
+  quota_transient, aborted, unknown) so the WDL auto-fix loop acts on a 2-token
+  signal instead of an LLM read of every failure. Pure-local: no network call, no
+  data fetch, returns fixed category strings and never echoes the input — safe
+  under `MCP_TERRA_CONTROLLED_ACCESS`. Wired into `terra-wdl-run` Phase 6.
+
 - **One-command Claude Code plugin.** The repo is now also a Claude Code plugin
   (`.claude-plugin/plugin.json` + `.claude-plugin/marketplace.json`) so teams can
   `/plugin marketplace add talha1369/mcp-terra` → `/plugin install mcp-terra` and
