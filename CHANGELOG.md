@@ -33,9 +33,16 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     attaches the run's OWN audio explainer. The path is derived from `job_id` +
     the locked bucket and fixed to `summary.{m4a,mp3}` (never an arbitrary
     path), audio-MIME-locked, and size-capped — so the long-standing "no
-    arbitrary attachments" anti-exfil invariant holds. (Slack file upload is
-    NOT possible via an incoming webhook — the Slack ping links the audio; true
-    Slack upload needs a bot token + `files:write`.)
+    arbitrary attachments" anti-exfil invariant holds.
+  - **True Slack file upload** — `terra_notify_slack(audio_job_id=…)` uploads
+    the run's audio as a real Slack attachment via the bot Web API
+    (`files.getUploadURLExternal` → bytes → `files.completeUploadExternal`),
+    when `MCP_TERRA_SLACK_BOT_TOKEN` + `MCP_TERRA_SLACK_CHANNEL` are set (a
+    Slack app with `files:write`). The bot token + channel are env-locked
+    (no tool params), the file path is derived from the job (never arbitrary),
+    the comment is secret-scanned, and the size is capped. Without a bot token
+    it falls back to the webhook text + a note. Per-user/collaborator config —
+    each sets their own token + channel.
 
 - **Read-only superset of `broadinstitute/fiss-mcp`** — nine new READ-class
   tools (no spend, no write, no destruction) close fiss-mcp's read-side lead so

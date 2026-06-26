@@ -31,6 +31,13 @@ from . import secret_scan
 _SLACK_WEBHOOK = os.environ.get("MCP_TERRA_SLACK_WEBHOOK", "").strip()
 _SLACK_HOST = "hooks.slack.com"
 
+# Bot-token path (true file upload — webhooks can't upload files). Each user /
+# collaborator sets their OWN token + channel; snapshotted at startup.
+_SLACK_BOT_TOKEN = os.environ.get("MCP_TERRA_SLACK_BOT_TOKEN", "").strip()
+_SLACK_CHANNEL = os.environ.get("MCP_TERRA_SLACK_CHANNEL", "").strip()
+_SLACK_API = "https://slack.com/api"
+_MAX_SLACK_UPLOAD_BYTES = 50 * 1024 * 1024
+
 
 class NotifyError(Exception):
     """Raised on a refused or failed notification."""
@@ -88,6 +95,83 @@ def send_slack(text: str, blocks: list | None = None) -> dict:
         raise NotifyError(
             f"Slack post rejected: HTTP {resp.status_code} {resp.text[:150]!r}")
     return {"sent": True, "transport": "slack-webhook"}
+
+
+# ── Slack bot-token file upload (true attachment; webhooks can't upload) ─────
+
+def slack_bot_configured() -> bool:
+    """True iff a Slack BOT token + channel are set (a real file upload is
+    possible). Distinct from the webhook (text-only) path."""
+    return bool(_SLACK_BOT_TOKEN and _SLACK_CHANNEL)
+
+
+def _slack_json(resp: httpx.Response) -> dict:
+    try:
+        return resp.json()
+    except ValueError:
+        raise NotifyError(f"Slack API returned non-JSON (HTTP {resp.status_code})")
+
+
+def slack_upload_file(data: bytes, *, filename: str, title: str = "",
+                      initial_comment: str = "") -> dict:
+    """Upload a file to the configured Slack channel via the Web API
+    (files.getUploadURLExternal -> PUT bytes -> files.completeUploadExternal).
+
+    Returns {uploaded, transport, file_id} on success, or {uploaded: False,
+    reason} when no bot token/channel is configured. Raises NotifyError on a
+    refused/failed upload. The bot token is a bearer secret — it is never
+    echoed in an error (Slack error bodies carry an error CODE, not the token).
+    """
+    if not slack_bot_configured():
+        return {"uploaded": False,
+                "reason": "MCP_TERRA_SLACK_BOT_TOKEN / MCP_TERRA_SLACK_CHANNEL not set"}
+    if not data:
+        raise NotifyError("file is empty")
+    if len(data) > _MAX_SLACK_UPLOAD_BYTES:
+        raise NotifyError(
+            f"file too large for Slack ({len(data)} bytes; cap {_MAX_SLACK_UPLOAD_BYTES})")
+    # Defense in depth: never push a credential into a chat channel via the
+    # message comment (the binary file itself is content-type-locked by caller).
+    if initial_comment:
+        hits = secret_scan.scan_bytes(initial_comment.encode("utf-8"),
+                                      "slack-upload-comment")
+        if hits:
+            raise NotifyError(
+                f"refusing Slack upload: comment matched {len(hits)} "
+                f"secret-shaped pattern(s)")
+    safe_name = os.path.basename(str(filename)) or "attachment"
+    headers = {"Authorization": f"Bearer {_SLACK_BOT_TOKEN}"}
+    try:
+        with httpx.Client(timeout=60.0, trust_env=False,
+                          follow_redirects=False) as client:
+            # 1) reserve an upload URL
+            r1 = client.post(f"{_SLACK_API}/files.getUploadURLExternal",
+                             headers=headers,
+                             data={"filename": safe_name, "length": str(len(data))})
+            j1 = _slack_json(r1)
+            if not j1.get("ok"):
+                raise NotifyError(f"Slack getUploadURLExternal: {j1.get('error', 'unknown')}")
+            upload_url = j1.get("upload_url")
+            file_id = j1.get("file_id")
+            if not upload_url or not file_id:
+                raise NotifyError("Slack getUploadURLExternal: missing upload_url/file_id")
+            # 2) PUT the bytes to the reserved URL
+            r2 = client.post(upload_url, files={"file": (safe_name, bytes(data))})
+            if r2.status_code != 200:
+                raise NotifyError(f"Slack file byte upload failed: HTTP {r2.status_code}")
+            # 3) finalize + share into the channel
+            payload: dict = {"files": [{"id": file_id, "title": title or safe_name}],
+                             "channel_id": _SLACK_CHANNEL}
+            if initial_comment:
+                payload["initial_comment"] = initial_comment
+            r3 = client.post(f"{_SLACK_API}/files.completeUploadExternal",
+                             headers=headers, json=payload)
+            j3 = _slack_json(r3)
+            if not j3.get("ok"):
+                raise NotifyError(f"Slack completeUploadExternal: {j3.get('error', 'unknown')}")
+    except httpx.HTTPError as e:
+        raise NotifyError(f"Slack upload network error: {type(e).__name__}")
+    return {"uploaded": True, "transport": "slack-bot-files", "file_id": file_id}
 
 
 # ── macOS Notification Center (local, no network) ───────────────────────────

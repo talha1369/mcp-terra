@@ -1692,6 +1692,41 @@ def terra_get_run_log(bucket_uri: str, job_id: str,
 
 # ── End-of-run email report (hard-locked recipient) ─────────────────────────
 
+def _fetch_run_audio_bytes(job_id: str) -> tuple[bytes, str]:
+    """Download the run's OWN audio explainer (summary.{m4a,mp3}) for `job_id`.
+
+    The path is DERIVED from job_id + the locked bucket and fixed to
+    summary.{m4a,mp3} — never an arbitrary path — so neither the email nor the
+    Slack attachment can be coerced into shipping some other object. Returns
+    (bytes, ext). Raises ValueError if no lock or no audio exists.
+    """
+    safety.validate_identifier(job_id, "job_id")   # path component — no traversal
+    _lk = policy.resolve_locked_workspace()
+    if not _lk or not _lk.get("bucketName"):
+        raise ValueError("a workspace lock is required to locate the audio")
+    _adir = f"gs://{_lk['bucketName']}/{nbr.JOBS_PREFIX}/{job_id}"
+    for _ext in ("m4a", "mp3"):
+        _cand = f"{_adir}/summary.{_ext}"
+        if safety.bucket_object_exists(_cand):
+            import os as _os_a
+            import tempfile as _tf_a
+            fd, _tmp = _tf_a.mkstemp(prefix="mcp_audio_", suffix=f".{_ext}")
+            _os_a.close(fd)
+            _os_a.unlink(_tmp)             # free the name so gsutil cp -n can write it
+            try:
+                bk.download_file(_cand, _tmp)
+                with open(_tmp, "rb") as _fh:
+                    return _fh.read(), _ext
+            finally:
+                try:
+                    _os_a.unlink(_tmp)     # never leave the audio blob on disk
+                except OSError:
+                    pass
+    raise ValueError(
+        f"no audio explainer (summary.m4a/.mp3) found for job {job_id}; "
+        f"render it first with terra_render_audio_summary.")
+
+
 @server.tool(title="Send end-of-run report email (recipient-locked)",
               annotations=ANN_WRITE_NEW)
 def terra_send_run_report_email(subject: str, body: str, job_id: str,
@@ -1745,37 +1780,7 @@ def terra_send_run_report_email(subject: str, body: str, job_id: str,
     # hard-locked to the data owner).
     audio_attachment = None
     if attach_audio:
-        safety.validate_identifier(job_id, "job_id")   # path component — no traversal
-        _lk = policy.resolve_locked_workspace()
-        if not _lk or not _lk.get("bucketName"):
-            raise ValueError("attach_audio requires a workspace lock to locate the audio")
-        _adir = f"gs://{_lk['bucketName']}/{nbr.JOBS_PREFIX}/{job_id}"
-        _found = None
-        for _ext in ("m4a", "mp3"):
-            _cand = f"{_adir}/summary.{_ext}"
-            if safety.bucket_object_exists(_cand):
-                _found = (_cand, _ext)
-                break
-        if _found is None:
-            raise ValueError(
-                f"no audio explainer found for job {job_id} "
-                f"(expected summary.m4a or summary.mp3 in the bucket). Render it "
-                f"first with terra_render_audio_summary.")
-        _cand, _ext = _found
-        import os as _os_em
-        import tempfile as _tf_em
-        fd, _tmp = _tf_em.mkstemp(prefix="mcp_audio_em_", suffix=f".{_ext}")
-        _os_em.close(fd)
-        _os_em.unlink(_tmp)                 # free the name so gsutil cp -n can write it
-        try:
-            bk.download_file(_cand, _tmp)
-            with open(_tmp, "rb") as _fh:
-                _audio_bytes = _fh.read()
-        finally:
-            try:
-                _os_em.unlink(_tmp)         # never leave the audio blob on disk
-            except OSError:
-                pass
+        _audio_bytes, _ext = _fetch_run_audio_bytes(job_id)
         audio_attachment = (_audio_bytes, f"summary.{_ext}")
 
     try:
@@ -2442,20 +2447,29 @@ def terra_write_run_record(run_id: str, record_json: str,
 
 
 @server.tool(title="Send a Slack completion ping", annotations=ANN_WRITE_NEW)
-def terra_notify_slack(text: str, run_id: str = "") -> str:
+def terra_notify_slack(text: str, run_id: str = "", audio_job_id: str = "") -> str:
     """Post a run-completion ping to the configured Slack channel.
 
     *** WRITE-SAFE — network side-effect (posts to Slack). ***
 
-    Render `text` from the run record (outcome, bugs fixed, key results, the
-    bucket artifact links). The webhook is HARD-LOCKED to
-    MCP_TERRA_SLACK_WEBHOOK — there is NO url parameter, so this cannot post to
-    an arbitrary host. The payload is secret-scanned before send. If no webhook
-    is configured, returns {sent: false, reason} (not an error).
+    Two transports, both per-user/collaborator config (env, snapshot at start):
+      • Webhook (text only): MCP_TERRA_SLACK_WEBHOOK — hard-locked to
+        hooks.slack.com (no url param). Default path.
+      • Bot file upload (TRUE attachment): MCP_TERRA_SLACK_BOT_TOKEN +
+        MCP_TERRA_SLACK_CHANNEL — required to attach the audio explainer
+        (webhooks can't upload files). Needs a Slack app with `files:write`.
+
+    If `audio_job_id` is set AND a bot token+channel are configured, the run's
+    OWN audio (summary.{m4a,mp3}, path derived from audio_job_id + the locked
+    bucket — never arbitrary) is uploaded with `text` as the file comment.
+    Otherwise `text` is posted via the webhook (with a note if an upload was
+    requested but the bot isn't configured).
 
     Args:
         text: the message body (compose from the run record; Slack mrkdwn ok).
         run_id: optional run id, for the audit-log detail line.
+        audio_job_id: optional — the job whose audio explainer to attach (bot
+            mode only).
     """
     if not text or not text.strip():
         raise ValueError("text is empty")
@@ -2464,9 +2478,24 @@ def terra_notify_slack(text: str, run_id: str = "") -> str:
     if run_id:
         safety.validate_identifier(run_id, "run_id")
     _pre("terra_notify_slack", WRITE_SAFE,
-         f"slack ping run_id={run_id or '-'} ({len(text)} chars)")
+         f"slack ping run_id={run_id or '-'} audio={audio_job_id or '-'} "
+         f"({len(text)} chars)")
     try:
-        result = nt.send_slack(text)
+        if audio_job_id and nt.slack_bot_configured():
+            # TRUE file attachment via the bot Web API. Path derived from the
+            # job (exfil-safe); `text` becomes the file's initial comment.
+            _audio_bytes, _ext = _fetch_run_audio_bytes(audio_job_id)
+            result = nt.slack_upload_file(
+                _audio_bytes, filename=f"summary.{_ext}",
+                title=f"Terra run audio explainer ({audio_job_id})",
+                initial_comment=text)
+        else:
+            result = nt.send_slack(text)
+            if audio_job_id and not nt.slack_bot_configured():
+                result["audio_note"] = (
+                    "audio NOT attached — webhooks can't upload files. Set "
+                    "MCP_TERRA_SLACK_BOT_TOKEN + MCP_TERRA_SLACK_CHANNEL "
+                    "(Slack app with files:write) for a true attachment.")
     except nt.NotifyError as e:
         raise RuntimeError(str(e))
     return _ok(result)

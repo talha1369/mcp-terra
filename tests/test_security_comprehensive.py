@@ -2928,15 +2928,83 @@ def _():
     assert "audio_attached" in src and "audio_attachment" in src
 
 
-@case("CC-AudioAttach", "email tool DERIVES the audio path from job_id (never arbitrary)")
+@case("CC-AudioAttach", "audio path is DERIVED from job_id (never arbitrary) + cleaned up")
 def _():
     import inspect
-    src = inspect.getsource(server.terra_send_run_report_email)
-    # path is built from job_id + locked bucket, fixed to summary.{ext}
+    src = inspect.getsource(server._fetch_run_audio_bytes)
     assert 'summary.{_ext}' in src and "bucket_object_exists(_cand)" in src
-    assert 'validate_identifier(job_id' in src, "job_id must be path-validated for attach"
-    # temp blob is always cleaned up (Codex-style hygiene)
-    assert "unlink(_tmp)" in src and "finally:" in src
+    assert 'validate_identifier(job_id' in src, "job_id must be path-validated"
+    assert "unlink(_tmp)" in src and "finally:" in src, "temp blob must be cleaned up"
+    # both delivery channels go through the shared helper (no inline arbitrary path)
+    assert "_fetch_run_audio_bytes(job_id)" in inspect.getsource(server.terra_send_run_report_email)
+    assert "_fetch_run_audio_bytes(audio_job_id)" in inspect.getsource(server.terra_notify_slack)
+
+
+# ── CC-SlackUpload — true Slack file attachment via the bot Web API ─────────
+
+@case("CC-SlackUpload", "slack_bot_configured requires token AND channel")
+def _():
+    from mcp_terra import notify as _n
+    saved = (_n._SLACK_BOT_TOKEN, _n._SLACK_CHANNEL)
+    try:
+        _n._SLACK_BOT_TOKEN, _n._SLACK_CHANNEL = "", ""
+        assert _n.slack_bot_configured() is False
+        _n._SLACK_BOT_TOKEN, _n._SLACK_CHANNEL = "xoxb-x", ""
+        assert _n.slack_bot_configured() is False
+        _n._SLACK_BOT_TOKEN, _n._SLACK_CHANNEL = "xoxb-x", "C123"
+        assert _n.slack_bot_configured() is True
+    finally:
+        (_n._SLACK_BOT_TOKEN, _n._SLACK_CHANNEL) = saved
+
+
+@case("CC-SlackUpload", "slack_upload_file returns uploaded=False when not configured")
+def _():
+    from mcp_terra import notify as _n
+    saved = (_n._SLACK_BOT_TOKEN, _n._SLACK_CHANNEL)
+    try:
+        _n._SLACK_BOT_TOKEN, _n._SLACK_CHANNEL = "", ""
+        r = _n.slack_upload_file(b"audio-bytes", filename="summary.m4a")
+        assert r["uploaded"] is False and "not set" in r["reason"]
+    finally:
+        (_n._SLACK_BOT_TOKEN, _n._SLACK_CHANNEL) = saved
+
+
+@case("CC-SlackUpload", "slack_upload_file refuses secret-shaped comment BEFORE any network")
+def _():
+    from mcp_terra import notify as _n
+    saved = (_n._SLACK_BOT_TOKEN, _n._SLACK_CHANNEL)
+    try:
+        _n._SLACK_BOT_TOKEN, _n._SLACK_CHANNEL = "xoxb-fake", "C123"
+        must_raise(lambda: _n.slack_upload_file(
+            b"audio" * 30, filename="summary.m4a",
+            initial_comment="leak ya29.A0" + "a" * 40), _n.NotifyError)
+    finally:
+        (_n._SLACK_BOT_TOKEN, _n._SLACK_CHANNEL) = saved
+
+
+@case("CC-SlackUpload", "slack_upload_file refuses empty / oversized BEFORE any network")
+def _():
+    from mcp_terra import notify as _n
+    saved = (_n._SLACK_BOT_TOKEN, _n._SLACK_CHANNEL)
+    try:
+        _n._SLACK_BOT_TOKEN, _n._SLACK_CHANNEL = "xoxb-fake", "C123"
+        must_raise(lambda: _n.slack_upload_file(b"", filename="summary.m4a"),
+                   _n.NotifyError)
+        must_raise(lambda: _n.slack_upload_file(b"A" * (51 * 1024 * 1024),
+                   filename="summary.m4a"), _n.NotifyError)
+    finally:
+        (_n._SLACK_BOT_TOKEN, _n._SLACK_CHANNEL) = saved
+
+
+@case("CC-SlackUpload", "notify_slack tool: env-locked, exfil-safe, webhook fallback")
+def _():
+    import inspect
+    src = inspect.getsource(server.terra_notify_slack)
+    assert "slack_bot_configured()" in src and "_fetch_run_audio_bytes(audio_job_id)" in src
+    assert "slack_upload_file" in src and "send_slack(text)" in src
+    params = set(inspect.signature(server.terra_notify_slack).parameters)
+    assert not (params & {"url", "webhook", "token", "channel"}), \
+        f"no destination/credential params allowed (env-locked): {params}"
 
 
 # ──────────────────────────────────────────────────────────────────────────
