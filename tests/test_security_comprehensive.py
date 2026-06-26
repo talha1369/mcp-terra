@@ -3486,21 +3486,23 @@ _DATA_TOOLS_REQUIRING_GUARD = {
     # notebook bytes locally; refresh enumerates bucket names → all guarded.
     "terra_list_runtimes", "terra_get_runtime",
     "terra_recommend_runtime_for_notebook", "terra_refresh_workspace_allowlist",
+    # Codex r8: write/lifecycle RETURN VALUES echo operator-controlled strings
+    # (createSubmission method/entity names, WDL payload, config inputs/outputs,
+    # Leonardo labels/URLs, cost workflow names) → projected + guarded.
+    "terra_submit_workflow", "terra_register_method", "terra_create_method_config",
+    "terra_create_runtime", "terra_start_runtime", "terra_stop_runtime",
+    "terra_get_workflow_cost", "terra_upload_to_bucket",
 }
 _NO_DATA_TOOLS = {
-    # writes / control (no workspace-data return)
-    "terra_create_method_config", "terra_create_runtime", "terra_register_method",
-    "terra_submit_workflow", "terra_submit_notebook_job", "terra_upload_to_bucket",
+    # writes / control whose RETURN is a caller-echo / local ack / status (NOT a
+    # raw remote service payload — enforced by the structural meta-test below)
+    "terra_submit_notebook_job",
     "terra_install_notebook_runner", "terra_start_runner_on_vm",
-    "terra_start_runtime", "terra_stop_runtime", "terra_killswitch_trip",
-    "terra_write_run_record",
+    "terra_killswitch_trip", "terra_write_run_record",
     # notifications / delivery (recipient-locked; not a Terra→LLM egress path)
     "terra_notify_desktop", "terra_notify_slack", "terra_send_run_report_email",
     # identity / posture (not workspace data)
     "terra_whoami", "terra_health", "terra_killswitch_status",
-    # status / cost of the user's OWN scope (no raw rows/objects, no operator
-    # free-form payloads)
-    "terra_get_workflow_cost",
     # external doc fetch (ingest from an allowlisted host, not Terra egress)
     "terra_fetch_url",
 }
@@ -3525,6 +3527,55 @@ def _tool_has_ast_guard(fn) -> bool:
             if nm in guards:
                 return True
     return False
+
+
+def _raw_returns_remote_service(fn) -> bool:
+    """True if the tool has a `return _ok(<direct call to tc.*/bk.*>)` — a raw
+    remote-service pass-through that could echo operator-controlled strings to
+    the LLM. Catches the write/lifecycle leak class (Codex r8). AST-based."""
+    import ast
+    import inspect
+
+    def _is_remote_call(a):
+        if not isinstance(a, ast.Call):
+            return False
+        f = a.func
+        if (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name)
+                and f.value.id in ("tc", "bk")):
+            return True
+        # unwrap _redact_runtime_env(tc.x(...))
+        if isinstance(f, ast.Name) and f.id == "_redact_runtime_env" and a.args:
+            return _is_remote_call(a.args[0])
+        return False
+
+    try:
+        tree = ast.parse(inspect.getsource(fn))
+    except (OSError, SyntaxError):
+        return False
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Return) and isinstance(node.value, ast.Call)):
+            continue
+        ofn = node.value.func
+        if isinstance(ofn, ast.Name) and ofn.id == "_ok" and node.value.args:
+            if _is_remote_call(node.value.args[0]):
+                return True
+    return False
+
+
+@case("CC-ControlledAccess3", "META(fail-closed): no _NO_DATA tool raw-returns a remote payload")
+def _():
+    # Codex r8 root cause: _NO_DATA tools were trusted to not leak, but several
+    # raw-returned a Rawls/Leonardo/gsutil response (write/lifecycle paths).
+    # A _NO_DATA tool must NOT pass a raw remote payload to the LLM — it must
+    # project (and move to the guarded set). The only allowed raw return is the
+    # caller's OWN identity (terra_whoami), which is not workspace data.
+    _RAW_RETURN_OK = {"terra_whoami"}
+    offenders = [t for t in _NO_DATA_TOOLS
+                 if t not in _RAW_RETURN_OK
+                 and _raw_returns_remote_service(getattr(server, t))]
+    assert not offenders, (
+        f"_NO_DATA tools raw-returning a remote payload — project them + move to "
+        f"_DATA_TOOLS_REQUIRING_GUARD: {offenders}")
 
 
 @case("CC-ControlledAccess3", "META(fail-closed): every tool classified + every data tool AST-guarded")
@@ -3868,6 +3919,150 @@ def _():
     finally:
         _p._CONTROLLED_ACCESS, safety.force_refresh_bucket_allowlist = saved, oref
         _p.resolve_locked_workspace = olock
+
+
+def _write_guards_on(_p):
+    """Enable writes + neutralize lock/rate gates for a hermetic write-tool test.
+    Returns a restore() closure."""
+    saved = (_p._WRITES_ALLOWED_SNAPSHOT, _p.enforce_rate_limit,
+             _p.assert_project_allowed, server._assert_workspace_allowed,
+             _p._CONTROLLED_ACCESS, server.auth.get_access_token)
+    _p._WRITES_ALLOWED_SNAPSHOT = True
+    _p.enforce_rate_limit = lambda *a, **k: None
+    _p.assert_project_allowed = lambda *a, **k: None
+    server._assert_workspace_allowed = lambda *a, **k: None
+    server.auth.get_access_token = lambda: "tok"
+    _p._CONTROLLED_ACCESS = True
+
+    def restore():
+        (_p._WRITES_ALLOWED_SNAPSHOT, _p.enforce_rate_limit,
+         _p.assert_project_allowed, server._assert_workspace_allowed,
+         _p._CONTROLLED_ACCESS, server.auth.get_access_token) = saved
+    return restore
+
+
+@case("CC-ControlledAccess3", "submit_workflow returns ids+status only (sentinel) in controlled mode")
+def _():
+    from mcp_terra import policy as _p
+    SENTINEL = "methodcfg-NA12878-secret"
+    o = _tc.rawls_create_submission
+    _tc.rawls_create_submission = lambda *a, **k: {
+        "submissionId": "sub1", "status": "Submitted",
+        "methodConfigurationName": SENTINEL,
+        "submissionEntity": {"entityName": SENTINEL},
+        "workflows": [{"workflowId": "wf1", "workflowEntity": SENTINEL}]}
+    restore = _write_guards_on(_p)
+    try:
+        out = server.terra_submit_workflow("ns", "ws", "cns", "cn")
+        assert SENTINEL not in out, "createSubmission leaked method/entity names!"
+        assert '"submissionId": "sub1"' in out and "wf1" in out
+    finally:
+        restore()
+        _tc.rawls_create_submission = o
+
+
+@case("CC-ControlledAccess3", "register_method returns snapshot id only (sentinel) in controlled mode")
+def _():
+    from mcp_terra import policy as _p
+    SENTINEL = "synopsis-NA12878-secret"
+    o = _tc.agora_register_method
+    _tc.agora_register_method = lambda *a, **k: {
+        "snapshotId": 7, "namespace": "n", "name": "m",
+        "synopsis": SENTINEL, "payload": SENTINEL}
+    restore = _write_guards_on(_p)
+    try:
+        out = server.terra_register_method("ns", "wf", "workflow w {}\n", synopsis="s")
+        assert SENTINEL not in out, "agora response leaked synopsis/WDL payload!"
+        assert '"snapshotId": 7' in out
+    finally:
+        restore()
+        _tc.agora_register_method = o
+
+
+@case("CC-ControlledAccess3", "create_method_config returns ack only (sentinel) in controlled mode")
+def _():
+    from mcp_terra import policy as _p
+    SENTINEL = "NA12878-secret"
+    o = _tc.rawls_create_method_config
+    _tc.rawls_create_method_config = lambda *a, **k: {
+        "namespace": "cns", "name": "cn", "rootEntityType": SENTINEL,
+        "inputs": {f"wf.{SENTINEL}": "x"}, "outputs": {}}
+    restore = _write_guards_on(_p)
+    try:
+        out = server.terra_create_method_config("ns", "ws", "cns", "cn", "mns", "mn", 3)
+        assert SENTINEL not in out, "create config leaked inputs/rootEntityType!"
+        assert '"created": true' in out
+    finally:
+        restore()
+        _tc.rawls_create_method_config = o
+
+
+@case("CC-ControlledAccess3", "start_runtime returns minimal ack (sentinel) in controlled mode")
+def _():
+    from mcp_terra import policy as _p
+    SENTINEL = "NA12878-secret-label"
+    o = _tc.leo_start_runtime
+    _tc.leo_start_runtime = lambda *a, **k: {
+        "runtimeName": "rt1", "labels": {"x": SENTINEL}, "proxyUrl": SENTINEL}
+    restore = _write_guards_on(_p)
+    try:
+        out = server.terra_start_runtime("proj", "rt1")
+        assert SENTINEL not in out, "leo start response leaked labels/URL!"
+        assert '"action": "start"' in out and "rt1" in out
+    finally:
+        restore()
+        _tc.leo_start_runtime = o
+
+
+@case("CC-ControlledAccess3", "get_workflow_cost returns numeric-only (sentinel) in controlled mode")
+def _():
+    from mcp_terra import policy as _p
+    saved, oc, ot = _p._CONTROLLED_ACCESS, _tc.rawls_get_workflow_cost, server.auth.get_access_token
+    SENTINEL = "workflow-NA12878-secret"
+    _tc.rawls_get_workflow_cost = lambda *a, **k: {
+        "cost": 1.23, "currency": "USD", "workflowName": SENTINEL,
+        "methodConfigurationName": SENTINEL}
+    server.auth.get_access_token = lambda: "tok"
+    try:
+        _p._CONTROLLED_ACCESS = True
+        out = server.terra_get_workflow_cost("ns", "ws", "sub", "wf")
+        assert SENTINEL not in out, "cost response leaked workflow/method names!"
+        assert "1.23" in out and "USD" in out
+    finally:
+        _p._CONTROLLED_ACCESS, _tc.rawls_get_workflow_cost, server.auth.get_access_token = saved, oc, ot
+
+
+@case("CC-ControlledAccess3", "upload_to_bucket returns an ack (no raw gsutil output) in controlled mode")
+def _():
+    import os as _os
+    import tempfile
+    from mcp_terra import policy as _p, bucket as _bk2
+    SENTINEL = "gs://fc-secure-x/NA12878-secret/out.bam"
+    o_up, o_safe, o_exist = _bk2.upload_file, safety.safe_bucket_uri, safety.bucket_object_exists
+    _bk2.upload_file = lambda *a, **k: f"Copying file://x [Content-Type=...]\n{SENTINEL}\n"
+    safety.safe_bucket_uri = lambda u: u
+    safety.bucket_object_exists = lambda u: False
+    fd, tmp = tempfile.mkstemp(suffix=".txt")
+    _os.write(fd, b"clean upload payload, no secrets\n")
+    _os.close(fd)
+    restore = _write_guards_on(_p)
+    try:
+        out = server.terra_upload_to_bucket(tmp, "gs://fc-secure-x/out.bam")
+        assert SENTINEL not in out, "raw gsutil output (object paths) leaked!"
+        assert '"ok": true' in out and "uploaded_to" in out
+    finally:
+        restore()
+        _bk2.upload_file, safety.safe_bucket_uri, safety.bucket_object_exists = o_up, o_safe, o_exist
+        _os.unlink(tmp)
+
+
+@case("CC-ControlledAccess3", "create_runtime/stop_runtime project the Leonardo response (source)")
+def _():
+    import inspect
+    csrc = inspect.getsource(server.terra_create_runtime)
+    assert 'create_resp = {' in csrc and "controlled_access_enabled()" in csrc
+    ssrc = inspect.getsource(server.terra_stop_runtime)
+    assert '"action": "stop"' in ssrc and "controlled_access_enabled()" in ssrc
 
 
 @case("CC-ControlledAccess3", "workflow_logs flags per-task stderr truncation (no false truncated=false)")

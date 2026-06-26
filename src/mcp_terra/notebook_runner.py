@@ -491,6 +491,22 @@ while true; do
         RESULT="$JOB_DIR/result.json"
         EXECUTED="$JOB_DIR/executed.ipynb"
 
+        # Codex r8: cross-runner safety. status.txt is the authoritative terminal
+        # marker. If a prior runner already wrote a terminal REFUSED status (e.g.
+        # a session-window refusal whose spec mv failed, leaving the spec still
+        # pending), NEVER execute it — a second runner/VM without our local
+        # processed file would otherwise re-run the job and SPEND. Refused jobs
+        # are terminal-by-decision; only a fresh-session restart (new spec)
+        # should run them.
+        EXISTING_STATUS="$(gsutil cat "$STATUS" 2>/dev/null || true)"
+        case "$EXISTING_STATUS" in
+            REFUSED*)
+                echo "[runner] job $JOB_ID already terminally REFUSED ($EXISTING_STATUS); skipping — not re-executing." >&2
+                echo "$JOB_ID" >> "$PROCESSED_FILE"
+                continue
+                ;;
+        esac
+
         echo "[runner] picking up $JOB_ID"
 
         LOCAL_SPEC="$WORK/$JOB_ID.spec.json"

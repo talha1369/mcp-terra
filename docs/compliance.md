@@ -51,7 +51,13 @@ compliance reviewer.
 | `terra_list_runtimes` (VMs) | allowed | **count + statuses only** (runtime names/labels/URLs withheld) |
 | `terra_get_runtime` (one VM) | allowed | **status + machine config** (labels/proxy-URL/creator withheld; name is the caller's own argument) |
 | `terra_recommend_runtime_for_notebook` | allowed | **refused** for non-public/non-allowlisted buckets (it cats the notebook bytes into the MCP host) |
-| `terra_refresh_workspace_allowlist` | allowed | with no lock: **bucket count only** (bucket names withheld) |
+| `terra_refresh_workspace_allowlist` | allowed | **bucket count only** (bucket names withheld; `fresh` spans all visible workspaces) |
+| `terra_submit_workflow` (return value) | allowed | **submission/workflow ids + status only** (methodConfigurationName + entity names withheld) |
+| `terra_register_method` (return value) | allowed | **snapshot id only** (method namespace/name, synopsis, WDL payload withheld) |
+| `terra_create_method_config` (return value) | allowed | **creation ack** (inputs/outputs, rootEntityType, method ref withheld) |
+| `terra_create_runtime` / `terra_start_runtime` / `terra_stop_runtime` (return value) | allowed | **minimal ack** (runtime name = caller arg; labels/proxy-URL/creator withheld) |
+| `terra_get_workflow_cost` (return value) | allowed | **numeric cost fields only** (workflow/method/entity names withheld) |
+| `terra_upload_to_bucket` (return value) | allowed (raw gsutil output) | **upload ack only** (raw gsutil output / object paths withheld) |
 | `terra_get_submission` (per-workflow detail) | allowed | **reduced** to submission/workflow **ids + statuses** (entity names + failure messages withheld) |
 | `terra_get_workflow_logs` (per-task stderr) | allowed (path bound to the queried workspace bucket) | **content AND paths withheld** (per-task status kept; stderr can print controlled data) |
 | `terra_get_run_log` (stdout/stderr) | allowed | **content withheld** (paths + status kept; a notebook can print controlled data) |

@@ -380,7 +380,14 @@ def terra_start_runtime(google_project: str, runtime_name: str) -> str:
         raise PermissionError(str(e))
     _pre("terra_start_runtime", SPEND, f"{google_project}/{runtime_name}")
     token = auth.get_access_token()
-    return _ok(tc.leo_start_runtime(token, google_project, runtime_name))
+    resp = tc.leo_start_runtime(token, google_project, runtime_name)
+    if policy.controlled_access_enabled():
+        # Codex r8: a Leonardo response can carry labels/proxyUrl/creator —
+        # return a minimal ack (caller-echoed name + the requested action).
+        return _ok({"runtimeName": runtime_name, "action": "start",
+                    "_controlled_access_withheld":
+                        "Leonardo response withheld (MCP_TERRA_CONTROLLED_ACCESS)."})
+    return _ok(resp)
 
 
 @server.tool(title="Stop Terra runtime", annotations=ANN_WRITE_IDEMP)
@@ -398,7 +405,13 @@ def terra_stop_runtime(google_project: str, runtime_name: str) -> str:
         raise PermissionError(str(e))
     _pre("terra_stop_runtime", WRITE_SAFE, f"{google_project}/{runtime_name}")
     token = auth.get_access_token()
-    return _ok(tc.leo_stop_runtime(token, google_project, runtime_name))
+    resp = tc.leo_stop_runtime(token, google_project, runtime_name)
+    if policy.controlled_access_enabled():
+        # Codex r8: minimal ack (caller-echoed name + action); no raw Leo payload.
+        return _ok({"runtimeName": runtime_name, "action": "stop",
+                    "_controlled_access_withheld":
+                        "Leonardo response withheld (MCP_TERRA_CONTROLLED_ACCESS)."})
+    return _ok(resp)
 
 
 @server.tool(title="Recommend runtime config for a notebook (no spend)",
@@ -740,6 +753,17 @@ def terra_create_runtime(
     # Never echo the secret back (Leonardo's create response may include the
     # customEnvironmentVariables we just sent).
     create_resp = _redact_runtime_env(create_resp)
+    # Codex r8: in guard mode don't echo the raw Leonardo payload (labels/
+    # proxyUrl/creator/config) — keep a minimal caller-echoed ack. Applies to
+    # BOTH the early return and the embedded leo_create_response below.
+    if policy.controlled_access_enabled():
+        create_resp = {
+            "runtimeName": runtime_name, "action": "create",
+            "status": (create_resp.get("status")
+                       if isinstance(create_resp, dict) else None),
+            "_controlled_access_withheld":
+                "Leonardo create response withheld (MCP_TERRA_CONTROLLED_ACCESS).",
+        }
 
     if not auto_start_runner:
         return _ok(create_resp)
@@ -971,7 +995,16 @@ def terra_upload_to_bucket(local_path: str, bucket_uri: str,
     # then upload.
     if dest_exists and version_existing:
         safety.version_existing_bucket(effective_dest, method=version_method)
-    return _ok(bk.upload_file(local_path, bucket_uri, recursive=recursive))
+    up = bk.upload_file(local_path, bucket_uri, recursive=recursive)
+    # Codex r8: raw `gsutil cp` output can enumerate object paths (esp. recursive).
+    # In guard mode return a minimal ack (the destination is the caller's own
+    # argument); the raw output is back-compat for non-controlled deployments.
+    if policy.controlled_access_enabled():
+        return _ok({"uploaded_to": bucket_uri, "recursive": recursive, "ok": True,
+                    "_controlled_access_withheld": (
+                        "raw gsutil output withheld (MCP_TERRA_CONTROLLED_ACCESS); "
+                        "upload acknowledged.")})
+    return _ok(up)
 
 
 @server.tool(title="Download from workspace bucket", annotations=ANN_WRITE_NEW)
@@ -2290,13 +2323,27 @@ def terra_submit_workflow(namespace: str, name: str,
          f"{namespace}/{name} config={config_namespace}/{config_name} "
          f"entity={entity_type or 'none'}/{entity_name or 'none'}")
     token = auth.get_access_token()
-    return _ok(tc.rawls_create_submission(
+    sub = tc.rawls_create_submission(
         token, namespace, name,
         method_config_namespace=config_namespace,
         method_config_name=config_name,
         entity_type=entity_type or None,
         entity_name=entity_name or None,
-        use_call_cache=use_call_cache))
+        use_call_cache=use_call_cache)
+    # Codex r8: the createSubmission response echoes methodConfigurationName +
+    # submissionEntity (operator/user-controlled). In guard mode project to
+    # ids + status only.
+    if policy.controlled_access_enabled() and isinstance(sub, dict):
+        sub = {
+            "submissionId": sub.get("submissionId"),
+            "status": sub.get("status"),
+            "workflowIds": [(w or {}).get("workflowId")
+                            for w in (sub.get("workflows") or [])],
+            "_controlled_access_withheld": (
+                "method config + entity names withheld "
+                "(MCP_TERRA_CONTROLLED_ACCESS); submission/workflow ids + status only."),
+        }
+    return _ok(sub)
 
 
 @server.tool(title="Get workflow submission status", annotations=ANN_READ_REMOTE)
@@ -2540,8 +2587,23 @@ def terra_get_workflow_cost(namespace: str, name: str,
     _pre("terra_get_workflow_cost", READ,
          f"{namespace}/{name} sub={submission_id} wf={workflow_id}")
     token = auth.get_access_token()
-    return _ok(tc.rawls_get_workflow_cost(token, namespace, name,
-                                          submission_id, workflow_id))
+    cost = tc.rawls_get_workflow_cost(token, namespace, name,
+                                      submission_id, workflow_id)
+    # Codex r8: the cost payload could carry workflowName / methodConfigurationName
+    # / entity ids. In guard mode keep ONLY numeric cost fields + the caller's own
+    # ids (workflowId is the caller's argument).
+    if policy.controlled_access_enabled() and isinstance(cost, dict):
+        _num = {k: v for k, v in cost.items()
+                if isinstance(v, (int, float)) and not isinstance(v, bool)}
+        cost = {
+            "workflowId": workflow_id,            # caller-supplied echo
+            "currency": cost.get("currency"),     # enum-like
+            **_num,
+            "_controlled_access_withheld": (
+                "workflow/method/entity names withheld "
+                "(MCP_TERRA_CONTROLLED_ACCESS); numeric cost fields only."),
+        }
+    return _ok(cost)
 
 
 @server.tool(title="Get workflow task logs (stderr/stdout)", annotations=ANN_READ_REMOTE)
@@ -3078,8 +3140,18 @@ def terra_register_method(method_namespace: str, method_name: str,
     _pre("terra_register_method", WRITE_SAFE,
          f"agora {method_namespace}/{method_name} ({len(wdl)} bytes)")
     token = auth.get_access_token()
-    return _ok(tc.agora_register_method(token, method_namespace, method_name, wdl,
-                                        synopsis=synopsis))
+    reg = tc.agora_register_method(token, method_namespace, method_name, wdl,
+                                   synopsis=synopsis)
+    # Codex r8: the Agora response echoes the WDL payload + synopsis + method
+    # namespace/name. In guard mode return only the (integer) snapshot id.
+    if policy.controlled_access_enabled() and isinstance(reg, dict):
+        reg = {
+            "snapshotId": reg.get("snapshotId"),
+            "_controlled_access_withheld": (
+                "method namespace/name, synopsis, and WDL payload withheld "
+                "(MCP_TERRA_CONTROLLED_ACCESS); snapshot id only."),
+        }
+    return _ok(reg)
 
 
 @server.tool(title="Create a workflow method config", annotations=ANN_WRITE_NEW)
@@ -3117,12 +3189,25 @@ def terra_create_method_config(namespace: str, name: str,
          f"{namespace}/{name} config={config_namespace}/{config_name} "
          f"method={method_namespace}/{method_name}/{method_version}")
     token = auth.get_access_token()
-    return _ok(tc.rawls_create_method_config(
+    mc_resp = tc.rawls_create_method_config(
         token, namespace, name,
         config_namespace=config_namespace, config_name=config_name,
         method_namespace=method_namespace, method_name=method_name,
         method_version=method_version, inputs=inputs, outputs=outputs,
-        root_entity_type=root_entity_type or None))
+        root_entity_type=root_entity_type or None)
+    # Codex r8: the created-config response echoes inputs/outputs maps,
+    # rootEntityType, and method/config names. In guard mode return a minimal
+    # ack with the caller's own config namespace/name only.
+    if policy.controlled_access_enabled() and isinstance(mc_resp, dict):
+        mc_resp = {
+            "namespace": config_namespace,   # caller-supplied echo
+            "name": config_name,             # caller-supplied echo
+            "created": True,
+            "_controlled_access_withheld": (
+                "inputs/outputs, rootEntityType, and method ref withheld "
+                "(MCP_TERRA_CONTROLLED_ACCESS); creation ack only."),
+        }
+    return _ok(mc_resp)
 
 
 # ── Audio summary rendering (Gemini 2.5 Flash TTS, opt-in) ──────────────────
@@ -3291,14 +3376,14 @@ def terra_refresh_workspace_allowlist() -> str:
     """
     _pre("terra_refresh_workspace_allowlist", READ, "Rawls bucket refresh")
     fresh = safety.force_refresh_bucket_allowlist()
-    # Codex r7: bucket names are workspace/operator-controlled identifiers — in
-    # guard mode without a lock return the count only (mirrors the count-only
-    # terra_list_workspaces behaviour; don't enumerate identifying buckets).
-    if policy.controlled_access_enabled() and policy.resolve_locked_workspace() is None:
+    # Codex r8: `fresh` is the FULL Rawls allowlist across ALL visible
+    # workspaces — even with a lock set, returning it leaks other workspaces'
+    # bucket names. In guard mode ALWAYS return the count only.
+    if policy.controlled_access_enabled():
         return _ok({
             "bucket_count": len(fresh),
             "_controlled_access_withheld": (
-                "bucket names withheld (MCP_TERRA_CONTROLLED_ACCESS, no lock) — "
+                "bucket names withheld (MCP_TERRA_CONTROLLED_ACCESS) — "
                 "workspace/operator-controlled identifiers; count only."),
         })
     return _ok({"bucket_count": len(fresh), "buckets": sorted(fresh)[:50]})

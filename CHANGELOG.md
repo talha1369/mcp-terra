@@ -392,6 +392,24 @@ tests exercise the templates in isolation, so these were latent):
     guard mode (it cats the notebook bytes into the MCP host).
   - `Content-Type` (operator-settable) dropped from the `gsutil stat`
     controlled-mode allowlist.
+- **Adversarial-review hardening (Codex) — round 8** (re-review of round-7):
+  closed 7 more findings — the **write/lifecycle return values** were the last
+  unprojected controlled-access surface.
+  - Controlled-mode projections added to `terra_submit_workflow` (ids + status),
+    `terra_register_method` (snapshot id), `terra_create_method_config` (ack),
+    `terra_create_runtime` / `terra_start_runtime` / `terra_stop_runtime`
+    (minimal ack), `terra_get_workflow_cost` (numeric only), and
+    `terra_upload_to_bucket` (ack, not raw gsutil output).
+  - `terra_refresh_workspace_allowlist` is now **always** count-only in guard
+    mode (the locked path leaked the full cross-workspace bucket list).
+  - The runner's `REFUSED-SESSION-WINDOW` path writes the terminal status FIRST,
+    and the pickup loop now **skips any spec whose status.txt is `REFUSED*`** —
+    a refused job can no longer be re-executed (and re-billed) by a second
+    runner that lacks the local processed-id file.
+  - **New fail-closed structural meta-test**: asserts that **no `_NO_DATA` tool
+    raw-returns a `tc.*`/`bk.*` payload** (the root cause that let the
+    write-side leaks pass), with `terra_whoami` (caller's own identity) the only
+    allowlisted exception. 31/43 tools now carry controlled-mode projections.
 - **No delete primitive, by design** — no tool (and no `leo_delete_runtime`
   at any layer) deletes a runtime or persistent disk; teardown is the user's
   action in the Terra UI ("Keep persistent disk"). The MCP detects a
