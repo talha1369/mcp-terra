@@ -399,20 +399,47 @@ def assert_bucket_allowed(gs_uri: str) -> None:
 # ── Rate limiting (sliding window) ─────────────────────────────────────────
 
 class RateLimiter:
-    """Sliding-window per-process rate limiter.
+    """Two-tier sliding-window per-process rate limiter.
 
-    Default: 60 calls / minute. Set MCP_TERRA_MAX_CALLS_PER_MIN to override.
+    A bot that paces itself just under a per-minute cap can still grind
+    indefinitely (60/min = 3600/hr). So we enforce BOTH a burst window
+    (per-minute) AND a sustained window (per-hour): a caller may burst up to
+    `max_per_minute` but cannot exceed `max_per_hour` over any rolling hour.
+
+    This caps the FREQUENCY of MCP tool calls, NOT the duration of a Terra job.
+    A notebook/WDL run can take many hours — it is a single submit plus periodic
+    status polls; the cap is sized so even heavy parallel monitoring (dozens of
+    concurrent submissions polled every 30-60s) stays well under it.
+
+    Defaults: 60/min, 3000/hour. Override via MCP_TERRA_MAX_CALLS_PER_MIN /
+    MCP_TERRA_MAX_CALLS_PER_HOUR.
     """
-    def __init__(self, max_per_minute: int = 60):
+    def __init__(self, max_per_minute: int = 60, max_per_hour: int = 3000):
         self.max = max_per_minute
+        self.max_hour = max_per_hour
         self.window: collections.deque[float] = collections.deque()
+        self.hour_window: collections.deque[float] = collections.deque()
         self.lock = threading.Lock()
 
     def check(self, tool_name: str) -> None:
-        """Record a call. Raises RuntimeError if over the limit."""
+        """Record a call. Raises PolicyError if over the burst or sustained cap."""
         now = time.monotonic()
         with self.lock:
-            # Drop entries older than 60s
+            # Sustained (per-hour) window first — the anti-grind defense.
+            while self.hour_window and now - self.hour_window[0] > 3600.0:
+                self.hour_window.popleft()
+            if len(self.hour_window) >= self.max_hour:
+                wait_s = int(3600 - (now - self.hour_window[0]))
+                raise PolicyError(
+                    f"mcp-terra sustained rate limit exceeded: {self.max_hour} "
+                    f"calls/hour. Last hour saw {len(self.hour_window)} tool calls. "
+                    f"This is a defense against a self-paced bot grinding under the "
+                    f"per-minute cap. Wait ~{wait_s}s.",
+                    code="E_RATE_LIMITED",
+                    retryable=True,
+                    user_action_required=f"wait ~{wait_s}s and retry",
+                )
+            # Burst (per-minute) window — drop entries older than 60s.
             while self.window and now - self.window[0] > 60.0:
                 self.window.popleft()
             if len(self.window) >= self.max:
@@ -427,10 +454,12 @@ class RateLimiter:
                 )
                 raise err
             self.window.append(now)
+            self.hour_window.append(now)
 
 
 _RATE_LIMIT = int(os.environ.get("MCP_TERRA_MAX_CALLS_PER_MIN", "60"))
-_LIMITER = RateLimiter(max_per_minute=_RATE_LIMIT)
+_RATE_LIMIT_HOUR = int(os.environ.get("MCP_TERRA_MAX_CALLS_PER_HOUR", "3000"))
+_LIMITER = RateLimiter(max_per_minute=_RATE_LIMIT, max_per_hour=_RATE_LIMIT_HOUR)
 
 
 def enforce_rate_limit(tool_name: str) -> None:

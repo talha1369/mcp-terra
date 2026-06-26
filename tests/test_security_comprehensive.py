@@ -367,6 +367,21 @@ def _():
     rl.check("tool"); rl.check("tool"); rl.check("tool")
     must_raise(rl.check, RuntimeError, "tool")
 
+@case("E-Policy", "rate limiter enforces sustained per-hour cap (anti-grind)")
+def _():
+    # A bot pacing under the per-minute cap must still hit the hourly ceiling.
+    # High per-minute so only the sustained window can trip.
+    rl = policy.RateLimiter(max_per_minute=10_000, max_per_hour=3)
+    rl.check("tool"); rl.check("tool"); rl.check("tool")
+    err = must_raise(rl.check, RuntimeError, "tool")
+    assert "hour" in str(err).lower(), f"expected hourly-cap message, got: {err}"
+
+@case("E-Policy", "rate limiter default carries a sustained hourly cap")
+def _():
+    # The process-wide limiter must have a finite hourly ceiling (not just /min).
+    assert policy._LIMITER.max_hour >= 1, "no sustained hourly cap configured"
+    assert policy._LIMITER.max_hour <= 100_000, "hourly cap implausibly high"
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # F. TOOL REGISTRATION / NO-DESTRUCTION
@@ -1315,7 +1330,7 @@ def _():
                                      job_id="aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa",
                                      wait_for_complete=True, timeout_s=0),
         (ValueError, safety.SafetyError, PermissionError, policy.PolicyError))
-    # timeout_s=99999 → must raise (over 3600 cap)
+    # timeout_s=99999 → must raise (over the session-window ceiling, ~86400s)
     must_raise(lambda: _aio.get_event_loop().run_until_complete(
         tool.fn(bucket_uri="gs://fake-bucket/x", job_id="aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa",
                 wait_for_complete=True, timeout_s=99999)

@@ -1,6 +1,6 @@
 # mcp-terra — Security Audit & Threat Model
 
-Last audited: 2026-06-25.
+Last audited: 2026-06-26.
 
 ## Threat model
 
@@ -11,6 +11,7 @@ Last audited: 2026-06-25.
 | Compromised dependency (mcp / httpx / pydantic) | Partial | Version bounds capped in pyproject.toml; no upper-cap defense vs supply-chain compromise within the allowed range. |
 | Local TOCTOU between path check and file I/O | **No** | Window is small; race requires shell access (already in compromised-host scope). |
 | Network-level MitM on Terra API calls | Inherited | TLS via httpx default; Terra services are HTTPS-only. |
+| Automated/bot abuse (runaway loop, bulk exfil, spend burn) | **Yes** (layered, duration-bounded) | The **24h Terra session limit is the primary bound** — the runner's credential window and VM session expire at ~24h, so no bot-driven loop can outlive a day (runner self-halts at the session deadline). Layered on top: per-minute burst cap (60/min) + a generous sustained per-hour backstop (3000/hr, sized so heavy parallel polling never trips it); per-session **submit cap** (25) bounds spend-causing actions; **spend cap** self-halts the VM at `$MCP_TERRA_MAX_COST_USD`; **kill-switch auto-trips** on refusal bursts; controlled-access guard blocks controlled-data egress regardless of call volume. Rate limits are call-FREQUENCY bounds, never job-DURATION limits — a single analysis cell may run 6h+ and a job up to the full session. |
 
 ## Audit history
 
@@ -64,7 +65,7 @@ These are real but either out of scope or fundamentally hard:
 
 2. **Code-integrity hash is informational only.** The startup banner prints SHA-256 of each `.py` file, but the MCP does NOT compare against a signed manifest. An attacker who modifies the source on disk can also adjust their expectations of what the hash should be. Real mitigation would require a signed manifest; out of scope for v1.
 
-3. **Per-process rate limit.** The 60-call/min limit is enforced per-process. An attacker who can spawn MCP processes (i.e., has shell) can run multiple in parallel to bypass. This is consistent with the compromised-host threat model's irreducibility.
+3. **Per-process rate limit.** The 60-call/min burst cap + 3000-call/hour sustained backstop are enforced per-process. An attacker who can spawn MCP processes (i.e., has shell) can run multiple in parallel to bypass. This is consistent with the compromised-host threat model's irreducibility — and is itself bounded by the **24h Terra session limit** (the per-process credentials and VM session expire within a day, so even a multi-process bot is duration-bounded). The rate caps are deliberately generous so they never throttle legitimate hours-long or many-job-parallel workloads; the real bot bounds are the 24h session, the submit cap, the spend cap, and the kill-switch.
 
 4. **Workspace allowlist relies on Terra's ACL.** Bucket access is gated by the user's Rawls-reported workspace list, refreshed every 5 minutes. If Terra itself is compromised and adds attacker-controlled buckets to the user's ACL, the MCP would honor that. Outside our threat model.
 
@@ -72,9 +73,42 @@ These are real but either out of scope or fundamentally hard:
 
 6. **No supply-chain defense within version bounds.** `httpx 0.27.0` and `httpx 0.99.0` are both accepted; if a malicious version is released in that range, we'd pick it up on next `pip install`. Standard pip caveat; pin tighter for production deployments.
 
+## Terra operational robustness
+
+Real Terra behaviors the MCP is built to survive (not security holes, but
+operational cliffs that would otherwise fail a long/parallel run):
+
+- **24h session window.** Terra credentials and the VM session expire at ~24h.
+  The on-VM runner tracks a per-session deadline, caps each job's wall-clock
+  budget to the time remaining, self-halts the VM at the deadline, and labels a
+  cut-off run `FAILED-SESSION-LIMIT` (never a silent hang). `terra_submit_notebook_job`
+  surfaces a session-limit advisory. Tune with `MCP_TERRA_MAX_RUN_HOURS` (1..24).
+- **Long single cells / long jobs.** The papermill per-cell timeout defaults to
+  **360 min (6h)**, max 1440 (24h), capped only by the remaining session — a
+  single heavy analysis cell can run for hours. The `wait_for_complete` poll
+  ceiling is the full session window (not a fixed hour), so a multi-hour run can
+  be awaited in one call. Rate limits bound call *frequency*, never job *duration*.
+- **Requester-pays buckets.** Some curated datasets are requester-pays — `gsutil`
+  refuses to read them without a billing project. Set
+  `MCP_TERRA_REQUESTER_PAYS_PROJECT=<your workspace googleProject>` and the MCP
+  passes `gsutil -u <project>` on every bucket op (harmless for normal buckets).
+- **Controlled-access link expiry.** dbGaP / eRA-Commons authorization links
+  renew on a ~30-day cycle; if a link lapses mid-analysis you lose data access
+  and localization fails. For multi-day controlled-data work, confirm the link
+  is current before submitting. (Separate from the 24h credential window.)
+- **Billing is per-workspace.** Costs (compute, storage, **egress**, requester-
+  pays) are charged to the workspace's billing project, not the caller. The MCP's
+  VM-uptime spend cap (`MCP_TERRA_MAX_COST_USD` + `MCP_TERRA_VM_HOURLY_USD`,
+  self-halt at the cap, warn at 80%) is a local guard; the authoritative bound is
+  a GCP budget alert on the billing project.
+
+New tunables introduced here: `MCP_TERRA_REQUESTER_PAYS_PROJECT` (requester-pays
+billing project) and `MCP_TERRA_MAX_CALLS_PER_HOUR` (sustained rate backstop,
+default 3000).
+
 ## Comprehensive attack-class coverage (`tests/test_security_comprehensive.py`)
 
-**349/349 tests pass** across 48 attack classes. The table below is generated
+**357/357 tests pass** across 50 attack classes. The table below is generated
 from the suite itself; the test file is the authoritative source. Run yourself:
 
 ```bash

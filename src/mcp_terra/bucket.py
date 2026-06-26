@@ -60,9 +60,16 @@ def _run_gsutil(args: list[str], *, timeout: float = 120.0,
             "If installed, add its bin dir to the MCP server's PATH env in "
             "~/.claude/settings.json."
         )
+    # Requester-pays support: a requester-pays bucket bills the ACCESSING project
+    # and gsutil refuses without `-u <project>`. When the operator sets
+    # MCP_TERRA_REQUESTER_PAYS_PROJECT (their workspace's googleProject), pass it
+    # as the top-level `-u` flag (harmless for non-requester-pays buckets). Lets
+    # the MCP read curated requester-pays datasets that otherwise fail. (Terra.)
+    _rp = os.environ.get("MCP_TERRA_REQUESTER_PAYS_PROJECT", "").strip()
+    _pre = ["-u", _rp] if _rp else []
     try:
         out = subprocess.run(
-            [gsutil] + args,
+            [gsutil] + _pre + args,
             capture_output=True, text=True, timeout=timeout, check=False,
         )
     except subprocess.TimeoutExpired:

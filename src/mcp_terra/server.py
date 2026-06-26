@@ -1643,8 +1643,9 @@ def terra_get_notebook_job_result(bucket_uri: str, job_id: str,
             reaches a terminal state (succeeded/FAILED) or timeout_s elapses.
             Default False (one-shot poll).
         timeout_s: max seconds to wait when wait_for_complete=True.
-            Must be 1..3600 (hard ceiling — refuses runaway agent waits).
-            Ignored when wait_for_complete=False.
+            Bounded by the Terra session window (up to ~24h, = MCP_TERRA_MAX_RUN_HOURS)
+            so multi-hour jobs can be awaited in one call; still refuses an
+            unbounded/runaway wait. Ignored when wait_for_complete=False.
         poll_interval_s: seconds between internal polls when waiting.
             Clamped to 5..300.
 
@@ -1659,10 +1660,16 @@ def terra_get_notebook_job_result(bucket_uri: str, job_id: str,
     safety.safe_bucket_uri(bucket_uri)
     safety.validate_identifier(job_id, "job_id")
     if wait_for_complete:
-        if not (1 <= timeout_s <= 3600):
+        # A notebook job runs for the whole Terra session window (up to ~24h),
+        # so a single wait may legitimately span hours — bound the wait by that
+        # SAME session window (the job cannot outlive it) rather than a fixed
+        # hour. Still bounded, never unbounded.
+        _wait_ceiling = max(3600, policy.max_run_hours() * 3600)
+        if not (1 <= timeout_s <= _wait_ceiling):
             raise ValueError(
-                f"timeout_s must be 1..3600 when wait_for_complete=True; "
-                f"got {timeout_s}. Refusing to wait an unbounded amount of time."
+                f"timeout_s must be 1..{_wait_ceiling} (the Terra session window) "
+                f"when wait_for_complete=True; got {timeout_s}. Refusing to wait an "
+                f"unbounded amount of time."
             )
         if not (5 <= poll_interval_s <= 300):
             raise ValueError(

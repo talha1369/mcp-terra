@@ -193,13 +193,26 @@ def verify_result_signature(result: dict, secret: str) -> bool:
 
 
 def get_runner_secret() -> str:
-    """Get the runner shared secret from env. Raises if missing/short."""
+    """Get the runner shared secret. Prefers MCP_TERRA_RUNNER_SECRET; falls back
+    to reading MCP_TERRA_RUNNER_SECRET_FILE (a 0600 file path) so installers /
+    the plugin can AUTO-GENERATE the secret into a file instead of requiring it
+    pasted into env. Raises if missing/short."""
     secret = os.environ.get("MCP_TERRA_RUNNER_SECRET", "").strip()
     if not secret:
+        _f = os.environ.get("MCP_TERRA_RUNNER_SECRET_FILE", "").strip()
+        if _f:
+            try:
+                _p = os.path.realpath(os.path.expanduser(_f))
+                if os.path.isfile(_p):
+                    with open(_p, encoding="utf-8") as _fh:
+                        secret = _fh.read().strip()
+            except OSError:
+                secret = ""
+    if not secret:
         raise RuntimeError(
-            "MCP_TERRA_RUNNER_SECRET env var not set. The MCP cannot submit "
-            "notebook jobs without it (HMAC signing is mandatory). Generate "
-            "a fresh secret with: python -c "
+            "MCP_TERRA_RUNNER_SECRET (or MCP_TERRA_RUNNER_SECRET_FILE) not set. "
+            "The MCP cannot submit notebook jobs without it (HMAC signing is "
+            "mandatory). Generate a fresh secret with: python -c "
             "'import secrets; print(secrets.token_urlsafe(32))' "
             "and set both this env var (in the MCP) AND the same value in "
             "the runner script's env on the Terra VM."

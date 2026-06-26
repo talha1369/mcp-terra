@@ -104,9 +104,16 @@ so they never double-run a job. Size each env to its workload.
    version_method='bak')` (preserves the prior version as `.BAK.<ts>`).
 2. **Submit:** `terra_submit_notebook_job(notebook_gcs=<dest>,
    bucket_uri=<bucket>, auto_stop_after_completion=True)` (auto-stop only
-   when this is the user's last/only run).
+   when this is the user's last/only run). **Long analyses:** the per-cell
+   timeout defaults to **360 min (6 h)** — a single heavy cell can run that
+   long. If the user expects a cell to run longer, pass
+   `timeout_minutes=<up to 1440>` (24 h, the Terra session ceiling).
 3. **Wait+poll:** `terra_get_notebook_job_result(bucket_uri, job_id,
-   wait_for_complete=True, timeout_s=3600)`.
+   wait_for_complete=True, timeout_s=<seconds>)`. `timeout_s` may be up to the
+   full Terra **session window** (~24 h) — size it to the expected run, e.g.
+   `3600` for a quick notebook, `28800` for an 8-hour analysis. If the wait
+   returns a non-terminal status (the run is still going), just call again to
+   keep waiting — re-polling never re-submits or disrupts the running job.
 4. **Branch:**
    - `succeeded` → go to Phase 4.
    - `FAILED` → read the `triage` block and act:

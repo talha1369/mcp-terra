@@ -117,14 +117,30 @@ the top-line status — one line per check, e.g.
   whole scatter from scratch.
 
 - **All `Succeeded`** → Phase 7.
-- **`Failed`** → read the workflow's failure messages. Fix by category:
-  - WDL syntax/type error → edit the WDL, re-validate (Phase 2),
+- **`Failed`** → read the workflow's failure messages. Cromwell/Google-Batch
+  errors fall into a stable set of categories — fix by category:
+  - **WDL syntax/type error** → edit the WDL, re-validate (Phase 2),
     **re-register** (new snapshot, Phase 3), **re-config** (new name, Phase 4),
     re-submit. (Agora is append-only — every fix is a new snapshot.)
-  - bad input value/path → fix `inputs_json`, new config, re-submit.
-  - missing Docker tool / runtime error → adjust the task `runtime`/`command`,
-    re-register, re-submit.
-  - quota / transient → surface to the user (don't loop on infra).
+  - **bad input value / wrong variable** (fails almost immediately, before any
+    task runs) → a required input is unset or a `this.`/literal expression is
+    wrong. Fix `inputs_json`, new config, re-submit.
+  - **localization failure** ("failed to localize", file not found / no access)
+    → the input GCS path is wrong, the object was moved/deleted, or you lack
+    read access (incl. a **requester-pays** bucket — set
+    `MCP_TERRA_REQUESTER_PAYS_PROJECT` so reads are billed, or a **controlled-
+    access auth-domain** you're not in). Verify the path with `terra_list_bucket`
+    / `terra_get_bucket_object_metadata`, fix the input, re-submit.
+  - **task failed on the VM** (Google-Batch/PAPI "error 9", non-zero return
+    code) → the task's `command` failed. Read the task `stderr` (in the call's
+    `gs://…/call-<task>/…/stderr`) via `terra_get_workflow_logs`; fix the command
+    or the missing Docker tool in `runtime`, re-register, re-submit.
+  - **machine/VM failed** (Google-Batch/PAPI "error 10", OOM-killed, "no space
+    left on device") → the task needs more memory or disk. Bump the task
+    `runtime { memory: "Ng"  disk: "N GB" }`, re-register, re-submit.
+  - **quota / transient infra** ("Quota exceeded", preemption, 5xx) → surface to
+    the user (don't loop on infra). A plain transient often succeeds on a bare
+    re-submit — call-caching reuses the shards that already succeeded.
 - **`Aborted`** (user stopped it in the UI) → STOP, surface state.
 
 Cap at 5 fix iterations; then surface every attempt.

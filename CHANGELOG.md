@@ -9,6 +9,28 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **Long-run / parallel robustness (Terra-fact hardening).** Folded real Terra
+  operational behaviors into the MCP so multi-hour and many-job-parallel runs are
+  not disrupted:
+  - **No hour-cap on jobs.** The `wait_for_complete` poll ceiling is now the full
+    Terra **session window** (up to ~24h via `MCP_TERRA_MAX_RUN_HOURS`) instead of
+    a fixed 1h, so a multi-hour run can be awaited in one call. The per-cell
+    papermill timeout already allows 6h default / 24h max — a single heavy analysis
+    cell can legitimately run for hours.
+  - **Requester-pays buckets** — new `MCP_TERRA_REQUESTER_PAYS_PROJECT`; when set,
+    the MCP passes `gsutil -u <project>` on every bucket op so curated
+    requester-pays datasets are readable (harmless for normal buckets).
+  - **Sustained rate backstop** — the rate limiter gained a per-hour window
+    (`MCP_TERRA_MAX_CALLS_PER_HOUR`, default 3000) complementing the 60/min burst
+    cap. Sized so heavy parallel polling never trips it; it bounds call FREQUENCY,
+    never job DURATION. The **24h session limit remains the primary bot bound**.
+  - **WDL failure taxonomy** — `terra-wdl-run` now triages Cromwell/Google-Batch
+    failures by category (localization, task-failed, OOM/disk, transient, bad
+    input) with concrete per-category fixes.
+  - SECURITY.md gains a bot-abuse threat row and a "Terra operational robustness"
+    section (24h session, long cells, requester-pays, controlled-link 30-day
+    expiry, per-workspace billing).
+
 - **Workspace spend cap (`MCP_TERRA_MAX_COST_USD`)** — opt-in credit limit that
   warns in advance and **halts before overage**. The on-VM runner estimates this
   VM's compute spend honestly (uptime x the operator-set `MCP_TERRA_VM_HOURLY_USD`
