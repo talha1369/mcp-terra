@@ -1210,10 +1210,15 @@ def _():
     # env parse + clamp
     assert 'RUNNER_CONCURRENCY="${MCP_TERRA_RUNNER_CONCURRENCY:-4}"' in src
     assert '[ "$RUNNER_CONCURRENCY" -gt 16 ] && RUNNER_CONCURRENCY=16' in src
-    # the throttle + background subshell + once-wrapper + batch drain
+    # the throttle + background subshell + once-wrapper + guarded batch drain
     assert 'wait -n 2>/dev/null || true' in src, "missing pool throttle"
     assert 'for _spec_once in 1; do' in src, "missing continue-preserving wrapper"
-    assert 'wait || true' in src, "missing batch-drain wait"
+    # batch drain is a guard-checking loop (enforces spend cap + abort sentinel
+    # while a busy pool runs), not a bare wait
+    assert 'while [ "$(jobs -rp | wc -l)" -gt 0 ]; do' in src, "missing guarded batch drain"
+    assert 'check_pool_guards' in src, "drain must enforce pool guards"
+    # the per-job subshell must clean up its lease on ANY exit path
+    assert "trap 'stop_refresher' EXIT" in src, "missing per-job EXIT trap"
 
 @case("CC-Concurrency", "concurrency var is integer-validated in the runner")
 def _():
@@ -1249,6 +1254,92 @@ def _():
     assert '"MCP_TERRA_RUNNER_CONCURRENCY": str(policy.runner_concurrency())' in src
     # start_runner_on_vm SSH bootstrap env line
     assert "MCP_TERRA_RUNNER_CONCURRENCY='{policy.runner_concurrency()}'" in src
+
+
+# ── CC-Hardening: concurrency + plugin-bootstrap hardening regressions ──────
+
+@case("CC-Hardening", "lease refresher resilient to transient errors (critical)")
+def _():
+    from mcp_terra import notebook_runner as nbr
+    src = nbr.runner_script_template()
+    # only give up on a definitive owner change or sustained failure near TTL —
+    # a single transient stat/CAS hiccup must NOT drop the lease + double-execute
+    assert "reclaimed by '$_ro'" in src, "no definitive-owner-change detection"
+    assert "_giveup=" in src and "transient lease-stat failure" in src, "no transient grace window"
+
+@case("CC-Hardening", "per-job EXIT trap stops the lease refresher on any exit")
+def _():
+    from mcp_terra import notebook_runner as nbr
+    assert "trap 'stop_refresher' EXIT" in nbr.runner_script_template()
+
+@case("CC-Hardening", "spend cap enforced during a busy batch + child abort reaches parent")
+def _():
+    from mcp_terra import notebook_runner as nbr
+    src = nbr.runner_script_template()
+    assert "enforce_spend_cap()" in src and "check_pool_guards()" in src
+    assert 'RUNNER_ABORT="$WORK/.runner_abort"' in src
+    assert "fail-streak-halt" in src and "symlink-fatal" in src, "child abort sentinel not raised"
+    # the drain loop calls the guard, not a bare wait
+    assert 'while [ "$(jobs -rp | wc -l)" -gt 0 ]; do\n        check_pool_guards' in src
+
+@case("CC-Hardening", "fail-streak decision captured inside the lock (no shared-file race)")
+def _():
+    from mcp_terra import notebook_runner as nbr
+    src = nbr.runner_script_template()
+    assert "FS_DECISION_FILE" not in src, "shared decision file still present (race)"
+    assert 'FS_DECISION="$(' in src, "decision not captured via command substitution"
+
+@case("CC-Hardening", "spec freshness window defaults to the session budget (queued jobs)")
+def _():
+    from mcp_terra import notebook_runner as nbr
+    src = nbr.runner_script_template()
+    assert 'MCP_TERRA_SPEC_MAX_AGE_SEC="${MCP_TERRA_SPEC_MAX_AGE_SEC:-$SESSION_BUDGET_SEC}"' in src
+
+@case("CC-Hardening", "rate limiter clamps 0/negative caps (no IndexError crash)")
+def _():
+    rl = policy.RateLimiter(max_per_minute=0, max_per_hour=0)
+    assert rl.max >= 1 and rl.max_hour >= 1
+    rl.check("t")  # first call must not crash building a wait msg on an empty deque
+    err = must_raise(rl.check, RuntimeError, "t")
+    assert "rate limit" in str(err).lower()
+
+@case("CC-Hardening", "_int_env_clamped falls back on junk/0/negative env")
+def _():
+    import os as _os
+    saved = _os.environ.get("MCP_TERRA_MAX_CALLS_PER_MIN")
+    try:
+        for raw in ("0", "-5", "abc"):
+            _os.environ["MCP_TERRA_MAX_CALLS_PER_MIN"] = raw
+            assert policy._int_env_clamped("MCP_TERRA_MAX_CALLS_PER_MIN", 60) == 60
+        _os.environ.pop("MCP_TERRA_MAX_CALLS_PER_MIN", None)
+        assert policy._int_env_clamped("MCP_TERRA_MAX_CALLS_PER_MIN", 60) == 60
+    finally:
+        if saved is None:
+            _os.environ.pop("MCP_TERRA_MAX_CALLS_PER_MIN", None)
+        else:
+            _os.environ["MCP_TERRA_MAX_CALLS_PER_MIN"] = saved
+
+@case("CC-Hardening", "install.sh passes the runner secret via env, never argv")
+def _():
+    sh = (REPO_ROOT / "install.sh").read_text()
+    assert "_validate_secret_strength('$RUNNER_SECRET')" not in sh, "secret still interpolated into argv"
+    assert 'MCP_TERRA_RUNNER_SECRET="$RUNNER_SECRET" "$VENV_PY"' in sh, "secret not passed via env"
+    # reuse path validates the secret file (symlink/owner/mode)
+    assert "is a symlink — refusing" in sh and "not owned by you" in sh
+
+@case("CC-Hardening", "plugin launcher validates + parses config.env (never sources it)")
+def _():
+    sh = (REPO_ROOT / "scripts" / "terra-mcp-launch.sh").read_text()
+    assert '. "$CFG"' not in sh, "launcher still sources config.env (shell-exec risk)"
+    assert "is a symlink — refusing" in sh and "must be mode 0600" in sh
+    assert "ignoring unrecognized config key" in sh, "no allowlist parse"
+
+@case("CC-Hardening", "start_runner_on_vm binds the heartbeat to the requested runtime")
+def _():
+    import inspect
+    src = inspect.getsource(server.terra_start_runner_on_vm)
+    assert "hb_runtime != runtime_name" in src, "heartbeat not bound to runtime"
+    assert "raw_age < -120" in src, "no future-skew rejection"
 
 
 # ──────────────────────────────────────────────────────────────────────────

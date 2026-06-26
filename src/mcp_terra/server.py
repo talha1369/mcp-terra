@@ -1371,20 +1371,37 @@ echo "runner_pid=$PID"
     hb_path = f"{bucket_clean}/{nbr.JOBS_PREFIX}/.runner_heartbeat.txt"
     deadline = time.monotonic() + 60.0
     hb_age = None
+    saw_other = None
     while time.monotonic() < deadline:
         try:
             hb_text = bk._run_gsutil(["cat", hb_path], timeout=15.0).strip()
-            hb_age = max(0, int(time.time()) - nbr.parse_heartbeat(hb_text)[0])
-            if hb_age < 30:
+            hb_epoch, hb_runtime = nbr.parse_heartbeat(hb_text)
+            raw_age = int(time.time()) - hb_epoch
+            hb_age = max(0, raw_age)
+            # security review: bind the heartbeat to THIS runtime (parity with
+            # terra_create_runtime). A DIFFERENT VM writing the shared workspace
+            # heartbeat must NOT be read as "this runtime started", and an
+            # implausibly future-dated stamp (forged/skewed) that max(0,...) would
+            # mask as fresh is rejected too.
+            if hb_runtime != runtime_name:
+                if hb_runtime is not None:
+                    saw_other = hb_runtime
+                hb_age = None
+            elif raw_age < -120:
+                hb_age = None
+            elif hb_age < 30:
                 break
         except (bk.BucketError, ValueError):
-            pass
+            hb_age = None
         time.sleep(5)
     if hb_age is None or hb_age >= 30:
+        other = (f" (a fresh heartbeat for a DIFFERENT runtime {saw_other!r} was "
+                 f"seen — another VM is writing this workspace's heartbeat; the "
+                 f"requested runtime's runner did not post one)" if saw_other else "")
         raise PermissionError(
             f"Runner appeared to start (ssh returned 0, {pid_hint}) but "
-            f"no fresh heartbeat at {hb_path} after 60s. Check the log: "
-            f"`gcloud compute ssh {instance} --zone {zone} --project "
+            f"no fresh heartbeat for {runtime_name} at {hb_path} after 60s{other}. "
+            f"Check the log: `gcloud compute ssh {instance} --zone {zone} --project "
             f"{google_project} -- tail /home/jupyter/.mcp_terra_runner.log`"
         )
 

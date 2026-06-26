@@ -557,6 +557,52 @@ stop_refresher() {
     REFRESHER_PID=""
 }
 
+# Abort sentinel: a child per-spec subshell that hits a runner-wide fail-closed
+# condition (fail-streak HALT, symlink FATAL) writes this file. Because a child
+# `exit` only ends its OWN subshell under the concurrency pool, the parent reads
+# this sentinel between launches / while draining and halts the whole VM.
+RUNNER_ABORT="$WORK/.runner_abort"
+
+# Best-effort: terminate in-flight per-spec subshells before a runner-wide halt.
+kill_pool() {
+    local _p
+    for _p in $(jobs -rp 2>/dev/null); do kill "$_p" 2>/dev/null || true; done
+}
+
+# Enforce the VM spend cap. EXTRACTED so it runs at the top of each poll AND
+# while a concurrent batch is draining — otherwise a busy pool could blow past
+# the cap for the whole batch before the next top-of-loop check. Halts + exits
+# on breach; warns once at 80%.
+enforce_spend_cap() {
+    awk "BEGIN{exit !($MAX_COST_USD>0 && $VM_HOURLY_USD>0)}" || return 0
+    local _now_c _est _ts
+    _now_c="$(date +%s)"
+    _est="$(awk "BEGIN{printf \"%.2f\", ($_now_c-$RUNNER_START_EPOCH)/3600.0*$VM_HOURLY_USD}")"
+    if awk "BEGIN{exit !($_est>=$MAX_COST_USD)}"; then
+        echo "[runner] estimated VM spend \$$_est >= cap \$$MAX_COST_USD — STOPPING the VM (stop/pause; persistent disk kept) to avoid exceeding the credit limit." >&2
+        _ts="$(date -u +%Y%m%dT%H%M%SZ)"
+        echo "est_vm_cost_usd=$_est cap_usd=$MAX_COST_USD rate_usd_per_hr=$VM_HOURLY_USD" \
+            | gsutil cp -n - "${BUCKET%/}/mcp_terra_jobs/HALTED-SPEND-CAP.${_ts}.txt" 2>/dev/null || true
+        kill_pool
+        halt_vm "spend cap \$$MAX_COST_USD reached"
+        exit 0
+    elif [ "$COST_WARNED" -eq 0 ] && awk "BEGIN{exit !($_est>=0.8*$MAX_COST_USD)}"; then
+        echo "[runner] WARN: estimated VM spend \$$_est is >=80% of the \$$MAX_COST_USD cap; the VM will auto-stop at the cap." >&2
+        COST_WARNED=1
+    fi
+}
+
+# Runner-wide guards checked between job launches AND while draining a batch.
+check_pool_guards() {
+    if [ -f "$RUNNER_ABORT" ]; then
+        echo "[runner] abort sentinel set ($(cat "$RUNNER_ABORT" 2>/dev/null)); halting the VM and stopping the pool." >&2
+        kill_pool
+        halt_vm "abort sentinel"
+        exit 0
+    fi
+    enforce_spend_cap
+}
+
 while true; do
     # Refresh heartbeat each poll. Allowed to overwrite (intentional —
     # heartbeat is a liveness probe, not a security artifact).
@@ -568,21 +614,7 @@ while true; do
         || echo "[runner] WARN: could not refresh heartbeat." >&2
 
     # ── Spend cap: stop the VM BEFORE estimated spend exceeds the credit limit ──
-    if awk "BEGIN{exit !($MAX_COST_USD>0 && $VM_HOURLY_USD>0)}"; then
-        _now_c="$(date +%s)"
-        EST_COST="$(awk "BEGIN{printf \"%.2f\", ($_now_c-$RUNNER_START_EPOCH)/3600.0*$VM_HOURLY_USD}")"
-        if awk "BEGIN{exit !($EST_COST>=$MAX_COST_USD)}"; then
-            echo "[runner] estimated VM spend \$$EST_COST >= cap \$$MAX_COST_USD — STOPPING the VM (stop/pause; persistent disk kept) to avoid exceeding the credit limit." >&2
-            CAP_TS="$(date -u +%Y%m%dT%H%M%SZ)"
-            echo "est_vm_cost_usd=$EST_COST cap_usd=$MAX_COST_USD rate_usd_per_hr=$VM_HOURLY_USD" \
-                | gsutil cp -n - "${BUCKET%/}/mcp_terra_jobs/HALTED-SPEND-CAP.${CAP_TS}.txt" 2>/dev/null || true
-            halt_vm "spend cap \$$MAX_COST_USD reached"
-            exit 0
-        elif [ "$COST_WARNED" -eq 0 ] && awk "BEGIN{exit !($EST_COST>=0.8*$MAX_COST_USD)}"; then
-            echo "[runner] WARN: estimated VM spend \$$EST_COST is >=80% of the \$$MAX_COST_USD cap; the VM will auto-stop at the cap." >&2
-            COST_WARNED=1
-        fi
-    fi
+    enforce_spend_cap
     # mapfile + null-delimited list to avoid word-splitting on bad paths
     # Filter pending to safe paths only. GCS object names can contain LF;
     # mapfile then sees them as separate array elements. Strict regex match
@@ -599,8 +631,13 @@ while true; do
         # Throttle to RUNNER_CONCURRENCY in-flight jobs before launching the next.
         # `jobs -rp` in THIS (main) shell counts only the per-spec subshells below
         # (lease refreshers are grandchildren inside those subshells, not counted).
+        # Enforce the spend cap + abort sentinel BEFORE launching (and whenever a
+        # slot frees), so a busy pool can't outrun the cost ceiling or ignore a
+        # child's fail-closed abort.
+        check_pool_guards
         while [ "$(jobs -rp | wc -l)" -ge "$RUNNER_CONCURRENCY" ]; do
             wait -n 2>/dev/null || true
+            check_pool_guards
         done
         (
             # Each job runs in its OWN subshell and owns its OWN lease handles.
@@ -609,8 +646,11 @@ while true; do
             # isolated and never double-execute. The `for _spec_once in 1` wrapper
             # makes every existing `continue` below skip to the END of THIS job's
             # body — byte-identical to the prior serial semantics — while the outer
-            # subshell lets the job run in the background pool.
+            # subshell lets the job run in the background pool. A `trap ... EXIT`
+            # guarantees the lease refresher is stopped on ANY exit path (incl. a
+            # set -e trip), so a crash can never strand a claim.
             REFRESHER_PID=""; REFRESH_ON=""
+            trap 'stop_refresher' EXIT
             for _spec_once in 1; do
         # Stop any lease-refresher left running for the PREVIOUS spec — covers
         # every `continue` exit path so a refresher never strands a claim. (r13)
@@ -748,17 +788,53 @@ while true; do
         LOST_CLAIM="$WORK/$JOB_ID.lost"
         : > "$REFRESH_ON"; rm -f "$LOST_CLAIM"
         (
+            # security review: a SINGLE transient stat/CAS hiccup must NOT
+            # immediately drop the lease — that would let the claim age past
+            # CLAIM_TTL and another runner stale-reclaim + double-execute a job
+            # that is STILL RUNNING here. So: retry transient failures across a
+            # grace window (up to ~CLAIM_TTL since the last SUCCESSFUL refresh),
+            # and only declare the lease LOST on (a) a definitive owner change
+            # (stat shows a different owner) or (b) sustained failure that risks
+            # the claim ageing out. result.json no-clobber remains the final
+            # backstop against a double WRITE.
+            _last_ok="$(date -u +%s)"
+            _giveup=$(( CLAIM_TTL - CLAIM_REFRESH_SEC ))
+            [ "$_giveup" -lt "$CLAIM_REFRESH_SEC" ] && _giveup="$CLAIM_REFRESH_SEC"
             while [ -f "$REFRESH_ON" ]; do
                 sleep "$CLAIM_REFRESH_SEC"
                 [ -f "$REFRESH_ON" ] || break
-                _rg="$(gsutil stat "$CLAIM" 2>/dev/null | awk '/Generation:/{print $2; exit}')"
-                if [ -z "$_rg" ] || ! printf '%s' "$RUNNER_INSTANCE_ID" \
+                _now_r="$(date -u +%s)"
+                _cs="$(gsutil stat "$CLAIM" 2>/dev/null || true)"
+                _rg="$(printf '%s' "$_cs" | awk '/Generation:/{print $2; exit}')"
+                _ro="$(printf '%s' "$_cs" | awk -F'[[:space:]]+' '/claim-owner:/{print $NF; exit}')"
+                # Definitive loss: another instance now owns the claim.
+                if [ -n "$_ro" ] && [ "$_ro" != "$RUNNER_INSTANCE_ID" ]; then
+                    : > "$LOST_CLAIM"
+                    echo "[runner] WARN: lease for $JOB_ID reclaimed by '$_ro'; stopping refresh." >&2
+                    break
+                fi
+                # Transient (no generation read): keep our lease, retry — unless
+                # we have now gone too long without a successful refresh.
+                if [ -z "$_rg" ]; then
+                    if [ $(( _now_r - _last_ok )) -ge "$_giveup" ]; then
+                        : > "$LOST_CLAIM"
+                        echo "[runner] WARN: could not refresh lease for $JOB_ID for $(( _now_r - _last_ok ))s (>=${_giveup}s); stopping refresh (claim may age out)." >&2
+                        break
+                    fi
+                    echo "[runner] WARN: transient lease-stat failure for $JOB_ID; will retry." >&2
+                    continue
+                fi
+                if printf '%s' "$RUNNER_INSTANCE_ID" \
                      | gsutil -h "x-goog-if-generation-match:$_rg" \
                               -h "x-goog-meta-claim-owner:$RUNNER_INSTANCE_ID" \
-                              -h "x-goog-meta-claim-ts:$(date -u +%s)" cp - "$CLAIM" 2>/dev/null; then
+                              -h "x-goog-meta-claim-ts:$_now_r" cp - "$CLAIM" 2>/dev/null; then
+                    _last_ok="$_now_r"
+                elif [ $(( _now_r - _last_ok )) -ge "$_giveup" ]; then
                     : > "$LOST_CLAIM"
-                    echo "[runner] WARN: lost the lease for $JOB_ID (claim reclaimed by another runner); stopping refresh." >&2
+                    echo "[runner] WARN: lease CAS for $JOB_ID failing for $(( _now_r - _last_ok ))s; stopping refresh." >&2
                     break
+                else
+                    echo "[runner] WARN: transient lease-CAS failure for $JOB_ID; will retry." >&2
                 fi
             done
         ) &
@@ -777,9 +853,15 @@ while true; do
         # them via os.environ. This defeats the entire shell→Python
         # injection class.
         VERIFY_RC=0
+        # Spec freshness window: a job QUEUED behind a busy concurrency pool may
+        # legitimately wait many minutes before pickup, so the replay-freshness
+        # window defaults to the whole SESSION budget (not 300s) — replay is
+        # already prevented by the path-bound HMAC + the .consumed rename. An
+        # operator may still set a tighter MCP_TERRA_SPEC_MAX_AGE_SEC.
         LOCAL_SPEC_VAR="$LOCAL_SPEC" \
         BUCKET_VAR="$BUCKET" \
         SPEC_GCS_VAR="$SPEC" \
+        MCP_TERRA_SPEC_MAX_AGE_SEC="${MCP_TERRA_SPEC_MAX_AGE_SEC:-$SESSION_BUDGET_SEC}" \
         MCP_TERRA_RUNNER_SECRET="$MCP_TERRA_RUNNER_SECRET" \
         python3 - <<'PYVERIFY' || VERIFY_RC=$?
 import hashlib
@@ -844,7 +926,7 @@ if not isinstance(submit_ts, int):
     print(f"[runner] spec missing _submit_ts; refusing.", file=sys.stderr)
     sys.exit(15)
 now = int(time.time())
-max_age_sec = int(os.environ.get("MCP_TERRA_SPEC_MAX_AGE_SEC", "300"))
+max_age_sec = int(os.environ.get("MCP_TERRA_SPEC_MAX_AGE_SEC") or "300")
 if abs(now - submit_ts) > max_age_sec:
     print(f"[runner] spec age {now - submit_ts}s exceeds max {max_age_sec}s; refusing replay.", file=sys.stderr)
     sys.exit(16)
@@ -1231,44 +1313,50 @@ PYRESULT
         # This bounds cost on a bug-fix loop that never converges.
         #
         # The read-modify-write on FAIL_STREAK_FILE is wrapped in `flock` so
-        # two concurrent runner instances (or an external touch) can't corrupt
-        # the counter. flock holds an exclusive lock on a sidecar fd.
-        # FAIL_STREAK update + decision both happen INSIDE the lock so two
-        # concurrent runners cannot race the abort decision. The decision
-        # (HALT?) is written to FS_DECISION_FILE; we read it outside the
-        # lock but the write happened before the lock release.
+        # two concurrent jobs (same VM pool or another runner) can't corrupt the
+        # counter. flock holds an exclusive lock on a sidecar fd. The HALT/STREAK
+        # decision is RETURNED from inside the locked subshell via command
+        # substitution (NOT a shared file), so a concurrent completion can never
+        # overwrite this job's decision between write and read.
         FAIL_STREAK_LOCK="$WORK/.fail_streak.lock"
-        FS_DECISION_FILE="$WORK/.fail_streak.decision"
-        # Pre-create both with O_NOFOLLOW-equivalent: refuse if either is a
-        # symlink (would redirect writes elsewhere).
-        for f in "$FAIL_STREAK_LOCK" "$FS_DECISION_FILE" "$FAIL_STREAK_FILE"; do
+        # Pre-create with O_NOFOLLOW-equivalent: refuse if a symlink (would
+        # redirect writes elsewhere). Under the concurrency pool a child `exit`
+        # only ends ITS subshell, so also raise the parent abort sentinel.
+        for f in "$FAIL_STREAK_LOCK" "$FAIL_STREAK_FILE"; do
             if [ -L "$f" ]; then
                 echo "[runner] FATAL: $f is a symlink. Refusing." >&2
+                echo "symlink-fatal $f" > "$RUNNER_ABORT" 2>/dev/null || true
                 exit 7
             fi
         done
-        (
-            flock -x 9
-            if [ "$RC" = "0" ]; then
-                echo "0" > "$FAIL_STREAK_FILE"
-                echo "CONTINUE" > "$FS_DECISION_FILE"
-            else
-                FS_CUR="$(cat "$FAIL_STREAK_FILE" 2>/dev/null || echo 0)"
-                case "$FS_CUR" in ''|*[!0-9]*) FS_CUR=0 ;; esac
-                FS_CUR=$((FS_CUR + 1))
-                [ "$FS_CUR" -lt 0 ] && FS_CUR=1
-                echo "$FS_CUR" > "$FAIL_STREAK_FILE"
-                if [ "$FS_CUR" -ge "$FAIL_STREAK_LIMIT" ]; then
-                    echo "HALT $FS_CUR" > "$FS_DECISION_FILE"
-                    # Reset streak inside the lock so subsequent runner starts
-                    # see a clean state.
+        # security review: capture the decision INSIDE the lock via command
+        # substitution (NOT a shared .decision file). With concurrent jobs a
+        # shared file could be overwritten by another completion between this
+        # job's write and read, dropping a HALT decision. The locked subshell
+        # echoes exactly one decision line to stdout; counter writes go to the
+        # FILE (redirected), so $() captures only the decision, atomically.
+        FS_DECISION="$(
+            (
+                flock -x 9
+                if [ "$RC" = "0" ]; then
                     echo "0" > "$FAIL_STREAK_FILE"
+                    echo "CONTINUE"
                 else
-                    echo "STREAK $FS_CUR" > "$FS_DECISION_FILE"
+                    _fs="$(cat "$FAIL_STREAK_FILE" 2>/dev/null || echo 0)"
+                    case "$_fs" in ''|*[!0-9]*) _fs=0 ;; esac
+                    _fs=$((_fs + 1))
+                    [ "$_fs" -lt 0 ] && _fs=1
+                    echo "$_fs" > "$FAIL_STREAK_FILE"
+                    if [ "$_fs" -ge "$FAIL_STREAK_LIMIT" ]; then
+                        # Reset inside the lock so a subsequent runner start is clean.
+                        echo "0" > "$FAIL_STREAK_FILE"
+                        echo "HALT $_fs"
+                    else
+                        echo "STREAK $_fs"
+                    fi
                 fi
-            fi
-        ) 9>"$FAIL_STREAK_LOCK"
-        FS_DECISION="$(cat "$FS_DECISION_FILE" 2>/dev/null || echo CONTINUE)"
+            ) 9>"$FAIL_STREAK_LOCK"
+        )"
         FS_CUR="$(echo "$FS_DECISION" | awk '{print $2}')"
         case "$FS_CUR" in ''|*[!0-9]*) FS_CUR=0 ;; esac
         if [ "$RC" != "0" ]; then
@@ -1299,6 +1387,11 @@ PYRESULT
                 fi
                 # Reset the streak so a subsequent VM start gives a clean slate
                 echo "0" > "$FAIL_STREAK_FILE"
+                # Signal the PARENT runner to halt the whole pool: under the
+                # concurrency wrapper this `exit 0` only ends THIS subshell, so
+                # without the sentinel the parent would keep launching jobs if the
+                # gcloud stop above is slow/failed.
+                echo "fail-streak-halt last_job=$JOB_ID" > "$RUNNER_ABORT" 2>/dev/null || true
                 exit 0
             fi
         fi
@@ -1336,14 +1429,21 @@ PYRESULT
             echo "[runner] auto_stop_after_completion=True but rc=$RC; NOT halting — leaving VM alive for the Claude agent's bug-fix loop. The agent will read the failing cell, fix it, re-upload with version_method='bak', and re-submit. Auto-stop fires only on rc=0."
         fi
             done   # end `for _spec_once in 1` (a `continue` above lands here)
-            # Guarantee this job's lease refresher is stopped on EVERY exit path.
+            # The EXIT trap (set inside the subshell) guarantees the lease
+            # refresher is stopped on EVERY exit path; this explicit call covers
+            # the normal-completion path promptly.
             stop_refresher
         ) &
     done
-    # Drain this poll's batch before re-polling so PENDING is recomputed fresh
-    # and the pool never accumulates unbounded background jobs. (wait with no
-    # args returns 0; guarded anyway so `set -e` can't trip on it.)
-    wait || true
+    # Drain this poll's batch before re-polling so PENDING is recomputed fresh and
+    # the pool never accumulates unbounded background jobs. We DRAIN with a guard
+    # loop (not a bare `wait`) so the spend cap + abort sentinel are enforced even
+    # while a long batch is running — otherwise a busy pool could outrun the cost
+    # ceiling or ignore a child fail-closed abort until the next top-of-loop poll.
+    while [ "$(jobs -rp | wc -l)" -gt 0 ]; do
+        check_pool_guards
+        wait -n 2>/dev/null || true
+    done
 done
 """
 

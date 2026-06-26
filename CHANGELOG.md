@@ -7,6 +7,32 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed (security hardening)
+
+- **Lease double-execute (critical).** A single transient lease stat/CAS hiccup
+  stopped the refresher outright, so the claim could age past TTL and another
+  runner stale-reclaim + double-execute a still-running job. The refresher now
+  retries transient failures across a grace window and declares the lease lost
+  only on a definitive owner-change or sustained failure near TTL.
+- **Concurrency-pool safety.** Added a per-job `trap stop_refresher EXIT` (a
+  `set -e` trip can no longer orphan a refresher / strand a claim); the spend cap
+  + an abort sentinel are enforced in the throttle AND batch-drain loops (a busy
+  pool can't outrun the cost ceiling); child fail-closed paths (fail-streak HALT,
+  symlink FATAL) raise the sentinel so the PARENT halts the whole pool; the
+  fail-streak HALT decision is returned from inside the flock via command
+  substitution (no shared-file race); the spec replay-freshness window defaults
+  to the session budget so jobs queued behind a busy pool aren't rejected.
+- **install.sh secret handling.** The runner secret is passed to the strength
+  check via the environment, never interpolated into `python -c` argv (argv is
+  world-readable via `ps`); a reused secret file is validated (regular file,
+  current-user owned, mode 0600, not a symlink) before trust.
+- **Plugin launcher.** `config.env` is validated (regular/owner/0600/no-symlink)
+  and parsed as an allowlisted KEY=VALUE set literally, instead of being
+  `source`d (removes a shell-execution path on every launch).
+- **Misc.** `terra_start_runner_on_vm` binds the heartbeat to the requested
+  runtime (+ future-skew reject), matching `terra_create_runtime`; the rate
+  limiter clamps 0/negative caps to ≥1 (was an IndexError on first call).
+
 ### Added
 
 - **Single-VM concurrency (bounded papermill pool).** The on-VM runner can now

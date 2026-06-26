@@ -427,8 +427,17 @@ class RateLimiter:
     MCP_TERRA_MAX_CALLS_PER_HOUR.
     """
     def __init__(self, max_per_minute: int = 60, max_per_hour: int = 3000):
-        self.max = max_per_minute
-        self.max_hour = max_per_hour
+        # Clamp to >=1 so a misconfigured 0/negative cap fails CLOSED (a tiny
+        # limit) instead of crashing: with max=0, check() would index an empty
+        # deque while building the wait message → IndexError on the first call.
+        try:
+            self.max = max(1, int(max_per_minute))
+        except (TypeError, ValueError):
+            self.max = 60
+        try:
+            self.max_hour = max(1, int(max_per_hour))
+        except (TypeError, ValueError):
+            self.max_hour = 3000
         self.window: collections.deque[float] = collections.deque()
         self.hour_window: collections.deque[float] = collections.deque()
         self.lock = threading.Lock()
@@ -469,8 +478,18 @@ class RateLimiter:
             self.hour_window.append(now)
 
 
-_RATE_LIMIT = int(os.environ.get("MCP_TERRA_MAX_CALLS_PER_MIN", "60"))
-_RATE_LIMIT_HOUR = int(os.environ.get("MCP_TERRA_MAX_CALLS_PER_HOUR", "3000"))
+def _int_env_clamped(name: str, default: int) -> int:
+    """Parse a positive-int env, falling back to default on junk/0/negative.
+    Keeps a misconfigured limit from crashing the process at import."""
+    try:
+        v = int(os.environ.get(name, str(default)) or default)
+    except (TypeError, ValueError):
+        return default
+    return v if v >= 1 else default
+
+
+_RATE_LIMIT = _int_env_clamped("MCP_TERRA_MAX_CALLS_PER_MIN", 60)
+_RATE_LIMIT_HOUR = _int_env_clamped("MCP_TERRA_MAX_CALLS_PER_HOUR", 3000)
 _LIMITER = RateLimiter(max_per_minute=_RATE_LIMIT, max_per_hour=_RATE_LIMIT_HOUR)
 
 

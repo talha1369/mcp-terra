@@ -113,7 +113,22 @@ ok "Package importable from venv"
 # ── 4. Runner secret ───────────────────────────────────────────────────────
 step "Runner secret (HMAC key)"
 
-if [ -f "$SECRET_FILE" ] && [ -s "$SECRET_FILE" ]; then
+if [ -e "$SECRET_FILE" ] && [ -s "$SECRET_FILE" ]; then
+  # Reuse — but only a SAFE secret file: a regular file (not a symlink/device),
+  # owned by us, with no group/other access. An attacker who pre-creates the
+  # secret (or symlinks it) could otherwise steal/redirect the HMAC key that
+  # signs runner-accepted specs. Fail loud rather than trust a suspect file.
+  [ -L "$SECRET_FILE" ] && fail "$SECRET_FILE is a symlink — refusing (move it aside)."
+  [ -f "$SECRET_FILE" ] || fail "$SECRET_FILE is not a regular file — refusing."
+  # Owner == current user
+  _own="$(stat -f '%u' "$SECRET_FILE" 2>/dev/null || stat -c '%u' "$SECRET_FILE" 2>/dev/null || echo -1)"
+  [ "$_own" = "$(id -u)" ] || fail "$SECRET_FILE is not owned by you (uid $_own) — refusing."
+  # Perms must be 0600 (no group/other). Tighten if looser; never widen.
+  _mode="$(stat -f '%Lp' "$SECRET_FILE" 2>/dev/null || stat -c '%a' "$SECRET_FILE" 2>/dev/null || echo 000)"
+  case "$_mode" in
+    600) : ;;
+    *) chmod 600 "$SECRET_FILE" && info "tightened $SECRET_FILE to mode 0600 (was $_mode)" ;;
+  esac
   ok "Reusing existing runner secret at $SECRET_FILE"
   RUNNER_SECRET="$(cat "$SECRET_FILE")"
 else
@@ -124,13 +139,14 @@ else
   ok "Generated new runner secret → $SECRET_FILE (mode 0600)"
 fi
 
-# Validate strength in the venv where mcp_terra is importable.
-"$VENV_PY" -c "
+# Validate strength in the venv where mcp_terra is importable. Pass the secret
+# via the ENVIRONMENT (read with os.environ), NEVER interpolated into the
+# `python -c` source — argv is visible to other users via `ps`, env is not.
+MCP_TERRA_RUNNER_SECRET="$RUNNER_SECRET" "$VENV_PY" -c '
 import os
-os.environ['MCP_TERRA_RUNNER_SECRET']='$RUNNER_SECRET'
 from mcp_terra.notebook_runner import _validate_secret_strength
-_validate_secret_strength('$RUNNER_SECRET')
-" || fail "Runner secret failed strength check (length ≥ 32, ≥ 12 unique chars, Shannon ≥ 3.5)"
+_validate_secret_strength(os.environ["MCP_TERRA_RUNNER_SECRET"])
+' || fail "Runner secret failed strength check (length ≥ 32, ≥ 12 unique chars, Shannon ≥ 3.5)"
 ok "Secret passes length + entropy checks"
 
 # ── 5. Workspace ───────────────────────────────────────────────────────────
