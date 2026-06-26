@@ -136,6 +136,12 @@ def max_cost_usd() -> float:
         c = float(os.environ.get("MCP_TERRA_MAX_COST_USD", "0") or "0")
     except (TypeError, ValueError):
         c = 0.0
+    if not math.isfinite(c):  # an inf cap is not enforceable by the runner — fail closed
+        raise PolicyError(
+            "MCP_TERRA_MAX_COST_USD is not a finite dollar amount (parses to "
+            "inf/nan); refusing rather than propagating an unenforceable cap.",
+            code="E_COST_NONFINITE",
+            user_action_required="set MCP_TERRA_MAX_COST_USD to a finite amount, or unset it")
     return max(0.0, c)
 
 
@@ -148,6 +154,12 @@ def vm_hourly_usd() -> float:
         r = float(os.environ.get("MCP_TERRA_VM_HOURLY_USD", "0") or "0")
     except (TypeError, ValueError):
         r = 0.0
+    if not math.isfinite(r):  # an inf rate is not enforceable by the runner — fail closed
+        raise PolicyError(
+            "MCP_TERRA_VM_HOURLY_USD is not a finite rate (parses to inf/nan); "
+            "refusing rather than propagating an unenforceable rate.",
+            code="E_RATE_NONFINITE",
+            user_action_required="set MCP_TERRA_VM_HOURLY_USD to a finite $/hr, or unset it")
     return max(0.0, r)
 
 
@@ -168,8 +180,15 @@ def budget_usd() -> float:
         b = float(os.environ.get("MCP_TERRA_BUDGET_USD", "0") or "0")
     except (TypeError, ValueError):
         b = 0.0
-    if not math.isfinite(b):  # inf/nan would silently disable the ceiling — treat as off
-        b = 0.0
+    if not math.isfinite(b):
+        # inf/nan (e.g. 1e309 -> inf) must NOT silently disable the ceiling —
+        # fail closed so the user fixes the config instead of running unbounded.
+        raise PolicyError(
+            "MCP_TERRA_BUDGET_USD is not a finite dollar amount (got a value that "
+            "parses to inf/nan); refusing to run rather than silently disabling "
+            "the spend ceiling.",
+            code="E_BUDGET_NONFINITE",
+            user_action_required="set MCP_TERRA_BUDGET_USD to a finite amount, or unset it")
     return max(0.0, b)
 
 
@@ -182,18 +201,30 @@ def budget_window_days() -> int:
     return max(1, min(d, 366))
 
 
-def _read_ledger_window(now_epoch: float) -> tuple[list[str], float]:
+def _read_ledger_window(now_epoch: float, *, strict: bool = False) -> tuple[list[str], float]:
     """Read the ledger and return (in_window_raw_json_lines, summed_cap_usd).
     Malformed and out-of-window lines are dropped, so a caller that rewrites the
     file with the returned lines compacts it to the active window (keeps the
     ledger from growing without bound). Negative caps are clamped to 0 so a
-    tampered entry can't shrink the committed total."""
+    tampered entry can't shrink the committed total.
+
+    strict=True (reservation path): a ledger that EXISTS but cannot be read is a
+    PolicyError, NOT empty — otherwise a transient read failure would be treated
+    as $0 spent and then overwritten, silently dropping prior commitments and
+    breaking the ceiling. Only a genuinely absent ledger means zero spend."""
     if not _SPEND_LEDGER.exists():
         return [], 0.0
     cutoff = now_epoch - budget_window_days() * 86400
     try:
         raw = _SPEND_LEDGER.read_text(encoding="utf-8")
-    except OSError:
+    except OSError as e:
+        if strict:
+            raise PolicyError(
+                f"spend ledger exists but could not be read ({e}); refusing to "
+                f"reserve because rewriting now would drop prior commitments and "
+                f"could exceed the budget.",
+                code="E_BUDGET_LEDGER_READ",
+                user_action_required="restore read access to the spend ledger in ~/.mcp-terra") from e
         return [], 0.0
     kept: list[str] = []
     total = 0.0
@@ -280,15 +311,21 @@ _LEDGER_THREAD_LOCK = threading.Lock()
 
 
 @contextlib.contextmanager
-def _ledger_locked():
+def _ledger_locked(*, strict: bool = False):
     """Serialize ledger read-modify-write across threads AND processes.
 
     threading.Lock covers concurrent tool threads inside one MCP process; an
     flock (POSIX) on a dedicated lock file extends mutual exclusion to multiple
-    MCP processes sharing the same ~/.mcp-terra. If flock is unavailable
-    (non-POSIX) we degrade to thread-only — still correct for the common
-    single-process case. The thread lock is held for the whole critical section
-    so the flock fd is always opened/closed by one thread at a time."""
+    MCP processes sharing the same ~/.mcp-terra. The thread lock is held for the
+    whole critical section so the flock fd is always opened/closed by one thread
+    at a time.
+
+    strict=True (reservation path): if the cross-process flock cannot be
+    acquired (flock unavailable, or os.open/flock fails), FAIL CLOSED with a
+    PolicyError instead of silently degrading to thread-only — a thread-only
+    lock cannot guarantee the ceiling across multiple MCP processes.
+    strict=False (release / best-effort): degrade to thread-only, since a
+    release that doesn't run just over-counts (the safe direction)."""
     with _LEDGER_THREAD_LOCK:
         fd = None
         try:
@@ -296,15 +333,22 @@ def _ledger_locked():
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             fd = os.open(str(_SPEND_LEDGER_LOCK), os.O_CREAT | os.O_RDWR, 0o600)
             fcntl.flock(fd, fcntl.LOCK_EX)
-        except (ImportError, OSError):
-            # degrade to thread-only lock; close the fd if open() succeeded but
-            # flock() failed, so we never leak a descriptor
+        except (ImportError, OSError) as e:
+            # close the fd if open() succeeded but flock() failed (no leak)
             if fd is not None:
                 try:
                     os.close(fd)
                 except OSError:
                     pass
                 fd = None
+            if strict:
+                raise PolicyError(
+                    f"could not acquire the cross-process spend lock "
+                    f"({type(e).__name__}); refusing to reserve because the "
+                    f"budget ceiling cannot be guaranteed across processes.",
+                    code="E_BUDGET_LOCK",
+                    user_action_required="run the MCP on a POSIX filesystem that supports flock for ~/.mcp-terra")
+            # non-strict: degrade to thread-only lock
         try:
             yield
         finally:
@@ -335,9 +379,9 @@ def reserve_within_budget(new_run_usd: float, ref: str, now_epoch: float) -> str
             "be bounded against the budget.",
             code="E_BUDGET_REQUIRES_CAP",
             user_action_required="pass a max_cost_usd to this run")
-    with _ledger_locked():
+    with _ledger_locked(strict=True):
         b = budget_usd()
-        kept, spent = _read_ledger_window(now_epoch)
+        kept, spent = _read_ledger_window(now_epoch, strict=True)
         if spent + new_run_usd > b:
             raise PolicyError(
                 f"rolling spend budget would be exceeded: ${spent:.2f} already "

@@ -4925,7 +4925,8 @@ def _():
     import os as _os
     import tempfile
     import pathlib
-    saved = {k: _os.environ.get(k) for k in ("MCP_TERRA_BUDGET_USD", "MCP_TERRA_BUDGET_WINDOW_DAYS")}
+    saved = {k: _os.environ.get(k) for k in ("MCP_TERRA_BUDGET_USD", "MCP_TERRA_BUDGET_WINDOW_DAYS",
+                                             "MCP_TERRA_MAX_COST_USD", "MCP_TERRA_VM_HOURLY_USD")}
     led, lock = policy._SPEND_LEDGER, policy._SPEND_LEDGER_LOCK
     try:
         base = pathlib.Path(tempfile.mkdtemp())
@@ -4952,11 +4953,20 @@ def _():
         # releasing None / unknown token is a safe no-op
         policy.release_reservation(None)
         policy.release_reservation("does-not-exist")
-        # inf/nan budget is treated as OFF (cannot silently disable the ceiling)
+        # inf/nan budget FAILS CLOSED (must not silently disable the ceiling)
         _os.environ["MCP_TERRA_BUDGET_USD"] = "inf"
-        assert policy.budget_usd() == 0.0
+        must_raise(policy.budget_usd, policy.PolicyError)
+        _os.environ["MCP_TERRA_BUDGET_USD"] = "1e309"  # parses to inf
+        must_raise(policy.budget_usd, policy.PolicyError)
         _os.environ["MCP_TERRA_BUDGET_USD"] = "nan"
-        assert policy.budget_usd() == 0.0
+        must_raise(policy.budget_usd, policy.PolicyError)
+        # an inf cap/rate is likewise unenforceable → fail closed
+        _os.environ["MCP_TERRA_MAX_COST_USD"] = "inf"
+        must_raise(policy.max_cost_usd, policy.PolicyError)
+        _os.environ.pop("MCP_TERRA_MAX_COST_USD", None)
+        _os.environ["MCP_TERRA_VM_HOURLY_USD"] = "inf"
+        must_raise(policy.vm_hourly_usd, policy.PolicyError)
+        _os.environ.pop("MCP_TERRA_VM_HOURLY_USD", None)
     finally:
         policy._SPEND_LEDGER, policy._SPEND_LEDGER_LOCK = led, lock
         for k, v in saved.items():
@@ -5065,6 +5075,70 @@ def _():
         for k, v in saved.items():
             if v is None: _os.environ.pop(k, None)
             else: _os.environ[k] = v
+
+@case("CC-SpendCap", "reserve FAILS CLOSED on ledger read error / lock failure (no overwrite)")
+def _():
+    import os as _os
+    import tempfile
+    import pathlib
+    saved = {k: _os.environ.get(k) for k in ("MCP_TERRA_BUDGET_USD", "MCP_TERRA_BUDGET_WINDOW_DAYS")}
+    led, lock = policy._SPEND_LEDGER, policy._SPEND_LEDGER_LOCK
+    try:
+        _os.environ["MCP_TERRA_BUDGET_USD"] = "100"
+        _os.environ["MCP_TERRA_BUDGET_WINDOW_DAYS"] = "30"
+        base = pathlib.Path(tempfile.mkdtemp())
+        now = 1_000_000_000.0
+        # (a) ledger EXISTS but is unreadable (a directory) → reserve must raise,
+        # NOT treat as empty and overwrite. windowed_spend (lenient) returns 0.
+        as_dir = base / "ledger_is_a_dir.jsonl"
+        as_dir.mkdir()
+        policy._SPEND_LEDGER = as_dir
+        policy._SPEND_LEDGER_LOCK = base / "ok.lock"
+        assert policy.windowed_spend_usd(now) == 0.0  # lenient reader tolerates it
+        must_raise(policy.reserve_within_budget, policy.PolicyError, 10, "r", now)
+        assert as_dir.is_dir()  # nothing overwrote it
+        # (b) cross-process lock cannot be acquired (lock dir does not exist) →
+        # reserve fails closed rather than degrading to thread-only.
+        policy._SPEND_LEDGER = base / "l.jsonl"
+        policy._SPEND_LEDGER_LOCK = base / "no_such_subdir" / "l.lock"
+        must_raise(policy.reserve_within_budget, policy.PolicyError, 10, "r", now)
+        assert not (base / "l.jsonl").exists()  # never wrote without the lock
+    finally:
+        policy._SPEND_LEDGER, policy._SPEND_LEDGER_LOCK = led, lock
+        for k, v in saved.items():
+            if v is None: _os.environ.pop(k, None)
+            else: _os.environ[k] = v
+
+@case("CC-SpendCap", "create requires an ENFORCEABLE cap + pauses (never deletes) on bring-up failure")
+def _():
+    import inspect
+    csrc = inspect.getsource(server.terra_create_runtime)
+    # Codex [critical]: a budget/cap requires a positive rate AND the runner, or
+    # the cap is unenforceable — must refuse pre-flight
+    assert "E_CAP_NOT_ENFORCEABLE" in csrc and "E_CAP_NEEDS_RUNNER" in csrc
+    assert "policy.budget_usd() > 0 or max_cost_usd > 0" in csrc
+    # Codex [high]: post-create runner-liveness failure must STOP/PAUSE the VM
+    # (never delete) so it can't run uncapped
+    assert "_stop_runtime_best_effort(" in csrc
+    # Codex [high]: ambiguous create failure releases ONLY on a confirmed 404
+    assert "_confirmed_absent" in csrc and "_probe.status == 404" in csrc
+    # the stop helper must pause via leo_stop_runtime (delete primitives don't
+    # exist anywhere in terra_client — no-destruction invariant)
+    hsrc = inspect.getsource(server._stop_runtime_best_effort)
+    assert "leo_stop_runtime" in hsrc
+
+@case("CC-SpendCap", "_stop_runtime_best_effort swallows errors, never masks the caller")
+def _():
+    saved = _tc_mod.leo_stop_runtime
+    try:
+        # raises → helper returns False, does not propagate
+        _tc_mod.leo_stop_runtime = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+        assert server._stop_runtime_best_effort("t", "p", "rt", "x") is False
+        # succeeds → returns True
+        _tc_mod.leo_stop_runtime = lambda *a, **k: {"status": "Stopping"}
+        assert server._stop_runtime_best_effort("t", "p", "rt", "x") is True
+    finally:
+        _tc_mod.leo_stop_runtime = saved
 
 
 # ──────────────────────────────────────────────────────────────────────────

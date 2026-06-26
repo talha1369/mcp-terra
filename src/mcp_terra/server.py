@@ -523,6 +523,20 @@ def _redact_runtime_env(obj):
     return [_scrub(x) for x in obj] if isinstance(obj, list) else _scrub(obj)
 
 
+def _stop_runtime_best_effort(token: str, google_project: str,
+                              runtime_name: str, reason: str) -> bool:
+    """Stop/pause a runtime (persistent disk kept — NEVER delete) on a best-effort
+    basis, swallowing its own errors so it cannot mask the caller's original
+    failure. Used when a create succeeded but the cap-enforcing runner could not
+    be confirmed live: pausing the VM prevents uncapped billing. Returns True if
+    the stop request was accepted."""
+    try:
+        tc.leo_stop_runtime(token, google_project, runtime_name)
+        return True
+    except Exception:
+        return False
+
+
 def _try_runner_log_tail(google_project: str, runtime_name: str) -> str:
     """Best-effort tail of the on-VM runner log for the create-runtime failure
     path. Uses gcloud ssh, which may itself be IAM-blocked (the very reason
@@ -663,12 +677,38 @@ def terra_create_runtime(
     # estimate. Both override the env defaults for this run only. A rolling budget
     # (MCP_TERRA_BUDGET_USD over MCP_TERRA_BUDGET_WINDOW_DAYS), if set, is checked
     # against the sum of per-run caps committed in the window.
-    if max_cost_usd < 0 or vm_hourly_usd < 0:
-        raise ValueError("max_cost_usd and vm_hourly_usd must be >= 0")
-    _eff_cap = float(max_cost_usd) if max_cost_usd > 0 else policy.max_cost_usd()
-    _eff_rate = float(vm_hourly_usd) if vm_hourly_usd > 0 else policy.vm_hourly_usd()
+    import math as _math_budget
     import time as _time_budget
+    if (max_cost_usd < 0 or vm_hourly_usd < 0
+            or not _math_budget.isfinite(max_cost_usd)
+            or not _math_budget.isfinite(vm_hourly_usd)):
+        raise ValueError("max_cost_usd and vm_hourly_usd must be finite and >= 0")
     try:
+        _eff_cap = float(max_cost_usd) if max_cost_usd > 0 else policy.max_cost_usd()
+        _eff_rate = float(vm_hourly_usd) if vm_hourly_usd > 0 else policy.vm_hourly_usd()
+        # A cap is only a real ceiling if the on-VM runner can ENFORCE it: it needs
+        # a positive $/hr to estimate spend AND the auto-start runner installed to
+        # act on it (the runner enforces only when BOTH MAX_COST_USD>0 and
+        # VM_HOURLY_USD>0). Require both whenever a budget is in force OR a per-run
+        # cap was requested — otherwise the ledger would record a commitment the VM
+        # cannot honor and actual spend could exceed the budget.
+        if policy.budget_usd() > 0 or max_cost_usd > 0:
+            if _eff_rate <= 0:
+                raise policy.PolicyError(
+                    "a spend cap was requested (max_cost_usd or MCP_TERRA_BUDGET_USD) "
+                    "but no positive hourly rate is set, so the on-VM runner cannot "
+                    "estimate or enforce it — the cap would not actually bound spend.",
+                    code="E_CAP_NOT_ENFORCEABLE",
+                    user_action_required="pass vm_hourly_usd (or set MCP_TERRA_VM_HOURLY_USD) to your VM's $/hr")
+            if not auto_start_runner:
+                raise policy.PolicyError(
+                    "a spend cap was requested but auto_start_runner=False would skip "
+                    "installing the on-VM runner that enforces the cap — the VM would "
+                    "run uncapped.",
+                    code="E_CAP_NEEDS_RUNNER",
+                    user_action_required="use auto_start_runner=True so the cap is enforced")
+        # early fast-fail before the expensive script upload; the authoritative,
+        # atomic reservation happens just before provisioning
         policy.assert_within_budget(_eff_cap, _time_budget.time())
     except policy.PolicyError as e:
         raise PermissionError(str(e))
@@ -833,8 +873,23 @@ def terra_create_runtime(
             start_user_script_uri=start_user_script_uri,
             custom_env_vars=custom_env_vars,
         )
-    except BaseException:
-        policy.release_reservation(_budget_token)
+    except Exception:
+        # leo_create_runtime is a non-idempotent POST: an ambiguous failure
+        # (read timeout, connection reset, 5xx after Leonardo accepted) may have
+        # created a billable VM. Release the reservation ONLY if we can CONFIRM
+        # the runtime does not exist (a definitive 404); otherwise KEEP it (fail
+        # closed) so a VM that may be billing can't oversubscribe the budget.
+        if _budget_token is not None:
+            _confirmed_absent = False
+            try:
+                tc.leo_get_runtime(token, google_project, runtime_name)
+                # runtime EXISTS → it bills → keep the reservation
+            except tc.TerraAPIError as _probe:
+                _confirmed_absent = (_probe.status == 404)
+            except Exception:
+                _confirmed_absent = False  # unknown → keep (fail closed)
+            if _confirmed_absent:
+                policy.release_reservation(_budget_token)
         raise
     # Never echo the secret back (Leonardo's create response may include the
     # customEnvironmentVariables we just sent).
@@ -868,16 +923,29 @@ def terra_create_runtime(
         if leo_status == "Running":
             break
         if leo_status in ("Error", "Deleting", "Deleted"):
+            if leo_status == "Error":
+                # an Error VM may still bill; pause it (never delete) — keep the
+                # reservation since the VM was created
+                _stop_runtime_best_effort(token, google_project, runtime_name,
+                                          "entered Error during provisioning")
             raise RuntimeError(
                 f"Runtime {runtime_name} entered status {leo_status!r} during "
                 f"provisioning (expected Running). Check the Terra UI."
             )
         time.sleep(15)
     if leo_status != "Running":
+        # the VM was created and may be Creating/Starting → it WILL bill; pause it
+        # (stop requested; persistent disk kept — never delete) before failing
+        _paused = _stop_runtime_best_effort(
+            token, google_project, runtime_name,
+            "did not reach Running within the provisioning timeout")
         raise RuntimeError(
             f"Runtime {runtime_name} did not reach Running within {timeout}s "
-            f"(last status: {leo_status!r}). The VM was created but is not "
-            f"ready; inspect it with terra_get_runtime."
+            f"(last status: {leo_status!r}). The VM was created but is not ready; "
+            + ("it has been PAUSED (stop requested; disk kept). "
+               if _paused else
+               "it could NOT be auto-paused — PAUSE IT MANUALLY to avoid charges. ")
+            + "Inspect it with terra_get_runtime."
         )
 
     # Phase 2 — after Running, wait up to ~5 min for a fresh (<30s) heartbeat,
@@ -909,6 +977,16 @@ def terra_create_runtime(
         time.sleep(10)
 
     if hb_age is None or hb_age >= 30:
+        # The VM is Running but its cap-enforcing runner is NOT live — left alone
+        # it would run UNCAPPED. Pause it (stop requested; persistent disk kept —
+        # never delete) before failing. Keep the reservation (the VM ran).
+        _paused = _stop_runtime_best_effort(
+            token, google_project, runtime_name,
+            "runner heartbeat never went live after Running (no cap enforcement)")
+        _pause_note = (" The VM has been PAUSED (stop requested; persistent disk "
+                       "kept) so it cannot run uncapped." if _paused else
+                       " WARNING: the VM could NOT be auto-paused — PAUSE IT "
+                       "MANUALLY in the Terra UI now to avoid uncapped charges.")
         # security review: in controlled mode the error must NOT expose the bucket-
         # derived heartbeat path or the runner log tail (it can echo bucket/
         # project/path strings) — surface a generic, path-free failure instead.
@@ -916,9 +994,8 @@ def terra_create_runtime(
             raise RuntimeError(
                 f"Runtime {runtime_name} reached Running, but its runner never "
                 f"posted a fresh heartbeat within 5 min (last age: {hb_age}). The "
-                f"startUserScriptUri runner failed to start. Details (heartbeat "
-                f"path + on-VM log tail) withheld in controlled-access mode — "
-                f"inspect the VM directly."
+                f"startUserScriptUri runner failed to start.{_pause_note}"
+                f" Details (heartbeat path + on-VM log tail) withheld in controlled-access mode — inspect the VM directly."
             )
         tail = _try_runner_log_tail(google_project, runtime_name)
         other = (f" (a fresh heartbeat for a DIFFERENT runtime {saw_other!r} "
@@ -928,7 +1005,7 @@ def terra_create_runtime(
             f"Runtime {runtime_name} reached Running, but its runner never "
             f"posted a fresh heartbeat at {hb_path} within 5 min "
             f"(last age: {hb_age}){other}. The startUserScriptUri runner failed "
-            f"to start.\n--- on-VM runner log tail ---\n{tail}"
+            f"to start.{_pause_note}\n--- on-VM runner log tail ---\n{tail}"
         )
 
     ready = {
