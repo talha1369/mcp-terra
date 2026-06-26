@@ -1457,6 +1457,16 @@ def _():
     sec = (REPO_ROOT / "SECURITY.md").read_text()
     assert "Terminal-result write is not perfectly atomic with claim ownership" in sec
 
+@case("CC-Hardening", "result-upload-failure path still reaches fail-streak + auto-stop")
+def _():
+    from mcp_terra import notebook_runner as nbr
+    s = nbr.runner_script_template()
+    # the billable upload-failure branch must NOT `continue` out before the
+    # shared cost-control block (fail-streak accounting / auto-stop)
+    seg = s[s.index("REFUSED-RESULT-UPLOAD-FAILED"):s.index("Fail-streak accounting")]
+    assert "continue" not in seg, "upload-failure path still continues before cost controls"
+    assert "every post-papermill path" in s.lower() or "EVERY post-papermill path" in s
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # U-Robustness: state-of-the-art MCP design — annotations, schema versioning,

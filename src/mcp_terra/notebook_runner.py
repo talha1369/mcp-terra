@@ -1368,54 +1368,49 @@ PYRESULT
             echo "[runner] WARN: result.json upload attempt $_try for $JOB_ID failed; retrying." >&2
             sleep 3
         done
-        if [ "$_result_ok" -ne 1 ]; then
-            # No durable result. Write a TERMINAL status marker so neither this
-            # runner (PROCESSED_FILE) nor another VM (REFUSED* status) re-executes
-            # the (already-run, billable) notebook — avoiding both a same-VM
-            # runaway loop AND a cross-VM retry. The notebook DID run; the failure
-            # is purely the result upload, so re-running would only double-spend.
+        # security review: EVERY post-papermill path (result uploaded OR upload
+        # failed) is BILLABLE and MUST reach the shared cost-control block below
+        # (fail-streak accounting + auto-stop) — no early `continue`, or a
+        # successful auto-stop job could leave the VM running and a failed job
+        # could skip the runaway-cost halt.
+        if [ "$_result_ok" -eq 1 ]; then
+            if [ "$RC" = "0" ]; then
+                echo "succeeded" | timeout 60 gsutil cp - "$STATUS" 2>/dev/null || true
+            else
+                echo "FAILED" | timeout 60 gsutil cp - "$STATUS" 2>/dev/null || true
+            fi
+            # Best-effort artifacts (the lease refresher keeps the claim alive even
+            # if these are large/slow); each timeout-bounded.
+            timeout --signal=TERM --kill-after=15 600 gsutil cp -n "$LOCAL_OUT" "$EXECUTED" 2>/dev/null || \
+                echo "[runner] WARN: executed.ipynb upload skipped/failed for $JOB_ID" >&2
+            timeout 300 gsutil cp -n "$WORK/$JOB_ID.stdout" "$JOB_DIR/runner.stdout" 2>/dev/null || true
+            timeout 300 gsutil cp -n "$WORK/$JOB_ID.stderr" "$JOB_DIR/runner.stderr" 2>/dev/null || true
+            if [ -f "$LOST_CLAIM" ]; then
+                echo "[runner] NOTE: the lease for $JOB_ID was lost mid-run; result.json no-clobber guarantees a single valid result (no corruption)." >&2
+            fi
+            # Re-prove claim ownership before MOVING the spec. ONLY the spec move +
+            # processed-marking are gated; the cost controls below run regardless.
+            # If we cannot prove ownership, leave the spec for the claim holder
+            # (the durable result.json terminal marker still prevents re-execution).
+            if own_claim_check; then
+                if ! gsutil mv -n "$SPEC" "$SPEC.consumed" 2>/dev/null; then
+                    TS="$(date -u +%Y%m%dT%H%M%SZ)"
+                    gsutil mv -n "$SPEC" "$SPEC.consumed.$TS" 2>/dev/null || \
+                        echo "[runner] WARN: could not move $SPEC to .consumed (already processed locally; safe)." >&2
+                fi
+                echo "$JOB_ID" >> "$PROCESSED_FILE"
+            else
+                echo "[runner] $JOB_ID: claim not held before spec move — leaving the spec for the claim holder (result already terminalized; cost controls still run)." >&2
+            fi
+        else
+            # result.json upload failed after retries — the notebook DID run
+            # (billable). Write a TERMINAL status marker so neither this runner nor
+            # another VM re-executes (double-spend), mark processed, and FALL
+            # THROUGH (no `continue`) so fail-streak + auto-stop still run.
             echo "REFUSED-RESULT-UPLOAD-FAILED" | timeout 60 gsutil cp - "$STATUS" 2>/dev/null || \
                 echo "[runner] CRITICAL: could not upload result.json OR a terminal status for $JOB_ID; the spec stays pending and its claim will age out for a later retry." >&2
             echo "[runner] CRITICAL: result.json upload failed for $JOB_ID after retries (notebook already executed)." >&2
             echo "$JOB_ID" >> "$PROCESSED_FILE"
-            stop_refresher
-            continue
-        fi
-        if [ "$RC" = "0" ]; then
-            echo "succeeded" | timeout 60 gsutil cp - "$STATUS" 2>/dev/null || true
-        else
-            echo "FAILED" | timeout 60 gsutil cp - "$STATUS" 2>/dev/null || true
-        fi
-        # Best-effort artifacts (the lease refresher keeps the claim alive even if
-        # these are large/slow); each timeout-bounded.
-        timeout --signal=TERM --kill-after=15 600 gsutil cp -n "$LOCAL_OUT" "$EXECUTED" 2>/dev/null || \
-            echo "[runner] WARN: executed.ipynb upload skipped/failed for $JOB_ID" >&2
-        timeout 300 gsutil cp -n "$WORK/$JOB_ID.stdout" "$JOB_DIR/runner.stdout" 2>/dev/null || true
-        timeout 300 gsutil cp -n "$WORK/$JOB_ID.stderr" "$JOB_DIR/runner.stderr" 2>/dev/null || true
-        if [ -f "$LOST_CLAIM" ]; then
-            echo "[runner] NOTE: the lease for $JOB_ID was lost mid-run; result.json no-clobber guarantees a single valid result (no corruption)." >&2
-        fi
-
-        # security review: re-prove claim ownership before MOVING the spec — but
-        # this run is ALREADY terminalized (result.json + status written above),
-        # so the cost controls below (fail-streak accounting + auto-stop) MUST
-        # still run regardless of this check (a transient ownership-stat failure
-        # must NOT leave the VM running or skip the runaway-cost halt). ONLY the
-        # spec MOVE + local processed-marking are gated: if we cannot prove we
-        # still hold the claim, leave the spec for the claim holder (the durable
-        # result.json terminal marker still prevents any re-execution).
-        if own_claim_check; then
-            # Mark spec consumed via no-clobber rename. If .consumed already
-            # exists, append a timestamp suffix so previous run's data survives.
-            if ! gsutil mv -n "$SPEC" "$SPEC.consumed" 2>/dev/null; then
-                TS="$(date -u +%Y%m%dT%H%M%SZ)"
-                gsutil mv -n "$SPEC" "$SPEC.consumed.$TS" 2>/dev/null || \
-                    echo "[runner] WARN: could not move $SPEC to .consumed (already processed locally; safe)." >&2
-            fi
-            # Record locally so we never re-execute even if the bucket move failed
-            echo "$JOB_ID" >> "$PROCESSED_FILE"
-        else
-            echo "[runner] $JOB_ID: claim not held before spec move — leaving the spec for the claim holder (result already terminalized; cost controls still run)." >&2
         fi
         # Job is durably terminal now — stop the lease refresher (it has done its
         # job). The top-of-loop stop_refresher is the safety net for any earlier
