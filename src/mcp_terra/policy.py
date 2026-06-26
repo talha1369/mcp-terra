@@ -79,7 +79,7 @@ _DATA_EGRESS_ALLOW = frozenset(
 # Well-known PUBLIC genomics/reference buckets, matched by EXACT name only.
 # Prefix matching is unsafe — a controlled bucket could be NAMED to collide
 # (e.g. 'gnomad-public-impostor'), turning the guard into bucket-name trust
-# (Codex finding). Bucket names are a flat global namespace, so only exact
+# (security review finding). Bucket names are a flat global namespace, so only exact
 # identity is trustworthy. Operators add others via MCP_TERRA_DATA_EGRESS_ALLOW.
 _PUBLIC_DATA_BUCKETS = frozenset({
     "gcp-public-data--broad-references",

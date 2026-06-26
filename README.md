@@ -277,7 +277,7 @@ terra_killswitch_status() → {tripped, reason, …}
 
 ### Workspace data & workflow inspection (read-only)
 
-These make the MCP a strict superset of `broadinstitute/fiss-mcp`'s reads —
+These give the MCP comprehensive read coverage —
 all READ-class, no spend, no destruction.
 
 ```

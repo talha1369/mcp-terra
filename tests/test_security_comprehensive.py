@@ -401,7 +401,7 @@ def _():
         "terra_list_method_configs", "terra_submit_workflow",
         "terra_get_submission", "terra_get_workflow_outputs",
         "terra_register_method", "terra_create_method_config",
-        # fiss-mcp-superset read-only tools (all READ-class)
+        # comprehensive-read read-only tools (all READ-class)
         "terra_list_data_tables", "terra_get_entities", "terra_list_submissions",
         "terra_get_workflow_metadata", "terra_get_workflow_cost",
         "terra_get_method_config", "terra_read_bucket_object",
@@ -1224,7 +1224,7 @@ def _():
         # WDL read tools
         "terra_list_method_configs", "terra_get_submission",
         "terra_get_workflow_outputs", "terra_get_workflow_logs",
-        # fiss-mcp-superset read tools (all ANN_READ_REMOTE)
+        # comprehensive-read read tools (all ANN_READ_REMOTE)
         "terra_list_data_tables", "terra_get_entities", "terra_list_submissions",
         "terra_get_workflow_metadata", "terra_get_workflow_cost",
         "terra_get_method_config", "terra_read_bucket_object",
@@ -2406,8 +2406,8 @@ def _():
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# CC-Reads — fiss-mcp-superset read-only tools. All READ-class: no spend, no
-# write, no destruction. Make this MCP a strict superset of fiss-mcp's reads.
+# CC-Reads — comprehensive-read read-only tools. All READ-class: no spend, no
+# write, no destruction. Make this MCP a comprehensive read coverage.
 # ──────────────────────────────────────────────────────────────────────────
 from mcp_terra import bucket as _bk
 
@@ -2789,20 +2789,20 @@ def _():
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# CC-CodexFixes — regressions for the 6 findings from the adversarial review
+# CC-HardeningFixes — regressions for the 6 findings from the adversarial review
 # ──────────────────────────────────────────────────────────────────────────
 import os as _os_cf
 import tempfile as _tf_cf
 
 
-@case("CC-CodexFixes", "F1[critical] write-policy refuses blocked paths exist-independently")
+@case("CC-HardeningFixes", "F1[critical] write-policy refuses blocked paths exist-independently")
 def _():
     for p in ("~/.ssh/id_rsa", "~/.zshrc", "/etc/passwd",
               "~/Library/LaunchAgents/eve.plist", "~/.aws/credentials"):
         must_raise(safety.assert_local_write_policy, safety.SafetyError, p)
 
 
-@case("CC-CodexFixes", "F1[critical] write-policy refuses symlink + non-regular node")
+@case("CC-HardeningFixes", "F1[critical] write-policy refuses symlink + non-regular node")
 def _():
     d = _tf_cf.mkdtemp(prefix="mcp_cf_")
     link = _os_cf.path.join(d, "link")
@@ -2816,14 +2816,14 @@ def _():
         pass  # os.mkfifo unavailable (non-POSIX) — symlink case still covered
 
 
-@case("CC-CodexFixes", "F1[critical] write-policy allows a normal non-existent temp path")
+@case("CC-HardeningFixes", "F1[critical] write-policy allows a normal non-existent temp path")
 def _():
     d = _tf_cf.mkdtemp(prefix="mcp_cf_")
     out = safety.assert_local_write_policy(_os_cf.path.join(d, "ok.txt"))
     assert str(out).endswith("ok.txt")
 
 
-@case("CC-CodexFixes", "F1[critical] download tool runs write-policy BEFORE the existence branch")
+@case("CC-HardeningFixes", "F1[critical] download tool runs write-policy BEFORE the existence branch")
 def _():
     import inspect
     src = inspect.getsource(server.terra_download_from_bucket)
@@ -2833,7 +2833,7 @@ def _():
         "policy check must run before/independent of version_existing branch"
 
 
-@case("CC-CodexFixes", "F2[high] audio text fails closed on a non-Google secret shape")
+@case("CC-HardeningFixes", "F2[high] audio text fails closed on a non-Google secret shape")
 def _():
     from mcp_terra import audio_summary as _as
     text = ("Run summary: the analysis finished cleanly, and here is an "
@@ -2841,7 +2841,7 @@ def _():
     must_raise(_as._validate_text, _as.AudioSummaryError, text)
 
 
-@case("CC-CodexFixes", "F3[high] build_record drops caller-forged agent identity")
+@case("CC-HardeningFixes", "F3[high] build_record drops caller-forged agent identity")
 def _():
     forged = dict(_GOOD_REC, agent={"terra_user_email": "attacker@evil.com",
                                     "terra_user_subject_id": "forged",
@@ -2853,27 +2853,27 @@ def _():
     assert "terra_user_subject_id" not in rec["agent"], "forged subject_id must be dropped"
 
 
-@case("CC-CodexFixes", "F3[high] build_record fails closed when identity unresolved")
+@case("CC-HardeningFixes", "F3[high] build_record fails closed when identity unresolved")
 def _():
     must_raise(_rr.build_record, _rr.RunRecordError, _GOOD_REC,
                mcp_version="1", module_hashes={"a.py": "h"}, user_email="")
 
 
-@case("CC-CodexFixes", "F4[med] write_run_record binds embedded run_id to the path arg")
+@case("CC-HardeningFixes", "F4[med] write_run_record binds embedded run_id to the path arg")
 def _():
     import inspect
     src = inspect.getsource(server.terra_write_run_record)
     assert "!= run_id" in src and 'record_in["run_id"] = run_id' in src
 
 
-@case("CC-CodexFixes", "F5[med] write_run_record unlinks its temp blob in finally")
+@case("CC-HardeningFixes", "F5[med] write_run_record unlinks its temp blob in finally")
 def _():
     import inspect
     src = inspect.getsource(server.terra_write_run_record)
     assert "finally:" in src and "unlink(tmp)" in src
 
 
-@case("CC-CodexFixes", "F6[med] write_run_record preflights no-clobber before upload")
+@case("CC-HardeningFixes", "F6[med] write_run_record preflights no-clobber before upload")
 def _():
     import inspect
     src = inspect.getsource(server.terra_write_run_record)
@@ -3029,10 +3029,10 @@ def _():
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# CC-CodexFixes2 — regressions for the 2nd adversarial-review round (6 findings)
+# CC-HardeningFixes2 — regressions for the 2nd adversarial-review round (6 findings)
 # ──────────────────────────────────────────────────────────────────────────
 
-@case("CC-CodexFixes2", "F1[critical] exact protected DIRS are blocked (trailing-slash fix)")
+@case("CC-HardeningFixes2", "F1[critical] exact protected DIRS are blocked (trailing-slash fix)")
 def _():
     for p in ("/usr/bin", "/usr/sbin", "/bin", "/sbin", "/System",
               "/var/db", "/var/root"):
@@ -3044,14 +3044,14 @@ def _():
     safety.assert_local_write_policy(_o.path.join(_t.mkdtemp(), "ok.txt"))
 
 
-@case("CC-CodexFixes2", "F1[critical] download refuses version_existing on a directory")
+@case("CC-HardeningFixes2", "F1[critical] download refuses version_existing on a directory")
 def _():
     import inspect
     src = inspect.getsource(server.terra_download_from_bucket)
     assert "target.is_dir()" in src and "versions single files only" in src
 
 
-@case("CC-CodexFixes2", "F2[high] reserved audio path: helper + upload refusal")
+@case("CC-HardeningFixes2", "F2[high] reserved audio path: helper + upload refusal")
 def _():
     assert safety.is_reserved_bucket_path("gs://b/mcp_terra_jobs/J1/summary.m4a")
     assert safety.is_reserved_bucket_path("gs://b/mcp_terra_jobs/J1/summary.mp3")
@@ -3062,7 +3062,7 @@ def _():
     assert "is_reserved_bucket_path" in src, "upload must refuse the reserved audio path"
 
 
-@case("CC-CodexFixes2", "F3[high] audio fetch size-preflights BEFORE download")
+@case("CC-HardeningFixes2", "F3[high] audio fetch size-preflights BEFORE download")
 def _():
     import inspect
     sig = inspect.signature(server._fetch_run_audio_bytes)
@@ -3074,7 +3074,7 @@ def _():
         "size cap must be enforced before the download"
 
 
-@case("CC-CodexFixes2", "F4[med] Slack fails LOUD when ALL targets fail")
+@case("CC-HardeningFixes2", "F4[med] Slack fails LOUD when ALL targets fail")
 def _():
     from mcp_terra import notify as _n
     saved = (_n._SLACK_BOT_TOKEN, _n._SLACK_CHANNEL, _n._slack_upload_one)
@@ -3092,7 +3092,7 @@ def _():
     assert "partial_failure" in inspect.getsource(_n.slack_upload_file)
 
 
-@case("CC-CodexFixes2", "F5[med] audio render preflights both ext BEFORE the TTS side-effect")
+@case("CC-HardeningFixes2", "F5[med] audio render preflights both ext BEFORE the TTS side-effect")
 def _():
     import inspect
     src = inspect.getsource(server.terra_render_audio_summary)
@@ -3102,7 +3102,7 @@ def _():
         "no-clobber preflight must run before sending text to the backend"
 
 
-@case("CC-CodexFixes2", "F6[med] run-record read-back verifies md5 after upload")
+@case("CC-HardeningFixes2", "F6[med] run-record read-back verifies md5 after upload")
 def _():
     import inspect
     src = inspect.getsource(server.terra_write_run_record)
@@ -3423,10 +3423,10 @@ def _():
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# CC-Seqera — MCP resources + prompts (discoverability), safe (no data egress)
+# CC-Discoverability — MCP resources + prompts (discoverability), safe (no data egress)
 # ──────────────────────────────────────────────────────────────────────────
 
-@case("CC-Seqera", "MCP resources + prompts are registered")
+@case("CC-Discoverability", "MCP resources + prompts are registered")
 def _():
     import asyncio
     res = asyncio.run(server.server.list_resources())
@@ -3437,7 +3437,7 @@ def _():
     assert {"diagnose_failed_workflow", "run_notebook_bugfix_loop"} <= pnames, pnames
 
 
-@case("CC-Seqera", "posture resource exposes config only — NO workspace data")
+@case("CC-Discoverability", "posture resource exposes config only — NO workspace data")
 def _():
     md = server._res_posture()
     assert "no delete" in md.lower() and "controlled-access" in md.lower()
@@ -3449,7 +3449,7 @@ def _():
         assert forbidden not in src, f"posture resource must not touch data ({forbidden})"
 
 
-@case("CC-Seqera", "prompts are guidance-only (no destructive instruction)")
+@case("CC-Discoverability", "prompts are guidance-only (no destructive instruction)")
 def _():
     p1 = server.diagnose_failed_workflow("ns", "ws", "sub")
     p2 = server.run_notebook_bugfix_loop("gs://b/n.ipynb")
@@ -3467,41 +3467,44 @@ def _():
 # can't satisfy it). NO_DATA tools are writes/control/notifications/metadata/
 # schema/status/cost that do not egress workspace data rows/objects to the model.
 # A NEW tool that is not added to either set FAILS the meta-test (fail-closed):
-# the author must classify it, and if it returns data, guard it. (Codex round-4.)
+# the author must classify it, and if it returns data, guard it. (security review round-4.)
 _DATA_TOOLS_REQUIRING_GUARD = {
     "terra_read_bucket_object", "terra_list_bucket", "terra_get_entities",
     "terra_get_method_config", "terra_get_submission", "terra_get_workflow_outputs",
     "terra_get_workflow_metadata", "terra_get_workflow_logs", "terra_get_run_log",
     "terra_get_notebook_job_result", "terra_get_batch_job_status",
     "terra_render_audio_summary",
-    # Codex r5: these return UNPROJECTED Rawls/gsutil payloads that can carry
+    # security review r5: these return UNPROJECTED Rawls/gsutil payloads that can carry
     # operator-controlled identifiers (workspace attributes, config names/refs,
     # custom object metadata) or pull the bytes to local disk → guarded + tested.
     "terra_get_workspace", "terra_list_method_configs",
     "terra_get_bucket_object_metadata", "terra_download_from_bucket",
-    # Codex r6: listings whose payloads carry operator/user-controlled strings
+    # security review r6: listings whose payloads carry operator/user-controlled strings
     # (workspace names, data-table schema, methodConfigurationName) → guarded.
     "terra_list_workspaces", "terra_list_data_tables", "terra_list_submissions",
-    # Codex r7: runtime names/labels/URLs are user-controlled; recommend cats the
+    # security review r7: runtime names/labels/URLs are user-controlled; recommend cats the
     # notebook bytes locally; refresh enumerates bucket names → all guarded.
     "terra_list_runtimes", "terra_get_runtime",
     "terra_recommend_runtime_for_notebook", "terra_refresh_workspace_allowlist",
-    # Codex r8: write/lifecycle RETURN VALUES echo operator-controlled strings
+    # security review r8: write/lifecycle RETURN VALUES echo operator-controlled strings
     # (createSubmission method/entity names, WDL payload, config inputs/outputs,
     # Leonardo labels/URLs, cost workflow names) → projected + guarded.
     "terra_submit_workflow", "terra_register_method", "terra_create_method_config",
     "terra_create_runtime", "terra_start_runtime", "terra_stop_runtime",
     "terra_get_workflow_cost", "terra_upload_to_bucket",
-    # Codex r9: terra_health returns workspace_lock + bucket/heartbeat paths + IAM
+    # security review r9: terra_health returns workspace_lock + bucket/heartbeat paths + IAM
     # writer principals — projected to booleans/counts/status in guard mode.
     "terra_health",
+    # security review r10: write_run_record returns the FULL enriched record (workspace
+    # identifiers + caller body) — projected to a minimal ack in guard mode.
+    "terra_write_run_record",
 }
 _NO_DATA_TOOLS = {
     # writes / control whose RETURN is a caller-echo / local ack / status (NOT a
     # raw remote service payload — enforced by the structural meta-test below)
     "terra_submit_notebook_job",
     "terra_install_notebook_runner", "terra_start_runner_on_vm",
-    "terra_killswitch_trip", "terra_write_run_record",
+    "terra_killswitch_trip",
     # notifications / delivery (recipient-locked; not a Terra→LLM egress path)
     "terra_notify_desktop", "terra_notify_slack", "terra_send_run_report_email",
     # identity / posture (not workspace data)
@@ -3513,13 +3516,12 @@ _NO_DATA_TOOLS = {
 # _NO_DATA tools that DO call a remote service (tc.*/bk.*) but provably return
 # only an ack / caller-echo / the caller's OWN identity — NOT workspace data.
 # A new _NO_DATA tool that calls a remote service must be added here deliberately
-# (fail-closed), which forces a human to confirm it doesn't leak. (Codex r9.)
+# (fail-closed), which forces a human to confirm it doesn't leak. (security review r9.)
 _NO_DATA_REMOTE_OK = {
     "terra_whoami",                  # caller's own Sam/gcloud identity
     "terra_submit_notebook_job",     # job_id + gcs paths under the caller's OWN bucket_uri arg
     "terra_install_notebook_runner", # install status + caller's bucket path
     "terra_start_runner_on_vm",      # runtime name (caller arg) + zone (enum) + status
-    "terra_write_run_record",        # record path (derived from job_id) + digest
 }
 
 
@@ -3562,7 +3564,7 @@ def _raw_returns_remote_service(fn) -> bool:
     """True if the tool returns a raw remote-service (tc.*/bk.*) payload to _ok —
     either directly (`return _ok(tc.x())`) OR via a local var tainted by a remote
     call (`r = tc.x(); return _ok(r)`). Catches the write/lifecycle leak class
-    (Codex r8) + the local-var shape (Codex r9). AST-based, ignores docstrings."""
+    (security review r8) + the local-var shape (security review r9). AST-based, ignores docstrings."""
     import ast
     import inspect
     try:
@@ -3590,7 +3592,7 @@ def _raw_returns_remote_service(fn) -> bool:
 
 
 def _calls_remote_service(fn) -> bool:
-    """True if the tool makes ANY tc.*/bk.* remote-service call (Codex r9). Used
+    """True if the tool makes ANY tc.*/bk.* remote-service call (security review r9). Used
     to keep the _NO_DATA set fail-closed: a no-data tool that touches a remote
     service must be explicitly justified in _NO_DATA_REMOTE_OK."""
     import ast
@@ -3610,7 +3612,7 @@ def _calls_remote_service(fn) -> bool:
 
 @case("CC-ControlledAccess3", "META(fail-closed): no _NO_DATA tool raw-returns a remote payload")
 def _():
-    # Codex r8 root cause: _NO_DATA tools were trusted to not leak, but several
+    # security review r8 root cause: _NO_DATA tools were trusted to not leak, but several
     # raw-returned a Rawls/Leonardo/gsutil response (write/lifecycle paths).
     # A _NO_DATA tool must NOT pass a raw remote payload to the LLM — it must
     # project (and move to the guarded set). The only allowed raw return is the
@@ -3626,7 +3628,7 @@ def _():
 
 @case("CC-ControlledAccess3", "META(fail-closed): _NO_DATA tools make no UNjustified remote call")
 def _():
-    # Codex r9: the raw-return check missed remote-derived data reaching _ok via
+    # security review r9: the raw-return check missed remote-derived data reaching _ok via
     # dicts/helpers/subprocess. Stronger rule: a _NO_DATA tool may call a remote
     # service ONLY if explicitly justified in _NO_DATA_REMOTE_OK (each returns an
     # ack / caller-echo / own identity). A new no-data tool that touches tc.*/bk.*
@@ -4134,23 +4136,66 @@ def _():
         out = server.terra_health()
         assert SENTINEL not in out, "terra_health leaked the locked bucket name!"
         assert "proj" not in out, "terra_health leaked the google project!"
+        # security review r10: absolute local paths + inventories must be gone too
+        assert str(_p.KILL_FILE) not in out, "terra_health leaked the kill_file path!"
+        assert str(_p.AUDIT_LOG) not in out, "terra_health leaked the audit_log path!"
+        assert "tools_index" not in out and "code_integrity" not in out
         # booleans/status still present
         assert "writes_allowed" in out and "tools_count" in out
     finally:
         _p._CONTROLLED_ACCESS, _p.resolve_locked_workspace = saved, olock
 
 
-@case("CC-SessionLimit", "runner atomically CLAIMS each spec (parallel-safe, no double-execution)")
+@case("CC-ControlledAccess3", "write_run_record returns a minimal ack, not the full record (controlled)")
+def _():
+    # The full behavioral path does bucket I/O + md5 read-back; assert at the
+    # source level that controlled mode SHORT-CIRCUITS to an ack BEFORE the
+    # full-record return (which carries workspace ids + the caller's body).
+    import inspect as _insp
+    src = _insp.getsource(server.terra_write_run_record)
+    assert "controlled_access_enabled()" in src
+    assert '"run_id": run_id' in src and '"written": True' in src
+    ack_idx = src.index('"written": True')
+    full_idx = src.index('"run_record": rec')
+    assert ack_idx < full_idx, "controlled ack must short-circuit before the full record"
+
+
+@case("CC-ControlledAccess3", "get_workflow_cost drops a numeric field whose KEY encodes an id (controlled)")
+def _():
+    from mcp_terra import policy as _p
+    saved, oc, ot = _p._CONTROLLED_ACCESS, _tc.rawls_get_workflow_cost, server.auth.get_access_token
+    _tc.rawls_get_workflow_cost = lambda *a, **k: {
+        "cost": 1.23, "currency": "USD",
+        "sample_NA12878_count": 5,        # numeric, but the KEY is an identifier
+        "vmCostUsd": 0.99}
+    server.auth.get_access_token = lambda: "tok"
+    try:
+        _p._CONTROLLED_ACCESS = True
+        out = server.terra_get_workflow_cost("ns", "ws", "sub", "wf")
+        assert "NA12878" not in out, "a numeric field with an identifier KEY leaked!"
+        assert "1.23" in out and "0.99" in out  # cost-named numeric fields kept
+    finally:
+        _p._CONTROLLED_ACCESS, _tc.rawls_get_workflow_cost, server.auth.get_access_token = saved, oc, ot
+
+
+@case("CC-SessionLimit", "runner atomically CLAIMS each spec via GCS precondition (parallel-safe)")
 def _():
     from mcp_terra import notebook_runner as nbr
     s = nbr.runner_script_template()
-    # Codex r9: a stable per-runtime claim id + a no-clobber .claim marker with a
-    # read-back decides ownership, so two VMs on the same bucket run DIFFERENT
-    # jobs in parallel but never the SAME job twice.
+    # security review r10: a REAL atomic create-if-absent via the GCS generation
+    # precondition (server-enforced) — NOT cp -n + read-back. Two VMs on the same
+    # bucket run DIFFERENT jobs in parallel but never the SAME job twice; a stale
+    # claim (owner gone) is reclaimed via compare-and-swap on the generation.
     assert "RUNNER_INSTANCE_ID" in s and "MCP_TERRA_RUNTIME_NAME:-legacy-runner" in s
     assert 'CLAIM="$JOB_DIR/.claim"' in s
-    assert "gsutil cp -n - \"$CLAIM\"" in s and "CLAIM_OWNER" in s
-    assert "claimed by another runner" in s
+    assert 'x-goog-if-generation-match:0' in s, "must use the atomic create precondition"
+    assert "x-goog-if-generation-match:$CLAIM_GEN" in s, "must reclaim via compare-and-swap"
+    assert "CLAIM_TTL" in s and "claim contended" in s
+    assert "gsutil cp -n - \"$CLAIM\"" not in s, "the racy cp -n claim must be gone"
+    # security review r10: durable terminal markers — succeeded/FAILED* + result.json, not
+    # just REFUSED — so a same-runtime restart never re-executes a completed spec.
+    assert "REFUSED*|succeeded|FAILED*" in s
+    assert 'gsutil -q stat "$RESULT"' in s
 
 
 @case("CC-ControlledAccess3", "create_runtime/stop_runtime project the Leonardo response (source)")
@@ -4158,9 +4203,12 @@ def _():
     import inspect
     csrc = inspect.getsource(server.terra_create_runtime)
     assert 'create_resp = {' in csrc and "controlled_access_enabled()" in csrc
-    # Codex r9: the auto-start "ready" block must ALSO drop the (lock-derived)
+    # security review r9: the auto-start "ready" block must ALSO drop the (lock-derived)
     # bucket_uri in controlled mode, not just leo_create_response.
     assert 'ready.pop("bucket_uri"' in csrc
+    # security review r10: the heartbeat-FAILURE raise must redact hb_path + log tail in
+    # controlled mode (it is derived from the bucket).
+    assert "Details (heartbeat" in csrc and "withheld in controlled-access mode" in csrc
     ssrc = inspect.getsource(server.terra_stop_runtime)
     assert '"action": "stop"' in ssrc and "controlled_access_enabled()" in ssrc
 
@@ -4184,7 +4232,7 @@ def _():
         out = server.terra_get_workflow_logs("ns", "ws", "sub", "wf")
         assert '"stderr_truncated": true' in out, "per-task truncation must be reported"
         assert '"content_truncated": true' in out, "content_truncated must surface"
-        # Codex r5: a single long stderr must NOT flip the break-driving top-level
+        # security review r5: a single long stderr must NOT flip the break-driving top-level
         # 'truncated' flag (that would drop OTHER failed tasks from diagnostics).
         assert '"truncated": false' in out, "per-object truncation must not set the early-break flag"
     finally:
@@ -4303,12 +4351,12 @@ def _():
     # Total budget computed from the session window (hours), minus a margin.
     assert "MCP_TERRA_MAX_RUN_HOURS" in s and "SESSION_BUDGET_SEC" in s
     assert "SESSION_MARGIN_SEC" in s
-    # Codex r5: a SINGLE deadline anchored at runner start; per-job budget is the
+    # security review r5: a SINGLE deadline anchored at runner start; per-job budget is the
     # REMAINING time, and a near-exhausted window REFUSES new jobs.
     assert "RUNNER_START_EPOCH" in s and "SESSION_DEADLINE" in s
     assert "SESSION_REMAINING" in s and "JOB_BUDGET" in s
     assert "REFUSED-SESSION-WINDOW" in s and "SESSION_MIN_JOB_SEC" in s
-    # Codex r6: a refused job is only marked processed once the spec MOVE
+    # security review r6: a refused job is only marked processed once the spec MOVE
     # (durable terminal marker) succeeds — else it stays RETRYABLE.
     assert "leaving it RETRYABLE" in s
     # The WHOLE papermill run is wrapped in coreutils `timeout` (TERM→KILL) at
@@ -4316,7 +4364,7 @@ def _():
     assert 'timeout --verbose --signal=TERM --kill-after=60 "${JOB_BUDGET}s"' in s
     assert "command -v timeout" in s, "must fail loud if timeout(1) is missing"
     assert "PER_CELL_SEC=$JOB_BUDGET" in s, "per-cell timeout capped to remaining budget"
-    # Codex r6: CAUSAL detection — RC 124, or the `timeout --verbose` marker.
+    # security review r6: CAUSAL detection — RC 124, or the `timeout --verbose` marker.
     # An OOM RC 137 without the marker must NOT be labelled a session limit.
     assert '"$RC" -eq 124' in s
     assert '"^timeout: sending signal"' in s, "must use the causal timeout marker"

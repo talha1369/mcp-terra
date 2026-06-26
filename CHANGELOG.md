@@ -9,7 +9,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
-- **MCP resources + prompts (Seqera-style discoverability).** Read-only
+- **MCP resources + prompts (discoverability).** Read-only
   resources `terra://health` (live posture) and `terra://posture` (safety/
   compliance one-pager) — config only, never workspace data — plus reusable
   prompt templates `diagnose_failed_workflow` and `run_notebook_bugfix_loop`.
@@ -22,8 +22,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   return code + stderr tail for failed tasks), the real failure signal for
   diagnosing a failed WDL run that the workflow status alone doesn't give. READ
   class, byte-capped, and **controlled-access-aware** (stderr content withheld
-  in guard mode; paths/statuses still returned). Inspired by the
-  dalmatian/nebelung gap analysis.
+  in guard mode; paths/statuses still returned). Inspired by a gap analysis of common Terra Python clients.
 - **Controlled-access data-egress guard (NIH GDS / DUC).** A new
   `MCP_TERRA_CONTROLLED_ACCESS=1` mode refuses to return raw workspace DATA to
   the LLM — `terra_read_bucket_object` (object bytes) and `terra_get_entities`
@@ -88,10 +87,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     be invited). Each target is delivered independently and its success/failure
     surfaced (partial delivery is never hidden).
 
-- **Read-only superset of `broadinstitute/fiss-mcp`** — nine new READ-class
-  tools (no spend, no write, no destruction) close fiss-mcp's read-side lead so
-  this MCP is a strict superset of its reads (it already exceeds fiss-mcp on
-  runtimes, the notebook run/fix/report loop, WDL authoring, and every safety
+- **Comprehensive read-only inspection surface** — nine new READ-class
+  tools (no spend, no write, no destruction) round out the read surface so the MCP gives broad read coverage
+  alongside runtimes, the notebook run/fix/report loop, WDL authoring, and every safety
   dimension):
   - `terra_list_data_tables` — workspace entity types + per-table metadata.
   - `terra_get_entities` — paged rows of a data table (`page_size` clamped 1..500
@@ -109,8 +107,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   - `terra_get_bucket_object_metadata` — `gsutil stat` for one object.
   - `terra_get_batch_job_status` — Google Batch job state for Cromwell-on-Batch
     infra triage; always returns a copy-pasteable `gcloud logging read` command.
-  - **Not adopted** (would break no-destruction): fiss-mcp's `abort_submission`
-    and entity-overwrite, and ops-terra-utils' delete scripts. Each gets a
+  - **Not adopted** (would break no-destruction): the destructive abort_submission
+    and entity-overwrite, and other toolkits. delete scripts. Each gets a
     read-only/"plan + UI steps" counterpart instead.
 - **Publication-readiness hardening** (for sharing as a public repo):
   - **Secret-scanning everywhere** — `detect-secrets` added as a fail-fast CI
@@ -181,7 +179,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `Retry-After` header, for **idempotent methods only** (GET/HEAD). A
   non-idempotent POST (e.g. a billable `createSubmission`) is attempted exactly
   once — retrying a transient error could double-submit. Tunable via
-  `MCP_TERRA_MAX_RETRIES` (default 3). Both `dalmatian` and `nebelung` do not
+  `MCP_TERRA_MAX_RETRIES` (default 3). Common Terra Python clients do not
   retry the Terra API at all.
 - **`terra_fetch_url` action class reconciled** — it is `WRITE_SAFE`-gated
   (a network side effect), so its annotation is now `ANN_WRITE_IDEMP`
@@ -241,7 +239,7 @@ tests exercise the templates in isolation, so these were latent):
 
 ### Security / invariants
 
-- **Adversarial-review hardening (Codex)** — fixed 6 findings against the
+- **Adversarial-review hardening** — fixed 6 findings against the
   run-record / Slack / desktop / audio work:
   - **CRITICAL** — `terra_download_from_bucket(version_existing=True)` skipped
     the local-path policy when the target already existed, so it could rename
@@ -259,8 +257,8 @@ tests exercise the templates in isolation, so these were latent):
     path; the local metadata temp blob is unlinked in `finally`; and
     `terra_write_run_record` does a no-clobber **preflight** so it can't report
     success while `gsutil cp -n` silently skipped.
-  - Guarded by 10 new regression tests (`CC-CodexFixes`).
-- **Adversarial-review hardening (Codex) — round 2** — 6 more findings on the
+  - Guarded by 10 new regression tests (`CC-HardeningFixes`).
+- **Adversarial-review hardening — round 2** — 6 more findings on the
   attachment/delivery work:
   - **CRITICAL** — `assert_local_write_policy` matched blocklist prefixes with a
     trailing slash, so EXACT protected directories (`/usr/bin`, `/bin`,
@@ -278,8 +276,8 @@ tests exercise the templates in isolation, so these were latent):
     `summary.{mp3,m4a}` before sending text to the backend; the run record is
     **read back (md5)** after upload so a `cp -n` skip/race can't report a
     write that didn't persist.
-  - Guarded by 7 new regression tests (`CC-CodexFixes2`).
-- **Adversarial-review hardening (Codex) — round 4** — egress closure across the
+  - Guarded by 7 new regression tests (`CC-HardeningFixes2`).
+- **Adversarial-review hardening — round 4** — egress closure across the
   full read surface + retry safety, on the new robustness work:
   - **Controlled-access leaks closed** in `terra_list_bucket` (object paths now
     require a public/allowlisted bucket), `terra_get_method_config` (projected to
@@ -302,7 +300,7 @@ tests exercise the templates in isolation, so these were latent):
     fails if any lacks a controlled-access check (prevents a future tool from
     silently re-opening an egress path). Guarded by 7 new regression tests
     (`CC-ControlledAccess3`).
-- **Adversarial-review hardening (Codex) — round 4b** (re-review of the round-4
+- **Adversarial-review hardening — round 4b** (re-review of the round-4
   fixes): closed 5 more findings.
   - **Audio in controlled mode** now feeds the summary text to `say` via
     **stdin**, never argv — argv is world-readable (`ps` / process accounting),
@@ -331,7 +329,7 @@ tests exercise the templates in isolation, so these were latent):
   `session_limit_note`. `terra_submit_notebook_job` advises the limit and points
   long jobs to the WDL/Cromwell path (Batch tasks auto-refresh credentials).
   Guarded by CC-SessionLimit.
-- **Adversarial-review hardening (Codex) — round 5** (re-review of round-4b +
+- **Adversarial-review hardening — round 5** (re-review of round-4b +
   the 24h guard): closed 6 more findings.
   - `terra_get_method_config` controlled-mode projection now returns **counts +
     integer version only** — method namespace/name and rootEntityType are also
@@ -355,7 +353,7 @@ tests exercise the templates in isolation, so these were latent):
   - `terra_get_workflow_logs` splits per-object `content_truncated` from the
     break-driving `truncated`, so one long stderr no longer drops later failed
     tasks from diagnostics.
-- **Adversarial-review hardening (Codex) — round 6** (re-review of round-5):
+- **Adversarial-review hardening — round 6** (re-review of round-5):
   closed 6 more findings.
   - `terra_get_bucket_object_metadata` controlled projection now matches EXACT
     safe labels at line start and **drops the whole custom-Metadata block** — a
@@ -376,7 +374,7 @@ tests exercise the templates in isolation, so these were latent):
     --verbose` "sending signal" marker — no longer a wall-clock heuristic, so an
     OOM SIGKILL (RC 137 without the marker) is correctly a normal `FAILED` and a
     backward clock step can't hide a real timeout.
-- **Adversarial-review hardening (Codex) — round 7** (re-review of round-6):
+- **Adversarial-review hardening — round 7** (re-review of round-6):
   closed 6 more findings.
   - The causal session-limit marker (`timeout --verbose` "sending signal") is now
     **gated to RC 137** — an ordinary papermill failure can no longer be
@@ -392,7 +390,7 @@ tests exercise the templates in isolation, so these were latent):
     guard mode (it cats the notebook bytes into the MCP host).
   - `Content-Type` (operator-settable) dropped from the `gsutil stat`
     controlled-mode allowlist.
-- **Adversarial-review hardening (Codex) — round 8** (re-review of round-7):
+- **Adversarial-review hardening — round 8** (re-review of round-7):
   closed 7 more findings — the **write/lifecycle return values** were the last
   unprojected controlled-access surface.
   - Controlled-mode projections added to `terra_submit_workflow` (ids + status),
@@ -410,7 +408,7 @@ tests exercise the templates in isolation, so these were latent):
     raw-returns a `tc.*`/`bk.*` payload** (the root cause that let the
     write-side leaks pass), with `terra_whoami` (caller's own identity) the only
     allowlisted exception. 31/43 tools now carry controlled-mode projections.
-- **Adversarial-review hardening (Codex) — round 9** (re-review of round-8):
+- **Adversarial-review hardening — round 9** (re-review of round-8):
   closed 5 more findings.
   - **Atomic per-spec runner claim** — the round-8 `REFUSED` status-skip wasn't
     atomic; two runners (two VMs on one bucket) could both pick up the same

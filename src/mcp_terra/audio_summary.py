@@ -95,7 +95,7 @@ def _validate_text(text: str) -> None:
     # Full secret scan before this text leaves via TTS / persisted audio — the
     # ya29 check above only covers Google OAuth tokens. Scan raw AND NFKC-
     # normalized (homoglyph defense), fail closed on ANY hit (AWS keys, GitHub
-    # PATs, Slack tokens, PEM private keys, …). (Codex high finding.)
+    # PATs, Slack tokens, PEM private keys, …). (security review high finding.)
     hits = secret_scan.scan_bytes(text.encode("utf-8"), "audio-summary")
     normalized = unicodedata.normalize("NFKC", text)
     if normalized != text:
@@ -233,7 +233,7 @@ def synthesize_say(text: str, *, voice: str = "") -> bytes:
     fd, tmp = tempfile.mkstemp(prefix="mcp_say_", suffix=".m4a")
     os.close(fd)
     try:
-        # SECURITY (Codex): never put the summary TEXT in argv — argv is
+        # SECURITY (security review): never put the summary TEXT in argv — argv is
         # world-readable via `ps`/process accounting on a multi-user host, so a
         # controlled-data summary in argv would be an egress path even with the
         # local backend. `say` reads the text to speak from STDIN when no string

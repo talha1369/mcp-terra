@@ -74,7 +74,7 @@ def build_record(record_in: dict, *, mcp_version: str,
     # `agent` object (if any) is DROPPED ENTIRELY so terra_user_email,
     # subject_id, mcp_version, or the integrity digest can never be forged.
     # Identity must be resolved — fail closed rather than write an
-    # unverifiable "who". (Codex high finding.)
+    # unverifiable "who". (security review high finding.)
     if not user_email:
         raise RunRecordError(
             "cannot resolve the authenticated Terra user; refusing to write a "

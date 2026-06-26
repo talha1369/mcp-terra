@@ -420,16 +420,20 @@ SESSION_MARGIN_SEC="${MCP_TERRA_SESSION_MARGIN_SEC:-1800}"   # 30-min headroom
 case "$SESSION_MARGIN_SEC" in ''|*[!0-9]*) SESSION_MARGIN_SEC=1800 ;; esac
 SESSION_BUDGET_SEC=$(( MAX_RUN_HOURS * 3600 - SESSION_MARGIN_SEC ))
 [ "$SESSION_BUDGET_SEC" -lt 300 ] && SESSION_BUDGET_SEC=300   # floor 5 min
-# Codex r5: the credential window is per-SESSION, not per-job. Anchor a single
+# security review r5: the credential window is per-SESSION, not per-job. Anchor a single
 # deadline at runner START (≈ when this VM/session booted and credentials were
 # issued), so a job submitted after a long prior job / idle is capped to what
 # REMAINS of the window — not given a fresh full budget each time.
 RUNNER_START_EPOCH=$(date +%s)
 SESSION_DEADLINE=$(( RUNNER_START_EPOCH + SESSION_BUDGET_SEC ))
 SESSION_MIN_JOB_SEC=300   # refuse a new job if less than this remains
+# A per-spec claim older than this means its owner is GONE (a job can never run
+# longer than the session budget), so it is safe to reclaim. No refresh needed —
+# an ACTIVE job's claim age is bounded by JOB_BUDGET <= SESSION_BUDGET_SEC. (r10)
+CLAIM_TTL=$(( SESSION_BUDGET_SEC + 300 ))
 # Stable id for THIS runner (the runtime name) — used to win an atomic per-spec
 # claim so two DIFFERENT VMs polling the same bucket can't execute/refuse the
-# same job twice. (Codex r9.) Stable (not pid/epoch) on purpose: a same-VM
+# same job twice. (security review r9.) Stable (not pid/epoch) on purpose: a same-VM
 # restart reclaims its own in-flight jobs (preserving existing retry behaviour);
 # only a DIFFERENT runtime is serialized out. flock already prevents two runners
 # per VM, and runtime names are unique per VM.
@@ -498,37 +502,54 @@ while true; do
         RESULT="$JOB_DIR/result.json"
         EXECUTED="$JOB_DIR/executed.ipynb"
 
-        # Codex r8: cross-runner safety. status.txt is the authoritative terminal
-        # marker. If a prior runner already wrote a terminal REFUSED status (e.g.
-        # a session-window refusal whose spec mv failed, leaving the spec still
-        # pending), NEVER execute it — a second runner/VM without our local
-        # processed file would otherwise re-run the job and SPEND. Refused jobs
-        # are terminal-by-decision; only a fresh-session restart (new spec)
-        # should run them.
+        # security review r8/r10: DURABLE terminal markers — never (re-)execute a job that
+        # already reached a terminal state, even when our LOCAL PROCESSED_FILE is
+        # missing (a different VM, or a fresh local disk). Covers REFUSED
+        # (session-window), succeeded / FAILED* (a runner that wrote the result +
+        # status but crashed before the .consumed move), and a present result.json.
         EXISTING_STATUS="$(gsutil cat "$STATUS" 2>/dev/null || true)"
         case "$EXISTING_STATUS" in
-            REFUSED*)
-                echo "[runner] job $JOB_ID already terminally REFUSED ($EXISTING_STATUS); skipping — not re-executing." >&2
+            REFUSED*|succeeded|FAILED*)
+                echo "[runner] job $JOB_ID already terminal ($EXISTING_STATUS); skipping — not re-executing." >&2
                 echo "$JOB_ID" >> "$PROCESSED_FILE"
                 continue
                 ;;
         esac
-
-        # Codex r9: ATOMIC per-spec claim BEFORE any verify/execute/refuse, so two
-        # different VMs polling this bucket cannot both act on the same pending
-        # spec (double-execute or one-runs-while-other-refuses). Write a
-        # no-clobber .claim marker, then READ IT BACK: gsutil cp -n exits 0
-        # whether it wrote or skipped, so the read-back is what decides ownership.
-        # GCS is read-after-write consistent, so every runner reads the SAME
-        # owner; exactly the one whose id matches proceeds. Same-runtime restarts
-        # reclaim (id is the stable runtime name) — preserving existing retry
-        # behaviour for a crashed-mid-run job on the same VM.
-        CLAIM="$JOB_DIR/.claim"
-        printf '%s\n' "$RUNNER_INSTANCE_ID" | gsutil cp -n - "$CLAIM" 2>/dev/null || true
-        CLAIM_OWNER="$(gsutil cat "$CLAIM" 2>/dev/null | head -n1 || true)"
-        if [ "$CLAIM_OWNER" != "$RUNNER_INSTANCE_ID" ]; then
-            echo "[runner] job $JOB_ID claimed by another runner ('$CLAIM_OWNER'); skipping." >&2
+        if gsutil -q stat "$RESULT" 2>/dev/null; then
+            echo "[runner] job $JOB_ID already has a result.json; skipping (terminal)." >&2
+            echo "$JOB_ID" >> "$PROCESSED_FILE"
             continue
+        fi
+
+        # security review r9/r10: ATOMIC cross-runner claim via the GCS GENERATION
+        # PRECONDITION (server-enforced create-if-absent) — NOT cp -n + read-back
+        # (which has a real two-writer race). Exactly one runner can create the
+        # marker; a concurrent create returns HTTP 412 (non-zero exit). A claim
+        # older than CLAIM_TTL means its owner is GONE (a job can never outlive the
+        # session budget), so it is reclaimed with a compare-and-swap on the
+        # current generation. Fail CLOSED: any unexpected failure → skip this pass
+        # (retried next poll; a live owner keeps us out). No double-execution; lets
+        # DIFFERENT VMs run DIFFERENT jobs in parallel.
+        CLAIM="$JOB_DIR/.claim"
+        CLAIM_BODY="$RUNNER_INSTANCE_ID $(date -u +%s)"
+        if printf '%s\n' "$CLAIM_BODY" | gsutil -h "x-goog-if-generation-match:0" cp - "$CLAIM" 2>/dev/null; then
+            : # won a fresh claim (atomic create)
+        else
+            CLAIM_TS="$(gsutil cat "$CLAIM" 2>/dev/null | awk 'NR==1{print $NF}')"
+            CLAIM_AGE=$(( $(date -u +%s) - ${CLAIM_TS:-0} ))
+            if [ -n "$CLAIM_TS" ] && [ "$CLAIM_AGE" -gt "$CLAIM_TTL" ]; then
+                CLAIM_GEN="$(gsutil stat "$CLAIM" 2>/dev/null | awk '/Generation:/{print $2}')"
+                if [ -n "$CLAIM_GEN" ] && printf '%s\n' "$CLAIM_BODY" \
+                     | gsutil -h "x-goog-if-generation-match:$CLAIM_GEN" cp - "$CLAIM" 2>/dev/null; then
+                    echo "[runner] reclaimed stale claim for $JOB_ID (age ${CLAIM_AGE}s > ${CLAIM_TTL}s; owner gone)." >&2
+                else
+                    echo "[runner] job $JOB_ID claim contended; skipping this pass." >&2
+                    continue
+                fi
+            else
+                echo "[runner] job $JOB_ID already claimed by a live runner; skipping." >&2
+                continue
+            fi
         fi
 
         echo "[runner] picking up $JOB_ID"
@@ -690,7 +711,7 @@ PYVERIFY
         # halted at the session budget (TERM, then KILL after 60s grace) rather
         # than hitting the Terra credential cliff. `timeout` exits 124 when it
         # has to stop the job — we surface that as a clear session-limit result.
-        # Codex r5: cap THIS job to what REMAINS of the session window (computed
+        # security review r5: cap THIS job to what REMAINS of the session window (computed
         # from the single runner-start deadline), not a fresh full budget. If too
         # little remains, refuse the job loudly rather than start a run that would
         # hit the credential cliff mid-execution.
@@ -698,7 +719,7 @@ PYVERIFY
         SESSION_REMAINING=$(( SESSION_DEADLINE - NOW ))
         if [ "$SESSION_REMAINING" -lt "$SESSION_MIN_JOB_SEC" ]; then
             echo "[runner] only ${SESSION_REMAINING}s remain in the Terra session window (< ${SESSION_MIN_JOB_SEC}s floor); REFUSING job $JOB_ID. Restart the runtime for a fresh session, or use the WDL/Cromwell path for long compute." >&2
-            # Codex r7: the STATUS write is the poller's terminal signal
+            # security review r7: the STATUS write is the poller's terminal signal
             # (terra_get_notebook_job_result keys terminal off status.txt /
             # result.json). It MUST land before we move the spec or mark the job
             # processed — otherwise a poller keeps seeing the earlier 'running'
@@ -734,7 +755,7 @@ PYVERIFY
         RC=$?
         set -e
         RUN_ENDED_AT=$(date +%s)
-        # Codex r6: CAUSAL session-limit detection, not a wall-clock heuristic.
+        # security review r6: CAUSAL session-limit detection, not a wall-clock heuristic.
         # RC 124 is coreutils' unambiguous "command timed out" status. For RC 137
         # (SIGKILL — which ALSO occurs on OOM or a manual kill) we ONLY count it
         # as a session limit when `timeout --verbose` actually logged that IT sent
@@ -747,7 +768,7 @@ PYVERIFY
         if [ "$RC" -eq 124 ]; then
             SESSION_LIMITED=1
         elif [ "$RC" -eq 137 ] && grep -q "^timeout: sending signal" "$WORK/$JOB_ID.stderr" 2>/dev/null; then
-            # Codex r7: gate the marker to RC 137 (the KILL-escalation exit) so an
+            # security review r7: gate the marker to RC 137 (the KILL-escalation exit) so an
             # ordinary papermill failure (RC 1, etc.) whose stderr happens to
             # contain that line is NOT relabelled as a session limit.
             SESSION_LIMITED=1

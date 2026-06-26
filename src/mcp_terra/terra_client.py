@@ -28,7 +28,7 @@ AGORA_BASE = "https://agora.dsde-prod.broadinstitute.org"
 
 # ── Transient-failure retry policy ──────────────────────────────────────────
 # Bounded retry with exponential backoff + jitter, honoring Retry-After — for
-# IDEMPOTENT methods only. dalmatian/nebelung do not retry the Terra API at all;
+# IDEMPOTENT methods only. common Terra Python clients do not retry the Terra API at all;
 # this makes the MCP more resilient to 429/5xx without ever auto-retrying a
 # non-idempotent POST (a Terra createSubmission is BILLABLE; a blind retry on a
 # transient error could double-submit, and Terra has no idempotency-key support).
@@ -152,7 +152,7 @@ def _request(service: str, method: str, base: str, path: str, token: str,
     # Total wall-clock is bounded: the first attempt's own timeout PLUS the retry
     # budget. Each attempt's timeout is then capped to whatever remains, so a
     # hung retry can never blow far past the budget — and the kill-switch is
-    # re-checked before every attempt and during every backoff. (Codex.)
+    # re-checked before every attempt and during every backoff. (security review.)
     _deadline = _start + float(timeout) + _RETRY_TOTAL_BUDGET_SEC
     resp = None
     with httpx.Client(trust_env=False, follow_redirects=False) as client:
@@ -459,7 +459,7 @@ def rawls_create_method_config(token: str, namespace: str, name: str, *,
 
 
 # ── Read-only workspace data + submission/workflow inspection ───────────────
-# These mirror the read surface of broadinstitute/fiss-mcp so this MCP is a
+# These provide a comprehensive read surface (data tables, submissions,
 # strict superset of its reads. Every function here is GET-only — no write,
 # no spend, no destruction.
 
