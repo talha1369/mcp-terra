@@ -169,7 +169,13 @@ def _slack_upload_one(client: httpx.Client, headers: dict, channel_id: str,
                      headers=headers, json=payload)
     j3 = _slack_json(r3)
     if not j3.get("ok"):
-        raise NotifyError(f"completeUploadExternal -> {channel_id}: {j3.get('error', 'unknown')}")
+        err = j3.get("error", "unknown")
+        hint = ""
+        if channel_id[:1] == "D" and err == "channel_not_found":
+            hint = (" — for a DM, set MCP_TERRA_SLACK_CHANNEL to your USER id "
+                    "(U…, via 'Copy member ID') NOT a DM-channel id (D…); the "
+                    "bot opens the DM itself (needs the im:write scope).")
+        raise NotifyError(f"completeUploadExternal -> {channel_id}: {err}{hint}")
     return file_id
 
 
