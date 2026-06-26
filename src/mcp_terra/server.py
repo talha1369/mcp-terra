@@ -248,7 +248,29 @@ def terra_get_workspace(namespace: str, name: str) -> str:
         raise PermissionError(str(e))
     _pre("terra_get_workspace", READ, f"{namespace}/{name}")
     token = auth.get_access_token()
-    return _ok(tc.rawls_get_workspace(token, namespace, name))
+    ws = tc.rawls_get_workspace(token, namespace, name)
+    # Codex round-5: workspace.attributes is an operator free-form bag that can
+    # encode identifiers (sample descriptions, consent/DUO codes). In guard mode
+    # withhold it; keep the system-generated operational identifiers (bucket,
+    # project, access level) that downstream tools need.
+    if policy.controlled_access_enabled() and isinstance(ws, dict):
+        w = ws.get("workspace") or {}
+        ws = {
+            "workspace": {
+                "namespace": w.get("namespace"),
+                "name": w.get("name"),
+                "bucketName": w.get("bucketName"),
+                "googleProject": w.get("googleProject"),
+                "attributes": "[withheld: controlled-access]",
+            },
+            "accessLevel": ws.get("accessLevel"),
+            "_controlled_access_withheld": (
+                "workspace.attributes (operator free-form, may encode "
+                "identifiers) withheld (MCP_TERRA_CONTROLLED_ACCESS); core "
+                "operational identifiers kept. Disable the guard for a "
+                "non-controlled workspace."),
+        }
+    return _ok(ws)
 
 
 # ── Runtime inspection (no spend, no write) ─────────────────────────────────
@@ -649,6 +671,11 @@ def terra_create_runtime(
             # Auto-install Claude Code on the VM for on-VM live coding (the
             # start script does this best-effort, backgrounded; auth per-user).
             "MCP_TERRA_INSTALL_CLAUDE": "1" if install_claude_code else "0",
+            # Codex r5: propagate the operator's session-budget policy so the
+            # on-VM runner ENFORCES the same ~24h window the MCP advertises
+            # (otherwise the runner silently used its built-in default).
+            "MCP_TERRA_MAX_RUN_HOURS": str(policy.max_run_hours()),
+            "MCP_TERRA_SESSION_MARGIN_SEC": str(policy.session_margin_sec()),
         }
 
     token = auth.get_access_token()
@@ -930,6 +957,16 @@ def terra_download_from_bucket(bucket_uri: str, local_path: str,
     if version_method not in ("timestamp", "bak"):
         raise ValueError("version_method must be 'timestamp' or 'bak'")
     safety.safe_bucket_uri(bucket_uri)
+    # Codex round-5: downloading pulls the actual object BYTES out of Terra onto
+    # the local (possibly non-NIST-800-171) host — the largest egress of all. In
+    # guard mode refuse unless the bucket is an EXACT-name public/allowlisted one
+    # (same rule as terra_read_bucket_object). GDS/DUC: controlled data stays in
+    # the compliant environment.
+    _dl_bucket = bucket_uri[len("gs://"):].split("/", 1)[0]
+    try:
+        policy.assert_data_egress_allowed(_dl_bucket, "download to local disk")
+    except policy.PolicyError as e:
+        raise PermissionError(str(e)) from e
     from pathlib import Path
     target = Path(local_path).expanduser()
     target = (Path.cwd() / target if not target.is_absolute() else target).resolve(strict=False)
@@ -2156,7 +2193,19 @@ def terra_list_method_configs(namespace: str, name: str) -> str:
     _assert_workspace_allowed(namespace, name)
     _pre("terra_list_method_configs", READ, f"{namespace}/{name}")
     token = auth.get_access_token()
-    return _ok(tc.rawls_list_method_configs(token, namespace, name))
+    mcs = tc.rawls_list_method_configs(token, namespace, name)
+    # Codex round-5: config names + method refs are operator-controlled strings
+    # that could encode identifiers — in guard mode return the COUNT only.
+    if policy.controlled_access_enabled():
+        mcs = {
+            "method_config_count": (len(mcs) if isinstance(mcs, list) else None),
+            "_controlled_access_withheld": (
+                "method-config names + method refs withheld "
+                "(MCP_TERRA_CONTROLLED_ACCESS) — operator-controlled strings "
+                "that could encode identifiers; count only. Disable the guard "
+                "for a non-controlled workspace."),
+        }
+    return _ok(mcs)
 
 
 @server.tool(title="Submit a WDL workflow (SPEND)", annotations=ANN_SPEND_NEW)
@@ -2455,7 +2504,8 @@ def terra_get_workflow_logs(namespace: str, name: str,
     _MAX_TASKS = 50                      # aggregate fan-out cap (Codex)
     _TOTAL_BYTE_BUDGET = 1024 * 1024     # 1 MiB total across all task stderr reads
     tasks: list[dict] = []
-    truncated = False
+    truncated = False          # task-count / aggregate-byte-budget limit (BREAKS iteration)
+    content_truncated = False  # a single stderr was truncated (does NOT break — Codex r5)
     bytes_used = 0
     for call_name, shards in calls.items():
         if truncated:
@@ -2503,12 +2553,15 @@ def terra_get_workflow_logs(namespace: str, name: str,
                         # returned with truncated=false (hiding the real error).
                         entry["stderr_truncated"] = bool(_r.get("truncated"))
                         if entry["stderr_truncated"]:
-                            truncated = True
+                            # a long single stderr must NOT stop us from reporting
+                            # the OTHER failed tasks — only count/byte limits break
+                            content_truncated = True
                     except (safety.SafetyError, bk.BucketError) as e:
                         entry["stderr_tail"] = f"[could not read stderr: {type(e).__name__}]"
             tasks.append(entry)
     out: dict = {"workflow_id": workflow_id, "status": (md or {}).get("status"),
-                 "task_count": len(tasks), "truncated": truncated, "tasks": tasks}
+                 "task_count": len(tasks), "truncated": truncated,
+                 "content_truncated": content_truncated, "tasks": tasks}
     if controlled:
         out["_controlled_access_withheld"] = (
             "task stderr content AND paths withheld (MCP_TERRA_CONTROLLED_ACCESS) "
@@ -2545,23 +2598,28 @@ def terra_get_method_config(namespace: str, name: str,
     # which is enough to select/verify a config. (config_namespace/config_name
     # are echoes of the caller's OWN arguments — no new disclosure.)
     if policy.controlled_access_enabled() and isinstance(mc, dict):
+        # Codex round-5: method NAMESPACE/NAME and rootEntityType are ALSO
+        # operator-controlled free text that could encode an identifier — so in
+        # guard mode keep ONLY non-identifying fields: the caller's own config
+        # namespace/name (already known to them), the integer method version,
+        # and param COUNTS. Everything operator-typed is withheld.
         mrm = mc.get("methodRepoMethod") or {}
+        _mver = mrm.get("methodVersion") if isinstance(mrm, dict) else None
         mc = {
-            "namespace": config_namespace,
-            "name": config_name,
-            "methodRepoMethod": ({
-                "methodNamespace": mrm.get("methodNamespace"),
-                "methodName": mrm.get("methodName"),
-                "methodVersion": mrm.get("methodVersion"),
-            } if isinstance(mrm, dict) else None),
-            "rootEntityType": mc.get("rootEntityType"),
+            "namespace": config_namespace,   # caller's own argument (no new disclosure)
+            "name": config_name,             # caller's own argument
+            "methodVersion": (_mver if isinstance(_mver, int)
+                              and not isinstance(_mver, bool) else None),
+            "method_ref": "[withheld: controlled-access]",
+            "rootEntityType": "[withheld: controlled-access]",
             "input_count": len(mc.get("inputs") or {}),
             "output_count": len(mc.get("outputs") or {}),
             "_controlled_access_withheld": (
-                "input/output VALUES AND key names withheld "
-                "(MCP_TERRA_CONTROLLED_ACCESS) — counts only; key names are "
-                "operator-controlled free text that could encode identifiers. "
-                "Disable the guard for a non-controlled workspace to see them."),
+                "method namespace/name, root entity type, and input/output "
+                "values AND key names withheld (MCP_TERRA_CONTROLLED_ACCESS) — "
+                "counts + integer version only; these strings are "
+                "operator-controlled and could encode identifiers. Disable the "
+                "guard for a non-controlled workspace to see them."),
         }
     return _ok(mc)
 
@@ -2608,7 +2666,21 @@ def terra_get_bucket_object_metadata(bucket_uri: str) -> str:
     """
     safety.safe_bucket_uri(bucket_uri)
     _pre("terra_get_bucket_object_metadata", READ, bucket_uri)
-    return _ok({"uri": bucket_uri, "stat": bk.stat_object(bucket_uri)})
+    stat_text = bk.stat_object(bucket_uri)
+    # Codex round-5: `gsutil stat` includes a custom-Metadata block that can
+    # carry operator-set identifiers. In guard mode keep ONLY the non-identifying
+    # integrity fields (size / hash / type / times / class) and drop the rest.
+    if policy.controlled_access_enabled() and isinstance(stat_text, str):
+        _safe = ("Content-Length", "Content-Type", "Storage class",
+                 "Hash (crc32c)", "Hash (md5)", "Creation time", "Update time",
+                 "Generation")
+        kept = [ln for ln in stat_text.splitlines() if any(p in ln for p in _safe)]
+        stat_text = "\n".join(kept) + "\n[custom metadata withheld: controlled-access]"
+        return _ok({"uri": bucket_uri, "stat": stat_text,
+                    "_controlled_access_withheld": (
+                        "custom object metadata withheld "
+                        "(MCP_TERRA_CONTROLLED_ACCESS); size/hash/type kept.")})
+    return _ok({"uri": bucket_uri, "stat": stat_text})
 
 
 @server.tool(title="Get Google Batch job status", annotations=ANN_READ_REMOTE)

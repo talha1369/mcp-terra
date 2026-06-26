@@ -420,13 +420,20 @@ SESSION_MARGIN_SEC="${MCP_TERRA_SESSION_MARGIN_SEC:-1800}"   # 30-min headroom
 case "$SESSION_MARGIN_SEC" in ''|*[!0-9]*) SESSION_MARGIN_SEC=1800 ;; esac
 SESSION_BUDGET_SEC=$(( MAX_RUN_HOURS * 3600 - SESSION_MARGIN_SEC ))
 [ "$SESSION_BUDGET_SEC" -lt 300 ] && SESSION_BUDGET_SEC=300   # floor 5 min
+# Codex r5: the credential window is per-SESSION, not per-job. Anchor a single
+# deadline at runner START (≈ when this VM/session booted and credentials were
+# issued), so a job submitted after a long prior job / idle is capped to what
+# REMAINS of the window — not given a fresh full budget each time.
+RUNNER_START_EPOCH=$(date +%s)
+SESSION_DEADLINE=$(( RUNNER_START_EPOCH + SESSION_BUDGET_SEC ))
+SESSION_MIN_JOB_SEC=300   # refuse a new job if less than this remains
 # `timeout` (coreutils) must exist to enforce the wall-clock budget — fail loud
 # rather than silently run unbounded.
 command -v timeout >/dev/null 2>&1 || {
     echo "[runner] coreutils 'timeout' not found; cannot enforce the session budget. Aborting." >&2
     exit 5;
 }
-echo "[runner] per-run wall-clock budget: ${SESSION_BUDGET_SEC}s (Terra ~${MAX_RUN_HOURS}h session window minus ${SESSION_MARGIN_SEC}s margin)"
+echo "[runner] session wall-clock budget: ${SESSION_BUDGET_SEC}s total from runner start (Terra ~${MAX_RUN_HOURS}h window minus ${SESSION_MARGIN_SEC}s margin); deadline epoch ${SESSION_DEADLINE}"
 
 # Install pinned deps ONCE at startup (not in the polling loop)
 pip install --no-input \
@@ -643,11 +650,26 @@ PYVERIFY
         # halted at the session budget (TERM, then KILL after 60s grace) rather
         # than hitting the Terra credential cliff. `timeout` exits 124 when it
         # has to stop the job — we surface that as a clear session-limit result.
+        # Codex r5: cap THIS job to what REMAINS of the session window (computed
+        # from the single runner-start deadline), not a fresh full budget. If too
+        # little remains, refuse the job loudly rather than start a run that would
+        # hit the credential cliff mid-execution.
+        NOW=$(date +%s)
+        SESSION_REMAINING=$(( SESSION_DEADLINE - NOW ))
+        if [ "$SESSION_REMAINING" -lt "$SESSION_MIN_JOB_SEC" ]; then
+            echo "[runner] only ${SESSION_REMAINING}s remain in the Terra session window (< ${SESSION_MIN_JOB_SEC}s floor); REFUSING job $JOB_ID. Restart the runtime for a fresh session, or use the WDL/Cromwell path for long compute." >&2
+            echo "REFUSED-SESSION-WINDOW" | gsutil cp - "$STATUS" 2>/dev/null || true
+            gsutil mv -n "$SPEC" "$SPEC.refused-session-window" 2>/dev/null || true
+            echo "$JOB_ID" >> "$PROCESSED_FILE"
+            continue
+        fi
+        JOB_BUDGET=$SESSION_REMAINING
+        [ "$JOB_BUDGET" -gt "$SESSION_BUDGET_SEC" ] && JOB_BUDGET=$SESSION_BUDGET_SEC
         PER_CELL_SEC=$(( TIMEOUT_MIN * 60 ))
-        [ "$PER_CELL_SEC" -gt "$SESSION_BUDGET_SEC" ] && PER_CELL_SEC=$SESSION_BUDGET_SEC
+        [ "$PER_CELL_SEC" -gt "$JOB_BUDGET" ] && PER_CELL_SEC=$JOB_BUDGET
         RUN_STARTED_AT=$(date +%s)
         set +e
-        timeout --signal=TERM --kill-after=60 "${SESSION_BUDGET_SEC}s" \
+        timeout --signal=TERM --kill-after=60 "${JOB_BUDGET}s" \
             env -u MCP_TERRA_RUNNER_SECRET \
             -u MCP_TERRA_ALLOW_WRITES \
             -u MCP_TERRA_WORKSPACE \
@@ -663,12 +685,21 @@ PYVERIFY
         RC=$?
         set -e
         RUN_ENDED_AT=$(date +%s)
-        # coreutils `timeout` returns 124 on TERM-timeout (or 137 if the KILL
-        # grace was needed). Either means we stopped the run at the budget.
+        ELAPSED=$(( RUN_ENDED_AT - RUN_STARTED_AT ))
+        # Codex r5: distinguish a session-budget halt from an OOM/external kill.
+        # coreutils `timeout` exits 124 on a clean TERM-timeout, or 137 if it had
+        # to escalate to SIGKILL ~60s LATER — so a timeout-137 has ELAPSED >= the
+        # budget. RC 137 with ELAPSED well under budget is an OOM/manual SIGKILL,
+        # NOT a session limit — labelling it FAILED-SESSION-LIMIT would be a fake
+        # status and send the user to the wrong fix.
         SESSION_LIMITED=0
-        if [ "$RC" -eq 124 ] || [ "$RC" -eq 137 ]; then
+        if [ "$RC" -eq 124 ]; then
             SESSION_LIMITED=1
-            echo "[runner] job $JOB_ID exceeded the ${SESSION_BUDGET_SEC}s session wall-clock budget; halted before the Terra session/credential window. Use the WDL/Cromwell path for runs this long." >&2
+        elif [ "$RC" -eq 137 ] && [ "$ELAPSED" -ge "$JOB_BUDGET" ]; then
+            SESSION_LIMITED=1
+        fi
+        if [ "$SESSION_LIMITED" -eq 1 ]; then
+            echo "[runner] job $JOB_ID halted at the ${JOB_BUDGET}s wall-clock budget (Terra session window). Use the WDL/Cromwell path for runs this long." >&2
         fi
 
         # Synthesize result.json via env-passing python (no shell→python source).
@@ -680,7 +711,7 @@ PYVERIFY
         RESULT_LOCAL_VAR="$RESULT_LOCAL" \
         RUN_STARTED_AT_VAR="$RUN_STARTED_AT" \
         RUN_ENDED_AT_VAR="$RUN_ENDED_AT" \
-        SESSION_BUDGET_SEC_VAR="$SESSION_BUDGET_SEC" \
+        SESSION_BUDGET_SEC_VAR="$JOB_BUDGET" \
         SESSION_LIMITED_VAR="$SESSION_LIMITED" \
         MCP_TERRA_RUNNER_SECRET="$MCP_TERRA_RUNNER_SECRET" \
         python3 - <<'PYRESULT'

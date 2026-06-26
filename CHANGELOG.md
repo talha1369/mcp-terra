@@ -331,6 +331,30 @@ tests exercise the templates in isolation, so these were latent):
   `session_limit_note`. `terra_submit_notebook_job` advises the limit and points
   long jobs to the WDL/Cromwell path (Batch tasks auto-refresh credentials).
   Guarded by CC-SessionLimit.
+- **Adversarial-review hardening (Codex) — round 5** (re-review of round-4b +
+  the 24h guard): closed 6 more findings.
+  - `terra_get_method_config` controlled-mode projection now returns **counts +
+    integer version only** — method namespace/name and rootEntityType are also
+    operator-controlled strings that could encode identifiers.
+  - **Four payload tools moved into the guarded set** with controlled-mode
+    projections (each covered by a sentinel-identifier test): `terra_get_workspace`
+    (withhold `attributes`), `terra_list_method_configs` (count only),
+    `terra_get_bucket_object_metadata` (withhold custom metadata), and
+    `terra_download_from_bucket` (**refuse** non-public buckets — downloading
+    controlled bytes to local disk is the largest egress).
+  - **Session-window guard is now per-SESSION, not per-job**: the runner anchors
+    ONE deadline at start, caps each job to the remaining window, and **refuses**
+    a new job when too little remains (`REFUSED-SESSION-WINDOW`) — a job after a
+    long prior job can no longer run past the credential cliff.
+  - The session budget + margin are now **propagated to the auto-started VM
+    runner** via `customEnvironmentVariables` (previously advertised but not
+    enforced).
+  - **RC 137 (OOM SIGKILL) is no longer mislabelled** `FAILED-SESSION-LIMIT` —
+    only RC 124, or RC 137 with elapsed ≥ budget, counts as a session limit;
+    otherwise it stays a normal `FAILED` (correct OOM remediation).
+  - `terra_get_workflow_logs` splits per-object `content_truncated` from the
+    break-driving `truncated`, so one long stderr no longer drops later failed
+    tasks from diagnostics.
 - **No delete primitive, by design** — no tool (and no `leo_delete_runtime`
   at any layer) deletes a runtime or persistent disk; teardown is the user's
   action in the Terra UI ("Keep persistent disk"). The MCP detects a

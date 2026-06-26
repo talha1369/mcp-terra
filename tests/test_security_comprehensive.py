@@ -3474,6 +3474,11 @@ _DATA_TOOLS_REQUIRING_GUARD = {
     "terra_get_workflow_metadata", "terra_get_workflow_logs", "terra_get_run_log",
     "terra_get_notebook_job_result", "terra_get_batch_job_status",
     "terra_render_audio_summary",
+    # Codex r5: these return UNPROJECTED Rawls/gsutil payloads that can carry
+    # operator-controlled identifiers (workspace attributes, config names/refs,
+    # custom object metadata) or pull the bytes to local disk → guarded + tested.
+    "terra_get_workspace", "terra_list_method_configs",
+    "terra_get_bucket_object_metadata", "terra_download_from_bucket",
 }
 _NO_DATA_TOOLS = {
     # writes / control (no workspace-data return)
@@ -3487,14 +3492,12 @@ _NO_DATA_TOOLS = {
     # identity / posture / runtime-config (not workspace data)
     "terra_whoami", "terra_health", "terra_killswitch_status",
     "terra_get_runtime", "terra_list_runtimes", "terra_recommend_runtime_for_notebook",
-    # metadata / schema / status / cost / listings (no raw data rows/objects)
-    "terra_get_workspace", "terra_list_workspaces", "terra_list_method_configs",
-    "terra_list_data_tables", "terra_list_submissions", "terra_get_workflow_cost",
-    "terra_get_bucket_object_metadata",
-    # downloads to LOCAL disk (content never returned to the LLM; the host's
-    # compliance — not the LLM-egress guard — governs local copies) + external
-    # doc fetch (ingest, not egress)
-    "terra_download_from_bucket", "terra_fetch_url",
+    # metadata / status / cost / listings of the user's OWN scope (no raw rows/
+    # objects, no operator free-form payloads)
+    "terra_list_workspaces", "terra_list_data_tables", "terra_list_submissions",
+    "terra_get_workflow_cost",
+    # external doc fetch (ingest from an allowlisted host, not Terra egress)
+    "terra_fetch_url",
 }
 
 
@@ -3575,11 +3578,13 @@ def _():
     try:
         _p._CONTROLLED_ACCESS = True
         out = server.terra_get_method_config("ns", "ws", "cns", "cn")
-        # neither VALUES nor KEY NAMES leak; only counts + method ref + entity type
+        # neither VALUES nor KEY NAMES nor operator strings leak — counts +
+        # integer version only (method namespace/name + rootEntityType withheld)
         assert "secret.vcf" not in out and "controlled-out" not in out
         assert "wf.x" not in out and "wf.y" not in out
+        assert "sample" not in out, "rootEntityType (operator string) must be withheld"
         assert '"input_count": 1' in out and '"output_count": 1' in out
-        assert '"rootEntityType": "sample"' in out and '"methodVersion": 3' in out
+        assert '"methodVersion": 3' in out
     finally:
         _p._CONTROLLED_ACCESS, _tc.rawls_get_method_config, server.auth.get_access_token = saved, om, ot
 
@@ -3626,6 +3631,85 @@ def _():
         _bk2.read_object, safety.safe_bucket_uri = oread, osafe
 
 
+@case("CC-ControlledAccess3", "get_workspace withholds operator attributes (sentinel) in controlled mode")
+def _():
+    from mcp_terra import policy as _p
+    saved, ow, ot = _p._CONTROLLED_ACCESS, _tc.rawls_get_workspace, server.auth.get_access_token
+    SENTINEL = "consent-NA12878-secret-attr"
+    _tc.rawls_get_workspace = lambda *a, **k: {
+        "workspace": {"namespace": "ns", "name": "ws", "bucketName": "fc-secure-x",
+                      "googleProject": "terra-abc",
+                      "attributes": {"description": SENTINEL, "duo": SENTINEL}},
+        "accessLevel": "OWNER"}
+    server.auth.get_access_token = lambda: "tok"
+    try:
+        _p._CONTROLLED_ACCESS = True
+        out = server.terra_get_workspace("ns", "ws")
+        assert SENTINEL not in out, "workspace.attributes leaked a sentinel identifier!"
+        assert "fc-secure-x" in out and "OWNER" in out  # operational fields kept
+    finally:
+        _p._CONTROLLED_ACCESS, _tc.rawls_get_workspace, server.auth.get_access_token = saved, ow, ot
+
+
+@case("CC-ControlledAccess3", "list_method_configs returns count-only (sentinel) in controlled mode")
+def _():
+    from mcp_terra import policy as _p
+    saved, ol, ot = _p._CONTROLLED_ACCESS, _tc.rawls_list_method_configs, server.auth.get_access_token
+    SENTINEL = "config-NA12878-secret"
+    _tc.rawls_list_method_configs = lambda *a, **k: [
+        {"namespace": "n", "name": SENTINEL, "methodRepoMethod": {"methodName": SENTINEL}},
+        {"namespace": "n", "name": "other"}]
+    server.auth.get_access_token = lambda: "tok"
+    try:
+        _p._CONTROLLED_ACCESS = True
+        out = server.terra_list_method_configs("ns", "ws")
+        assert SENTINEL not in out, "method-config name leaked a sentinel identifier!"
+        assert '"method_config_count": 2' in out
+    finally:
+        _p._CONTROLLED_ACCESS, _tc.rawls_list_method_configs, server.auth.get_access_token = saved, ol, ot
+
+
+@case("CC-ControlledAccess3", "bucket_object_metadata withholds custom metadata (sentinel) in controlled mode")
+def _():
+    from mcp_terra import policy as _p, bucket as _bk2
+    saved, ostat = _p._CONTROLLED_ACCESS, _bk2.stat_object
+    osafe = safety.safe_bucket_uri
+    SENTINEL = "x-goog-meta-subject-NA12878-secret"
+    _bk2.stat_object = lambda uri: (
+        "gs://fc-secure-x/o:\n"
+        "    Content-Length:   12345\n"
+        "    Content-Type:     application/octet-stream\n"
+        "    Hash (md5):       abc==\n"
+        "    Metadata:\n"
+        f"        {SENTINEL}:  value\n")
+    safety.safe_bucket_uri = lambda u: u
+    try:
+        _p._CONTROLLED_ACCESS = True
+        out = server.terra_get_bucket_object_metadata("gs://fc-secure-x/o")
+        assert SENTINEL not in out, "custom object metadata leaked a sentinel!"
+        assert "12345" in out and "Content-Type" in out  # safe integrity fields kept
+    finally:
+        _p._CONTROLLED_ACCESS, _bk2.stat_object = saved, ostat
+        safety.safe_bucket_uri = osafe
+
+
+@case("CC-ControlledAccess3", "download_from_bucket REFUSES a controlled bucket (data→local disk)")
+def _():
+    from mcp_terra import policy as _p
+    saved = _p._CONTROLLED_ACCESS
+    osafe = safety.safe_bucket_uri
+    safety.safe_bucket_uri = lambda u: u
+    try:
+        _p._CONTROLLED_ACCESS = True
+        # a non-public, non-allowlisted (controlled) bucket must be refused before
+        # any bytes are pulled to local disk
+        must_raise(lambda: server.terra_download_from_bucket(
+            "gs://fc-secure-controlled/x.bam", "/tmp/x.bam"), PermissionError)
+    finally:
+        _p._CONTROLLED_ACCESS = saved
+        safety.safe_bucket_uri = osafe
+
+
 @case("CC-ControlledAccess3", "workflow_logs flags per-task stderr truncation (no false truncated=false)")
 def _():
     from mcp_terra import policy as _p, bucket as _bk2
@@ -3644,7 +3728,10 @@ def _():
         _p._CONTROLLED_ACCESS = False
         out = server.terra_get_workflow_logs("ns", "ws", "sub", "wf")
         assert '"stderr_truncated": true' in out, "per-task truncation must be reported"
-        assert '"truncated": true' in out, "top-level truncated must reflect a partial stderr"
+        assert '"content_truncated": true' in out, "content_truncated must surface"
+        # Codex r5: a single long stderr must NOT flip the break-driving top-level
+        # 'truncated' flag (that would drop OTHER failed tasks from diagnostics).
+        assert '"truncated": false' in out, "per-object truncation must not set the early-break flag"
     finally:
         _p._CONTROLLED_ACCESS = saved
         _tc.rawls_get_workspace, _tc.rawls_get_workflow_metadata, server.auth.get_access_token = ows, omd, ot
@@ -3754,18 +3841,25 @@ def _():
             _os.environ["MCP_TERRA_MAX_RUN_HOURS"] = saved
 
 
-@case("CC-SessionLimit", "runner enforces a TOTAL wall-clock budget (timeout wrapper)")
+@case("CC-SessionLimit", "runner anchors a SESSION deadline (not per-job) + disambiguates RC137")
 def _():
     from mcp_terra import notebook_runner as nbr
     s = nbr.runner_script_template()
     # Total budget computed from the session window (hours), minus a margin.
     assert "MCP_TERRA_MAX_RUN_HOURS" in s and "SESSION_BUDGET_SEC" in s
     assert "SESSION_MARGIN_SEC" in s
-    # The WHOLE papermill run is wrapped in coreutils `timeout` (TERM→KILL).
-    assert "timeout --signal=TERM --kill-after=60" in s
+    # Codex r5: a SINGLE deadline anchored at runner start; per-job budget is the
+    # REMAINING time, and a near-exhausted window REFUSES new jobs.
+    assert "RUNNER_START_EPOCH" in s and "SESSION_DEADLINE" in s
+    assert "SESSION_REMAINING" in s and "JOB_BUDGET" in s
+    assert "REFUSED-SESSION-WINDOW" in s and "SESSION_MIN_JOB_SEC" in s
+    # The WHOLE papermill run is wrapped in coreutils `timeout` (TERM→KILL) at
+    # the per-job remaining budget.
+    assert 'timeout --signal=TERM --kill-after=60 "${JOB_BUDGET}s"' in s
     assert "command -v timeout" in s, "must fail loud if timeout(1) is missing"
-    # Per-cell timeout can never exceed the total budget.
-    assert "PER_CELL_SEC" in s and "PER_CELL_SEC=$SESSION_BUDGET_SEC" in s
+    assert "PER_CELL_SEC=$JOB_BUDGET" in s, "per-cell timeout capped to remaining budget"
+    # Codex r5: RC 124 -> session limit; RC 137 only if ELAPSED >= budget (else OOM)
+    assert '"$RC" -eq 124' in s and '"$RC" -eq 137' in s and "ELAPSED" in s
     # A halted run is attributable + fail-loud, never silently truncated.
     assert "FAILED-SESSION-LIMIT" in s and "session_limit_note" in s
     assert "elapsed_sec" in s

@@ -111,6 +111,18 @@ def max_run_hours() -> int:
     return max(1, min(h, 24))
 
 
+def session_margin_sec() -> int:
+    """Safety headroom (seconds) subtracted from the session window before the
+    runner halts a run — so it stops BEFORE the credential cliff, not at it. The
+    on-VM runner reads the same env (MCP_TERRA_SESSION_MARGIN_SEC) independently;
+    this is the submit-side mirror for propagation into the VM. Clamp 60..3600."""
+    try:
+        m = int(os.environ.get("MCP_TERRA_SESSION_MARGIN_SEC", "1800") or "1800")
+    except (TypeError, ValueError):
+        m = 1800
+    return max(60, min(m, 3600))
+
+
 def is_egress_allowed_bucket(bucket: str) -> bool:
     """True if `bucket` may have its DATA returned to the LLM even under the
     controlled-access guard — an EXACT-name match against a known PUBLIC
