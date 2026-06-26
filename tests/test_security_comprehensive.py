@@ -1333,6 +1333,11 @@ def _():
     assert '. "$CFG"' not in sh, "launcher still sources config.env (shell-exec risk)"
     assert "is a symlink — refusing" in sh and "must be mode 0600" in sh
     assert "ignoring unrecognized config key" in sh, "no allowlist parse"
+    # the rolling-budget keys must be allowlisted, else a user's config.env monthly
+    # cap is silently dropped ("ignoring unrecognized config key") — a spend control
+    # must never fail open
+    assert "MCP_TERRA_BUDGET_USD" in sh and "MCP_TERRA_BUDGET_WINDOW_DAYS" in sh, \
+        "launcher drops the rolling-budget keys"
 
 @case("CC-Hardening", "start_runner_on_vm binds the heartbeat to the requested runtime")
 def _():
