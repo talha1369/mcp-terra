@@ -585,6 +585,28 @@ stop_refresher() {
 # this sentinel between launches / while draining and halts the whole VM.
 RUNNER_ABORT="$WORK/.runner_abort"
 
+# security review: AUTHORITATIVE, synchronous proof that we STILL hold the claim
+# for $CLAIM, checked at the moment of a terminal write. The LOST_CLAIM sentinel
+# is written ASYNCHRONOUSLY by the refresher and can lag (a paused/resumed or
+# partitioned runner may not have run its refresher yet) — so a stale runner
+# could pass the file checks, win the result.json cp -n race, and write terminal
+# state it no longer owns. This stats the live claim and requires owner ==
+# RUNNER_INSTANCE_ID. Retries a few times so a transient stat error doesn't drop
+# a legitimately-owned result; fails CLOSED (return 1) if ownership can't be
+# proven. Uses $CLAIM / $RUNNER_INSTANCE_ID resolved at call time.
+own_claim_check() {
+    local _o _try
+    for _try in 1 2 3; do
+        _o="$(gsutil stat "$CLAIM" 2>/dev/null | awk -F'[[:space:]]+' '/claim-owner:/{print $NF; exit}')"
+        if [ -n "$_o" ]; then
+            [ "$_o" = "$RUNNER_INSTANCE_ID" ] && return 0
+            return 1
+        fi
+        sleep 2
+    done
+    return 1
+}
+
 # Terminate in-flight work before a runner-wide halt. The expensive work is a
 # setsid'd timeout->papermill->kernel process GROUP (whose PGID each job records
 # in $WORK/<job>.pgid), NOT the wrapper subshell — so killing only the subshell
@@ -1324,12 +1346,13 @@ with open(out_path, "w") as f:
 PYRESULT
 
         # security review: FINAL lease check immediately before the durable
-        # terminal write — result synthesis above takes time, and LOST_CLAIM /
-        # RUNNER_ABORT could have landed in that gap. If we no longer hold the
-        # claim, do NOT write result.json / status / move the spec — the claim
-        # holder owns the terminal state (result.json no-clobber is the backstop).
-        if [ -f "$LOST_CLAIM" ] || [ -f "$RUNNER_ABORT" ]; then
-            echo "[runner] $JOB_ID: lease lost just before terminal write — leaving it to the claim holder." >&2
+        # terminal write. Two layers: (1) the async LOST_CLAIM / RUNNER_ABORT
+        # sentinels, and (2) an AUTHORITATIVE synchronous claim-ownership stat —
+        # because the sentinel can lag a paused/partitioned runner whose refresher
+        # hasn't run. If we no longer hold the claim, write NOTHING and move
+        # NOTHING (result.json no-clobber is the final backstop).
+        if [ -f "$LOST_CLAIM" ] || [ -f "$RUNNER_ABORT" ] || ! own_claim_check; then
+            echo "[runner] $JOB_ID: claim not authoritatively held just before terminal write — leaving it to the claim holder." >&2
             continue
         fi
         # Write the DURABLE terminal markers FIRST (the MCP and other runners key
@@ -1373,6 +1396,15 @@ PYRESULT
             echo "[runner] NOTE: the lease for $JOB_ID was lost mid-run; result.json no-clobber guarantees a single valid result (no corruption)." >&2
         fi
 
+        # security review: re-prove claim ownership before MOVING the spec. If we
+        # lost the claim during the result/artifact writes, the claim holder owns
+        # the job — do NOT hide its spec by renaming it to .consumed (that would
+        # strand the holder's pickup); leave it and let the holder finish.
+        if ! own_claim_check; then
+            echo "[runner] $JOB_ID: claim not held before spec move — leaving the spec for the claim holder." >&2
+            stop_refresher
+            continue
+        fi
         # Mark spec consumed via no-clobber rename. If .consumed already
         # exists, append a timestamp suffix so previous run's data survives.
         if ! gsutil mv -n "$SPEC" "$SPEC.consumed" 2>/dev/null; then

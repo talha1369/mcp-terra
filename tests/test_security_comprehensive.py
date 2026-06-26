@@ -1423,6 +1423,24 @@ def _():
     s = nbr.runner_script_template()
     assert '"$WORK"/*.pgid' in s and 'kill -KILL -- "-$_pg"' in s
 
+@case("CC-Hardening", "versioned-script upload is read-back-verified on EVERY path (cp -n race)")
+def _():
+    import inspect
+    src = inspect.getsource(server)
+    # verify happens AFTER the upload branch too, not only when the object pre-exists
+    assert "if not safety.bucket_object_exists(dest):" in src
+    assert "read back" in src and "raced script" in src, "no unconditional read-back verify"
+
+@case("CC-Hardening", "terminal write requires authoritative claim ownership (not just the sentinel)")
+def _():
+    from mcp_terra import notebook_runner as nbr
+    s = nbr.runner_script_template()
+    assert "own_claim_check()" in s, "no synchronous ownership check helper"
+    assert "claim-owner:" in s
+    # gated before the terminal write AND again before the spec move
+    assert "|| ! own_claim_check; then" in s, "ownership not required before terminal write"
+    assert s.count("! own_claim_check") >= 2, "ownership not re-checked before the spec move"
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # U-Robustness: state-of-the-art MCP design — annotations, schema versioning,

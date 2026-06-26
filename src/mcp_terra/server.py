@@ -693,19 +693,7 @@ def terra_create_runtime(
             # corruption AND a co-member pre-staging a tampered script).
             digest = _hashlib.sha256(body_text.encode("utf-8")).hexdigest()
             dest = f"{bucket_clean}/{nbr.JOBS_PREFIX}/{stem}.{digest}.sh"
-            if safety.bucket_object_exists(dest):
-                try:
-                    existing = bk._run_gsutil(["cat", dest], timeout=30.0)
-                except bk.BucketError as e:
-                    raise safety.SafetyError(
-                        f"cannot read existing script {dest} to verify "
-                        f"integrity: {type(e).__name__}")
-                if _hashlib.sha256(existing.encode("utf-8")).hexdigest() != digest:
-                    raise safety.SafetyError(
-                        f"existing object {dest} does not match the expected "
-                        f"script content (sha256 mismatch) — refusing to wire a "
-                        f"possibly-tampered startup script.")
-            else:
+            if not safety.bucket_object_exists(dest):
                 with tempfile.NamedTemporaryFile("w", suffix=".sh",
                                                  delete=False) as fh:
                     fh.write(body_text)
@@ -714,6 +702,24 @@ def terra_create_runtime(
                     bk.upload_file(tmp, dest, recursive=False)
                 finally:
                     _os.unlink(tmp)
+            # security review: UNCONDITIONAL read-back verify — AFTER every path,
+            # not just the pre-existing branch. The upload uses `gsutil cp -n`
+            # (no-clobber), which silently SKIPS if a co-member raced an object
+            # into this content-addressed path between our existence check and the
+            # upload (TOCTOU). So we re-read the FINAL object bytes and require
+            # sha256 == expected, failing CLOSED on any mismatch or unreadable
+            # object. GCS does not enforce name==hash(content), so name alone is
+            # never trusted.
+            try:
+                final = bk._run_gsutil(["cat", dest], timeout=30.0)
+            except bk.BucketError as e:
+                raise safety.SafetyError(
+                    f"cannot read back {dest} to verify integrity: "
+                    f"{type(e).__name__} — refusing to wire an unverifiable script.")
+            if _hashlib.sha256(final.encode("utf-8")).hexdigest() != digest:
+                raise safety.SafetyError(
+                    f"{dest} content does not match the expected sha256 — refusing "
+                    f"to wire a possibly-tampered or raced script.")
             # security review: PIN the GCS generation for objects FETCHED BY GSUTIL
             # on the VM (the runner). The workspace bucket is co-member-writable;
             # a generation-pinned URI (gs://…#<gen>) makes gsutil fetch the EXACT

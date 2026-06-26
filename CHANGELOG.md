@@ -9,6 +9,14 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed (security hardening)
 
+- **Upload-race + terminal-write race (deep follow-ups).** `_ensure_versioned_script`
+  now reads back and sha256-verifies the object on EVERY path (not only when it
+  pre-exists) — closing a TOCTOU where `gsutil cp -n` could silently skip over a
+  co-member-raced object. And a terminal write now requires an AUTHORITATIVE
+  synchronous claim-ownership stat (owner == this runner), re-checked before the
+  result upload AND before the spec move — not just the async LOST_CLAIM sentinel,
+  which can lag a paused/partitioned runner.
+
 - **First-stage boot integrity + lease-after-exit (follow-up pass).** The runner
   object is now fetched from a **generation-pinned (immutable) GCS URI** on top of
   its sha256 verify; the lease is **re-checked after papermill exits AND right
