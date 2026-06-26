@@ -76,7 +76,7 @@ public (e.g. `gnomad-public-impostor`) is **not** trusted.
 Refusals are **fail-loud** with a clear message and remediation — never a silent
 drop or placeholder.
 
-This table is **enforced by a structural meta-test** (`CC-ControlledAccess3`):
+This table is **enforced by a structural meta-test** (`CC-ControlledAccessGuard`):
 the suite enumerates every data-returning tool and fails if any one of them
 ships without a controlled-access check, so a future tool cannot silently
 re-open an egress path.

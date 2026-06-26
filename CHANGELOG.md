@@ -47,7 +47,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     is reduced to status + call-status summary. The public-bucket allowlist is
     now **exact-name** (a controlled bucket *named* to look public is not
     trusted). Audio render gains a read-back md5 verify. 6 regression tests
-    (CC-ControlledAccess2) that execute the bypasses.
+    (CC-ControlledAccessEgress) that execute the bypasses.
 
 - **Consolidated run record + multi-channel completion delivery, with a
   metadata spec.** A completed run now produces ONE provenance-bearing record
@@ -259,7 +259,7 @@ tests exercise the templates in isolation, so these were latent):
     path; the local metadata temp blob is unlinked in `finally`; and
     `terra_write_run_record` does a no-clobber **preflight** so it can't report
     success while `gsutil cp -n` silently skipped.
-  - Guarded by 10 new regression tests (`CC-HardeningFixes`).
+  - Guarded by 10 new regression tests (`CC-WriteSafety`).
 - **Adversarial-review hardening — round 2** — 6 more findings on the
   attachment/delivery work:
   - **CRITICAL** — `assert_local_write_policy` matched blocklist prefixes with a
@@ -278,7 +278,7 @@ tests exercise the templates in isolation, so these were latent):
     `summary.{mp3,m4a}` before sending text to the backend; the run record is
     **read back (md5)** after upload so a `cp -n` skip/race can't report a
     write that didn't persist.
-  - Guarded by 7 new regression tests (`CC-HardeningFixes2`).
+  - Guarded by 7 new regression tests (`CC-DeliverySafety`).
 - **Adversarial-review hardening — round 4** — egress closure across the
   full read surface + retry safety, on the new robustness work:
   - **Controlled-access leaks closed** in `terra_list_bucket` (object paths now
@@ -301,7 +301,7 @@ tests exercise the templates in isolation, so these were latent):
   - A **structural meta-test** now enumerates every data-returning tool and
     fails if any lacks a controlled-access check (prevents a future tool from
     silently re-opening an egress path). Guarded by 7 new regression tests
-    (`CC-ControlledAccess3`).
+    (`CC-ControlledAccessGuard`).
 - **Adversarial-review hardening — round 4b** (re-review of the round-4
   fixes): closed 5 more findings.
   - **Audio in controlled mode** now feeds the summary text to `say` via
@@ -437,6 +437,14 @@ tests exercise the templates in isolation, so these were latent):
   restart reclaims its own job by owner; get_workflow_cost uses an EXACT cost-key
   allowlist; terra_write_run_record error paths redact the bucket path in guard
   mode.
+- **Adversarial-review hardening — round 12** (re-review of round-11): the on-VM
+  runner lease owner is now UNIQUE per instance (runtime+host+pid+boot-epoch) and
+  reclaim is STALE-AGE-ONLY — removing the critical shared-owner double-execution
+  (two VMs sharing a legacy owner). A no-metadata claim ages out via the object
+  Update time; the stale margin is budget+3600s and the pre-run download is
+  timeout-bounded so a live owner is never reclaimed mid-run; obj_state treats an
+  ACL/auth failure as an error (fail-closed); run-record upload/read-back errors
+  redact the bucket path in guard mode.
 - **No delete primitive, by design** — no tool (and no `leo_delete_runtime`
   at any layer) deletes a runtime or persistent disk; teardown is the user's
   action in the Terra UI ("Keep persistent disk"). The MCP detects a

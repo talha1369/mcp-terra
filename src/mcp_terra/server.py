@@ -3135,14 +3135,32 @@ def terra_write_run_record(run_id: str, record_json: str,
     try:
         with _os_rr.fdopen(fd, "w") as fh:
             fh.write(blob)
-        bk.upload_file(tmp, dest, recursive=False)
+        # security review r12: in controlled mode a raw bk.BucketError (gsutil
+        # stderr) can echo the dest bucket URI — catch + re-raise path-redacted,
+        # preserving fail-loud behaviour without leaking the path.
+        try:
+            bk.upload_file(tmp, dest, recursive=False)
+        except bk.BucketError as _e:
+            if policy.controlled_access_enabled():
+                raise bk.BucketError(
+                    "run-record upload failed (path withheld: "
+                    "controlled-access mode)") from None
+            raise
         # READ-BACK VERIFY (security review finding): cp -n SILENTLY SKIPS if a concurrent
         # writer created dest after our preflight. Confirm the persisted object
         # actually holds OUR bytes (md5 match) — otherwise we'd report 'written'
         # for a record we did not persist. Fail loud on mismatch.
         _expected_md5 = _b64_rr.b64encode(
             _hl_rr.md5(blob.encode("utf-8")).digest()).decode()
-        _mm = _re_rr.search(r"Hash \(md5\):\s*(\S+)", bk.stat_object(dest))
+        try:
+            _statout = bk.stat_object(dest)
+        except bk.BucketError as _e:
+            if policy.controlled_access_enabled():
+                raise bk.BucketError(
+                    "run-record read-back failed (path withheld: "
+                    "controlled-access mode)") from None
+            raise
+        _mm = _re_rr.search(r"Hash \(md5\):\s*(\S+)", _statout)
         if not _mm or _mm.group(1) != _expected_md5:
             raise safety.SafetyError(
                 f"run record at {_rr_loc} does NOT match what we wrote (md5 "

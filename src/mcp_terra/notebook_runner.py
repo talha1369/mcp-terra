@@ -430,14 +430,18 @@ SESSION_MIN_JOB_SEC=300   # refuse a new job if less than this remains
 # A per-spec claim older than this means its owner is GONE (a job can never run
 # longer than the session budget), so it is safe to reclaim. No refresh needed —
 # an ACTIVE job's claim age is bounded by JOB_BUDGET <= SESSION_BUDGET_SEC. (r10)
-CLAIM_TTL=$(( SESSION_BUDGET_SEC + 300 ))
-# Stable id for THIS runner (the runtime name) — used to win an atomic per-spec
-# claim so two DIFFERENT VMs polling the same bucket can't execute/refuse the
-# same job twice. (security review r9.) Stable (not pid/epoch) on purpose: a same-VM
-# restart reclaims its own in-flight jobs (preserving existing retry behaviour);
-# only a DIFFERENT runtime is serialized out. flock already prevents two runners
-# per VM, and runtime names are unique per VM.
-RUNNER_INSTANCE_ID="${MCP_TERRA_RUNTIME_NAME:-legacy-runner}"
+# Generous stale margin: an ACTIVE job holds its claim for the papermill run
+# (bounded by JOB_BUDGET <= SESSION_BUDGET) PLUS the pre-run notebook download and
+# post-run result/log uploads (gsutil I/O). The margin must exceed that I/O so a
+# live owner's claim is never reclaimed mid-run; 1h is ample for realistic
+# notebooks, and the notebook download is additionally `timeout`-bounded. (r12)
+CLAIM_TTL=$(( SESSION_BUDGET_SEC + 3600 ))
+# UNIQUE id per live runner INSTANCE (runtime + host + pid + boot epoch) — so two
+# VMs (or the legacy/no-name fallback) can NEVER share an owner. (security review
+# r12 critical.) Owner is used only for logging; reclaim is STALE-AGE-ONLY (no
+# owner-based immediate reclaim — a shared/restarted owner can't be told apart
+# from a live one without a liveness signal, so age is the only safe basis).
+RUNNER_INSTANCE_ID="${MCP_TERRA_RUNTIME_NAME:-runner}.$(hostname 2>/dev/null || echo h).$$.${RUNNER_START_EPOCH}"
 # `timeout` (coreutils) must exist to enforce the wall-clock budget — fail loud
 # rather than silently run unbounded.
 command -v timeout >/dev/null 2>&1 || {
@@ -466,7 +470,12 @@ obj_state() {
     _err="$(gsutil stat "$1" 2>&1 >/dev/null)"; _rc=$?
     if [ "$_rc" -eq 0 ]; then
         echo present
-    elif printf '%s' "$_err" | grep -qiE "no url|not found|404|does not exist|one or more"; then
+    # security review r12: an ACL/auth failure makes gsutil ALSO print "No URLs
+    # matched" (match count 0) — so check the access/permission signatures FIRST
+    # and classify them as ERROR (fail-closed), before the not-found signatures.
+    elif printf '%s' "$_err" | grep -qiE "accessdenied|access denied|permission|forbidden|403|401|not authorized|unauthorized|credential|reauth"; then
+        echo error
+    elif printf '%s' "$_err" | grep -qiE "no url|not found|404|does not exist"; then
         echo absent
     else
         echo error
@@ -573,20 +582,30 @@ while true; do
             CLAIM_GEN="$(printf '%s' "$CLAIM_STAT" | awk '/Generation:/{print $2; exit}')"
             CLAIM_OWNER="$(printf '%s' "$CLAIM_STAT" | awk -F'[[:space:]]+' '/claim-owner:/{print $NF; exit}')"
             CLAIM_TS="$(printf '%s' "$CLAIM_STAT" | awk -F'[[:space:]]+' '/claim-ts:/{print $NF; exit}')"
-            CLAIM_AGE=$(( NOW - ${CLAIM_TS:-$NOW} ))
             if [ -z "$CLAIM_GEN" ]; then
                 echo "[runner] could not stat claim for $JOB_ID; skipping this poll." >&2
                 continue   # fail-closed (transient stat error)
             fi
-            if [ "$CLAIM_OWNER" = "$RUNNER_INSTANCE_ID" ] \
-                 || { [ -n "$CLAIM_TS" ] && [ "$CLAIM_AGE" -gt "$CLAIM_TTL" ]; }; then
+            # security review r12: no metadata ts? (a pre-upgrade / foreign claim
+            # that stored data in the body) → fall back to the object's Update time
+            # so it can still age out instead of stranding the job forever.
+            if [ -z "$CLAIM_TS" ]; then
+                _CL_UPD="$(printf '%s' "$CLAIM_STAT" | sed -n 's/^[[:space:]]*Update time:[[:space:]]*//p' | head -n1)"
+                [ -n "$_CL_UPD" ] && CLAIM_TS="$(date -u -d "$_CL_UPD" +%s 2>/dev/null || echo "")"
+            fi
+            CLAIM_AGE=$(( NOW - ${CLAIM_TS:-$NOW} ))
+            # security review r12 (critical): reclaim is STALE-AGE-ONLY — NO
+            # owner-based immediate reclaim (a shared/restarted owner cannot be
+            # distinguished from a live one). The owner id is unique per instance
+            # and used only for logging.
+            if [ -n "$CLAIM_TS" ] && [ "$CLAIM_AGE" -gt "$CLAIM_TTL" ]; then
                 # CAS on the SAME generation we just judged — if another runner
                 # reclaimed first, the generation changed and this 412-fails.
                 if printf '%s' "$RUNNER_INSTANCE_ID" \
                      | gsutil -h "x-goog-if-generation-match:$CLAIM_GEN" \
                               -h "x-goog-meta-claim-owner:$RUNNER_INSTANCE_ID" \
                               -h "x-goog-meta-claim-ts:$NOW" cp - "$CLAIM" 2>/dev/null; then
-                    echo "[runner] reclaimed claim for $JOB_ID (prev owner='$CLAIM_OWNER' age=${CLAIM_AGE}s)." >&2
+                    echo "[runner] reclaimed STALE claim for $JOB_ID (prev owner='$CLAIM_OWNER' age=${CLAIM_AGE}s > ${CLAIM_TTL}s)." >&2
                 else
                     echo "[runner] claim for $JOB_ID changed under us; skipping this poll." >&2
                     continue
@@ -724,7 +743,13 @@ PYVERIFY
 
         LOCAL_NB="$WORK/$JOB_ID.in.ipynb"
         LOCAL_OUT="$WORK/$JOB_ID.out.ipynb"
-        gsutil cp "$NOTEBOOK_GCS" "$LOCAL_NB"
+        # security review r12: bound the pre-run download so a hung transfer can't
+        # hold the claim past the stale margin (which would let another VM
+        # reclaim + double-execute). On timeout, skip this poll (claim ages out).
+        if ! timeout --signal=TERM --kill-after=30 900 gsutil cp "$NOTEBOOK_GCS" "$LOCAL_NB"; then
+            echo "[runner] notebook download for $JOB_ID failed or timed out; skipping this poll." >&2
+            continue
+        fi
 
         # Integrity check: if the spec carries a notebook_sha256, recompute
         # the SHA-256 of the downloaded file and refuse on mismatch. Catches

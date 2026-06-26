@@ -1000,7 +1000,7 @@ def _():
 # S. ROUND-3 HARDENING (audit-driven CRITICAL/HIGH fixes)
 # ──────────────────────────────────────────────────────────────────────────
 
-@case("S-Round3", "runner script scrubs MCP_TERRA_RUNNER_SECRET before papermill")
+@case("CC-RunnerSecret", "runner script scrubs MCP_TERRA_RUNNER_SECRET before papermill")
 def _():
     from mcp_terra import notebook_runner as nbr
     src = nbr.runner_script_template()
@@ -1009,7 +1009,7 @@ def _():
     assert "env -u MCP_TERRA_RUNNER_SECRET" in src, \
         "papermill not env-scrubbed of HMAC secret"
 
-@case("S-Round3", "runner script also scrubs other MCP_TERRA_* env vars before papermill")
+@case("CC-RunnerSecret", "runner script also scrubs other MCP_TERRA_* env vars before papermill")
 def _():
     from mcp_terra import notebook_runner as nbr
     src = nbr.runner_script_template()
@@ -1017,7 +1017,7 @@ def _():
                 "MCP_TERRA_KILL_REFUSAL_THRESHOLD", "MCP_TERRA_SPEC_MAX_AGE_SEC"):
         assert f"-u {var}" in src, f"{var} not scrubbed before papermill"
 
-@case("S-Round3", "spec _spec_gcs + _submit_ts bound into signature")
+@case("CC-RunnerSecret", "spec _spec_gcs + _submit_ts bound into signature")
 def _():
     from mcp_terra import notebook_runner as nbr
     import time as _t
@@ -1033,14 +1033,14 @@ def _():
     # not via HMAC), so this test only verifies the signature stays bound.
     assert nbr.verify_spec(signed_a, _TEST_SECRET_A)
 
-@case("S-Round3", "runner enforces schema_version == 2")
+@case("CC-RunnerSecret", "runner enforces schema_version == 2")
 def _():
     from mcp_terra import notebook_runner as nbr
     src = nbr.runner_script_template()
     # The runner's PYVERIFY heredoc should reject schema_version != 2
     assert "schema_version" in src and 'sys.exit(13)' in src
 
-@case("S-Round3", "runner validates _spec_gcs and _submit_ts (replay defense)")
+@case("CC-RunnerSecret", "runner validates _spec_gcs and _submit_ts (replay defense)")
 def _():
     from mcp_terra import notebook_runner as nbr
     src = nbr.runner_script_template()
@@ -1049,39 +1049,39 @@ def _():
     assert "bound_gcs" in src
     assert "MCP_TERRA_SPEC_MAX_AGE_SEC" in src
 
-@case("S-Round3", "runner tracks processed IDs locally (re-execution defense)")
+@case("CC-RunnerSecret", "runner tracks processed IDs locally (re-execution defense)")
 def _():
     from mcp_terra import notebook_runner as nbr
     src = nbr.runner_script_template()
     assert "PROCESSED_FILE" in src
     assert 'grep -qxF "$JOB_ID" "$PROCESSED_FILE"' in src
 
-@case("S-Round3", "runner LOCKFILE symlink check")
+@case("CC-RunnerSecret", "runner LOCKFILE symlink check")
 def _():
     from mcp_terra import notebook_runner as nbr
     src = nbr.runner_script_template()
     assert '-L "$LOCKFILE"' in src
 
-@case("S-Round3", "runner JOB_ID rejects consecutive dots")
+@case("CC-RunnerSecret", "runner JOB_ID rejects consecutive dots")
 def _():
     from mcp_terra import notebook_runner as nbr
     src = nbr.runner_script_template()
     assert '"$JOB_ID" == *..*' in src
 
-@case("S-Round3", "runner BUCKET regex disallows consecutive dots")
+@case("CC-RunnerSecret", "runner BUCKET regex disallows consecutive dots")
 def _():
     from mcp_terra import notebook_runner as nbr
     src = nbr.runner_script_template()
     assert '"$BUCKET" == *..*' in src
 
-@case("S-Round3", "runner PENDING filter is strict regex (LF-in-name defense)")
+@case("CC-RunnerSecret", "runner PENDING filter is strict regex (LF-in-name defense)")
 def _():
     from mcp_terra import notebook_runner as nbr
     src = nbr.runner_script_template()
     # The regex line should be present
     assert 'grep -E' in src and '^gs://[a-z0-9]' in src
 
-@case("S-Round3", "fail-closed: get_notebook_job_result raises if secret unset")
+@case("CC-RunnerSecret", "fail-closed: get_notebook_job_result raises if secret unset")
 def _():
     # Test the code path — without setting the secret, fetching a result
     # should NOT silently degrade.
@@ -1090,14 +1090,14 @@ def _():
     # The PermissionError raise must be on the no-secret path
     assert 'MCP_TERRA_RUNNER_SECRET is not configured' in src
 
-@case("S-Round3", "runner sanitizes paths from traceback (no /home/<user>/ leak)")
+@case("CC-RunnerSecret", "runner sanitizes paths from traceback (no /home/<user>/ leak)")
 def _():
     from mcp_terra import notebook_runner as nbr
     src = nbr.runner_script_template()
     assert "_sanitize_paths" in src
     assert "<HOME>" in src
 
-@case("S-Round3", "runner caps raw source length BEFORE base64 (truncation defense)")
+@case("CC-RunnerSecret", "runner caps raw source length BEFORE base64 (truncation defense)")
 def _():
     from mcp_terra import notebook_runner as nbr
     src = nbr.runner_script_template()
@@ -2790,20 +2790,20 @@ def _():
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# CC-HardeningFixes — regressions for the 6 findings from the adversarial review
+# CC-WriteSafety — regressions for the 6 findings from the adversarial review
 # ──────────────────────────────────────────────────────────────────────────
 import os as _os_cf
 import tempfile as _tf_cf
 
 
-@case("CC-HardeningFixes", "F1[critical] write-policy refuses blocked paths exist-independently")
+@case("CC-WriteSafety", "F1[critical] write-policy refuses blocked paths exist-independently")
 def _():
     for p in ("~/.ssh/id_rsa", "~/.zshrc", "/etc/passwd",
               "~/Library/LaunchAgents/eve.plist", "~/.aws/credentials"):
         must_raise(safety.assert_local_write_policy, safety.SafetyError, p)
 
 
-@case("CC-HardeningFixes", "F1[critical] write-policy refuses symlink + non-regular node")
+@case("CC-WriteSafety", "F1[critical] write-policy refuses symlink + non-regular node")
 def _():
     d = _tf_cf.mkdtemp(prefix="mcp_cf_")
     link = _os_cf.path.join(d, "link")
@@ -2817,14 +2817,14 @@ def _():
         pass  # os.mkfifo unavailable (non-POSIX) — symlink case still covered
 
 
-@case("CC-HardeningFixes", "F1[critical] write-policy allows a normal non-existent temp path")
+@case("CC-WriteSafety", "F1[critical] write-policy allows a normal non-existent temp path")
 def _():
     d = _tf_cf.mkdtemp(prefix="mcp_cf_")
     out = safety.assert_local_write_policy(_os_cf.path.join(d, "ok.txt"))
     assert str(out).endswith("ok.txt")
 
 
-@case("CC-HardeningFixes", "F1[critical] download tool runs write-policy BEFORE the existence branch")
+@case("CC-WriteSafety", "F1[critical] download tool runs write-policy BEFORE the existence branch")
 def _():
     import inspect
     src = inspect.getsource(server.terra_download_from_bucket)
@@ -2834,7 +2834,7 @@ def _():
         "policy check must run before/independent of version_existing branch"
 
 
-@case("CC-HardeningFixes", "F2[high] audio text fails closed on a non-Google secret shape")
+@case("CC-WriteSafety", "F2[high] audio text fails closed on a non-Google secret shape")
 def _():
     from mcp_terra import audio_summary as _as
     text = ("Run summary: the analysis finished cleanly, and here is an "
@@ -2842,7 +2842,7 @@ def _():
     must_raise(_as._validate_text, _as.AudioSummaryError, text)
 
 
-@case("CC-HardeningFixes", "F3[high] build_record drops caller-forged agent identity")
+@case("CC-WriteSafety", "F3[high] build_record drops caller-forged agent identity")
 def _():
     forged = dict(_GOOD_REC, agent={"terra_user_email": "attacker@evil.com",
                                     "terra_user_subject_id": "forged",
@@ -2854,27 +2854,27 @@ def _():
     assert "terra_user_subject_id" not in rec["agent"], "forged subject_id must be dropped"
 
 
-@case("CC-HardeningFixes", "F3[high] build_record fails closed when identity unresolved")
+@case("CC-WriteSafety", "F3[high] build_record fails closed when identity unresolved")
 def _():
     must_raise(_rr.build_record, _rr.RunRecordError, _GOOD_REC,
                mcp_version="1", module_hashes={"a.py": "h"}, user_email="")
 
 
-@case("CC-HardeningFixes", "F4[med] write_run_record binds embedded run_id to the path arg")
+@case("CC-WriteSafety", "F4[med] write_run_record binds embedded run_id to the path arg")
 def _():
     import inspect
     src = inspect.getsource(server.terra_write_run_record)
     assert "!= run_id" in src and 'record_in["run_id"] = run_id' in src
 
 
-@case("CC-HardeningFixes", "F5[med] write_run_record unlinks its temp blob in finally")
+@case("CC-WriteSafety", "F5[med] write_run_record unlinks its temp blob in finally")
 def _():
     import inspect
     src = inspect.getsource(server.terra_write_run_record)
     assert "finally:" in src and "unlink(tmp)" in src
 
 
-@case("CC-HardeningFixes", "F6[med] write_run_record preflights no-clobber before upload")
+@case("CC-WriteSafety", "F6[med] write_run_record preflights no-clobber before upload")
 def _():
     import inspect
     src = inspect.getsource(server.terra_write_run_record)
@@ -3030,10 +3030,10 @@ def _():
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# CC-HardeningFixes2 — regressions for the 2nd adversarial-review round (6 findings)
+# CC-DeliverySafety — regressions for the 2nd adversarial-review round (6 findings)
 # ──────────────────────────────────────────────────────────────────────────
 
-@case("CC-HardeningFixes2", "F1[critical] exact protected DIRS are blocked (trailing-slash fix)")
+@case("CC-DeliverySafety", "F1[critical] exact protected DIRS are blocked (trailing-slash fix)")
 def _():
     for p in ("/usr/bin", "/usr/sbin", "/bin", "/sbin", "/System",
               "/var/db", "/var/root"):
@@ -3045,14 +3045,14 @@ def _():
     safety.assert_local_write_policy(_o.path.join(_t.mkdtemp(), "ok.txt"))
 
 
-@case("CC-HardeningFixes2", "F1[critical] download refuses version_existing on a directory")
+@case("CC-DeliverySafety", "F1[critical] download refuses version_existing on a directory")
 def _():
     import inspect
     src = inspect.getsource(server.terra_download_from_bucket)
     assert "target.is_dir()" in src and "versions single files only" in src
 
 
-@case("CC-HardeningFixes2", "F2[high] reserved audio path: helper + upload refusal")
+@case("CC-DeliverySafety", "F2[high] reserved audio path: helper + upload refusal")
 def _():
     assert safety.is_reserved_bucket_path("gs://b/mcp_terra_jobs/J1/summary.m4a")
     assert safety.is_reserved_bucket_path("gs://b/mcp_terra_jobs/J1/summary.mp3")
@@ -3063,7 +3063,7 @@ def _():
     assert "is_reserved_bucket_path" in src, "upload must refuse the reserved audio path"
 
 
-@case("CC-HardeningFixes2", "F3[high] audio fetch size-preflights BEFORE download")
+@case("CC-DeliverySafety", "F3[high] audio fetch size-preflights BEFORE download")
 def _():
     import inspect
     sig = inspect.signature(server._fetch_run_audio_bytes)
@@ -3075,7 +3075,7 @@ def _():
         "size cap must be enforced before the download"
 
 
-@case("CC-HardeningFixes2", "F4[med] Slack fails LOUD when ALL targets fail")
+@case("CC-DeliverySafety", "F4[med] Slack fails LOUD when ALL targets fail")
 def _():
     from mcp_terra import notify as _n
     saved = (_n._SLACK_BOT_TOKEN, _n._SLACK_CHANNEL, _n._slack_upload_one)
@@ -3093,7 +3093,7 @@ def _():
     assert "partial_failure" in inspect.getsource(_n.slack_upload_file)
 
 
-@case("CC-HardeningFixes2", "F5[med] audio render preflights both ext BEFORE the TTS side-effect")
+@case("CC-DeliverySafety", "F5[med] audio render preflights both ext BEFORE the TTS side-effect")
 def _():
     import inspect
     src = inspect.getsource(server.terra_render_audio_summary)
@@ -3103,7 +3103,7 @@ def _():
         "no-clobber preflight must run before sending text to the backend"
 
 
-@case("CC-HardeningFixes2", "F6[med] run-record read-back verifies md5 after upload")
+@case("CC-DeliverySafety", "F6[med] run-record read-back verifies md5 after upload")
 def _():
     import inspect
     src = inspect.getsource(server.terra_write_run_record)
@@ -3172,11 +3172,11 @@ def _():
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# CC-ControlledAccess2 — round-3 fixes: close ALL controlled-access egress
+# CC-ControlledAccessEgress — round-3 fixes: close ALL controlled-access egress
 # paths + exact-name public allowlist. Tests EXECUTE the documented bypasses.
 # ──────────────────────────────────────────────────────────────────────────
 
-@case("CC-ControlledAccess2", "F3 public allowlist is EXACT — prefix-collision blocked")
+@case("CC-ControlledAccessEgress", "F3 public allowlist is EXACT — prefix-collision blocked")
 def _():
     from mcp_terra import policy as _p
     saved = (_p._CONTROLLED_ACCESS, _p._DATA_EGRESS_ALLOW)
@@ -3193,7 +3193,7 @@ def _():
         (_p._CONTROLLED_ACCESS, _p._DATA_EGRESS_ALLOW) = saved
 
 
-@case("CC-ControlledAccess2", "F2 workflow_outputs REFUSED in controlled mode (executes bypass)")
+@case("CC-ControlledAccessEgress", "F2 workflow_outputs REFUSED in controlled mode (executes bypass)")
 def _():
     from mcp_terra import policy as _p
     saved = _p._CONTROLLED_ACCESS
@@ -3205,7 +3205,7 @@ def _():
         _p._CONTROLLED_ACCESS = saved
 
 
-@case("CC-ControlledAccess2", "F2 workflow_metadata REDUCED to status+summary (executes bypass)")
+@case("CC-ControlledAccessEgress", "F2 workflow_metadata REDUCED to status+summary (executes bypass)")
 def _():
     from mcp_terra import policy as _p
     saved = _p._CONTROLLED_ACCESS
@@ -3230,7 +3230,7 @@ def _():
         server.auth.get_access_token = orig_tok
 
 
-@case("CC-ControlledAccess2", "F1 run_log content WITHHELD in controlled mode (executes bypass)")
+@case("CC-ControlledAccessEgress", "F1 run_log content WITHHELD in controlled mode (executes bypass)")
 def _():
     from mcp_terra import policy as _p
     import time as _t
@@ -3248,7 +3248,7 @@ def _():
         safety._BUCKET_CACHE.update(saved_cache)
 
 
-@case("CC-ControlledAccess2", "F1 job_result redacts source/traceback + gates Tier-2 ext-LLM")
+@case("CC-ControlledAccessEgress", "F1 job_result redacts source/traceback + gates Tier-2 ext-LLM")
 def _():
     import inspect
     src = inspect.getsource(server.terra_get_notebook_job_result)
@@ -3256,7 +3256,7 @@ def _():
     assert "not policy.controlled_access_enabled()" in src, "must gate the Tier-2 ext-LLM call"
 
 
-@case("CC-ControlledAccess2", "F4 audio render read-back verifies md5 after upload")
+@case("CC-ControlledAccessEgress", "F4 audio render read-back verifies md5 after upload")
 def _():
     import inspect
     src = inspect.getsource(server.terra_render_audio_summary)
@@ -3459,7 +3459,7 @@ def _():
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# CC-ControlledAccess3 — round-4 egress closure across ALL data-returning tools
+# CC-ControlledAccessGuard — round-4 egress closure across ALL data-returning tools
 # ──────────────────────────────────────────────────────────────────────────
 
 # Every registered tool MUST be explicitly classified into exactly one of these
@@ -3612,7 +3612,7 @@ def _calls_remote_service(fn) -> bool:
     return False
 
 
-@case("CC-ControlledAccess3", "META(fail-closed): no _NO_DATA tool raw-returns a remote payload")
+@case("CC-ControlledAccessGuard", "META(fail-closed): no _NO_DATA tool raw-returns a remote payload")
 def _():
     # security review r8 root cause: _NO_DATA tools were trusted to not leak, but several
     # raw-returned a Rawls/Leonardo/gsutil response (write/lifecycle paths).
@@ -3628,7 +3628,7 @@ def _():
         f"— project them + move to _DATA_TOOLS_REQUIRING_GUARD: {offenders}")
 
 
-@case("CC-ControlledAccess3", "META(fail-closed): _NO_DATA tools make no UNjustified remote call")
+@case("CC-ControlledAccessGuard", "META(fail-closed): _NO_DATA tools make no UNjustified remote call")
 def _():
     # security review r9: the raw-return check missed remote-derived data reaching _ok via
     # dicts/helpers/subprocess. Stronger rule: a _NO_DATA tool may call a remote
@@ -3647,7 +3647,7 @@ def _():
         f"_NO_DATA_REMOTE_OK: {offenders}")
 
 
-@case("CC-ControlledAccess3", "META(fail-closed): every tool classified + every data tool AST-guarded")
+@case("CC-ControlledAccessGuard", "META(fail-closed): every tool classified + every data tool AST-guarded")
 def _():
     registered = set(server.server._tool_manager._tools.keys())
     classified = _DATA_TOOLS_REQUIRING_GUARD | _NO_DATA_TOOLS
@@ -3668,7 +3668,7 @@ def _():
     assert not unguarded, f"data tools missing a runtime controlled-access guard: {unguarded}"
 
 
-@case("CC-ControlledAccess3", "method_config: a sentinel identifier in an input KEY never egresses (controlled)")
+@case("CC-ControlledAccessGuard", "method_config: a sentinel identifier in an input KEY never egresses (controlled)")
 def _():
     from mcp_terra import policy as _p
     saved, om, ot = _p._CONTROLLED_ACCESS, _tc.rawls_get_method_config, server.auth.get_access_token
@@ -3690,7 +3690,7 @@ def _():
         _p._CONTROLLED_ACCESS, _tc.rawls_get_method_config, server.auth.get_access_token = saved, om, ot
 
 
-@case("CC-ControlledAccess3", "method_config projects to COUNTS (no values, no key names) in controlled mode")
+@case("CC-ControlledAccessGuard", "method_config projects to COUNTS (no values, no key names) in controlled mode")
 def _():
     from mcp_terra import policy as _p
     saved, om, ot = _p._CONTROLLED_ACCESS, _tc.rawls_get_method_config, server.auth.get_access_token
@@ -3714,7 +3714,7 @@ def _():
         _p._CONTROLLED_ACCESS, _tc.rawls_get_method_config, server.auth.get_access_token = saved, om, ot
 
 
-@case("CC-ControlledAccess3", "submission projects to ids+statuses in controlled mode")
+@case("CC-ControlledAccessGuard", "submission projects to ids+statuses in controlled mode")
 def _():
     from mcp_terra import policy as _p
     saved, os_, ot = _p._CONTROLLED_ACCESS, _tc.rawls_get_submission, server.auth.get_access_token
@@ -3732,7 +3732,7 @@ def _():
         _p._CONTROLLED_ACCESS, _tc.rawls_get_submission, server.auth.get_access_token = saved, os_, ot
 
 
-@case("CC-ControlledAccess3", "workflow_logs refuses stderr OUTSIDE the queried workspace bucket")
+@case("CC-ControlledAccessGuard", "workflow_logs refuses stderr OUTSIDE the queried workspace bucket")
 def _():
     from mcp_terra import policy as _p, bucket as _bk2
     saved = _p._CONTROLLED_ACCESS
@@ -3756,7 +3756,7 @@ def _():
         _bk2.read_object, safety.safe_bucket_uri = oread, osafe
 
 
-@case("CC-ControlledAccess3", "get_workspace withholds operator attributes (sentinel) in controlled mode")
+@case("CC-ControlledAccessGuard", "get_workspace withholds operator attributes (sentinel) in controlled mode")
 def _():
     from mcp_terra import policy as _p
     saved, ow, ot = _p._CONTROLLED_ACCESS, _tc.rawls_get_workspace, server.auth.get_access_token
@@ -3776,7 +3776,7 @@ def _():
         _p._CONTROLLED_ACCESS, _tc.rawls_get_workspace, server.auth.get_access_token = saved, ow, ot
 
 
-@case("CC-ControlledAccess3", "list_method_configs returns count-only (sentinel) in controlled mode")
+@case("CC-ControlledAccessGuard", "list_method_configs returns count-only (sentinel) in controlled mode")
 def _():
     from mcp_terra import policy as _p
     saved, ol, ot = _p._CONTROLLED_ACCESS, _tc.rawls_list_method_configs, server.auth.get_access_token
@@ -3794,7 +3794,7 @@ def _():
         _p._CONTROLLED_ACCESS, _tc.rawls_list_method_configs, server.auth.get_access_token = saved, ol, ot
 
 
-@case("CC-ControlledAccess3", "bucket_object_metadata withholds custom metadata (sentinel) in controlled mode")
+@case("CC-ControlledAccessGuard", "bucket_object_metadata withholds custom metadata (sentinel) in controlled mode")
 def _():
     from mcp_terra import policy as _p, bucket as _bk2
     saved, ostat = _p._CONTROLLED_ACCESS, _bk2.stat_object
@@ -3819,7 +3819,7 @@ def _():
         safety.safe_bucket_uri = osafe
 
 
-@case("CC-ControlledAccess3", "download_from_bucket REFUSES a controlled bucket (data→local disk)")
+@case("CC-ControlledAccessGuard", "download_from_bucket REFUSES a controlled bucket (data→local disk)")
 def _():
     from mcp_terra import policy as _p
     saved = _p._CONTROLLED_ACCESS
@@ -3836,7 +3836,7 @@ def _():
         safety.safe_bucket_uri = osafe
 
 
-@case("CC-ControlledAccess3", "list_workspaces is count-only (sentinel) in controlled mode w/o lock")
+@case("CC-ControlledAccessGuard", "list_workspaces is count-only (sentinel) in controlled mode w/o lock")
 def _():
     from mcp_terra import policy as _p
     saved, ol, ot = _p._CONTROLLED_ACCESS, _tc.rawls_list_workspaces, server.auth.get_access_token
@@ -3857,7 +3857,7 @@ def _():
         _p.resolve_locked_workspace = olock
 
 
-@case("CC-ControlledAccess3", "list_data_tables is counts-only (sentinel) in controlled mode")
+@case("CC-ControlledAccessGuard", "list_data_tables is counts-only (sentinel) in controlled mode")
 def _():
     from mcp_terra import policy as _p
     saved, ol, ot = _p._CONTROLLED_ACCESS, _tc.rawls_list_data_tables, server.auth.get_access_token
@@ -3874,7 +3874,7 @@ def _():
         _p._CONTROLLED_ACCESS, _tc.rawls_list_data_tables, server.auth.get_access_token = saved, ol, ot
 
 
-@case("CC-ControlledAccess3", "list_submissions withholds method-config/entity names (sentinel) in controlled mode")
+@case("CC-ControlledAccessGuard", "list_submissions withholds method-config/entity names (sentinel) in controlled mode")
 def _():
     from mcp_terra import policy as _p
     saved, ol, ot = _p._CONTROLLED_ACCESS, _tc.rawls_list_submissions, server.auth.get_access_token
@@ -3894,7 +3894,7 @@ def _():
         _p._CONTROLLED_ACCESS, _tc.rawls_list_submissions, server.auth.get_access_token = saved, ol, ot
 
 
-@case("CC-ControlledAccess3", "summarize_submissions withholds method-config names (sentinel) in controlled mode")
+@case("CC-ControlledAccessGuard", "summarize_submissions withholds method-config names (sentinel) in controlled mode")
 def _():
     from mcp_terra import policy as _p
     saved, ol, ot = _p._CONTROLLED_ACCESS, _tc.rawls_list_submissions, server.auth.get_access_token
@@ -3914,7 +3914,7 @@ def _():
         _p._CONTROLLED_ACCESS, _tc.rawls_list_submissions, server.auth.get_access_token = saved, ol, ot
 
 
-@case("CC-ControlledAccess3", "stat: a custom key CONTAINING a safe-label substring is still withheld")
+@case("CC-ControlledAccessGuard", "stat: a custom key CONTAINING a safe-label substring is still withheld")
 def _():
     from mcp_terra import policy as _p, bucket as _bk2
     saved, ostat, osafe = _p._CONTROLLED_ACCESS, _bk2.stat_object, safety.safe_bucket_uri
@@ -3936,7 +3936,7 @@ def _():
         safety.safe_bucket_uri = osafe
 
 
-@case("CC-ControlledAccess3", "list_runtimes is count+status only (sentinel) in controlled mode")
+@case("CC-ControlledAccessGuard", "list_runtimes is count+status only (sentinel) in controlled mode")
 def _():
     from mcp_terra import policy as _p
     saved, ol, ot = _p._CONTROLLED_ACCESS, _tc.leo_list_runtimes, server.auth.get_access_token
@@ -3957,7 +3957,7 @@ def _():
         _p.resolve_locked_workspace = olock
 
 
-@case("CC-ControlledAccess3", "get_runtime withholds labels/URL/creator (sentinel) in controlled mode")
+@case("CC-ControlledAccessGuard", "get_runtime withholds labels/URL/creator (sentinel) in controlled mode")
 def _():
     from mcp_terra import policy as _p
     saved, og, ot = _p._CONTROLLED_ACCESS, _tc.leo_get_runtime, server.auth.get_access_token
@@ -3977,7 +3977,7 @@ def _():
         _p._CONTROLLED_ACCESS, _tc.leo_get_runtime, server.auth.get_access_token = saved, og, ot
 
 
-@case("CC-ControlledAccess3", "recommend_runtime_for_notebook REFUSES a controlled bucket (no local cat)")
+@case("CC-ControlledAccessGuard", "recommend_runtime_for_notebook REFUSES a controlled bucket (no local cat)")
 def _():
     from mcp_terra import policy as _p, bucket as _bk2
     saved, osafe, orun = _p._CONTROLLED_ACCESS, safety.safe_bucket_uri, _bk2._run_gsutil
@@ -3993,7 +3993,7 @@ def _():
         _p._CONTROLLED_ACCESS, safety.safe_bucket_uri, _bk2._run_gsutil = saved, osafe, orun
 
 
-@case("CC-ControlledAccess3", "refresh_workspace_allowlist is count-only (no bucket names) in controlled mode w/o lock")
+@case("CC-ControlledAccessGuard", "refresh_workspace_allowlist is count-only (no bucket names) in controlled mode w/o lock")
 def _():
     from mcp_terra import policy as _p
     saved, oref, olock = _p._CONTROLLED_ACCESS, safety.force_refresh_bucket_allowlist, _p.resolve_locked_workspace
@@ -4030,7 +4030,7 @@ def _write_guards_on(_p):
     return restore
 
 
-@case("CC-ControlledAccess3", "submit_workflow returns ids+status only (sentinel) in controlled mode")
+@case("CC-ControlledAccessGuard", "submit_workflow returns ids+status only (sentinel) in controlled mode")
 def _():
     from mcp_terra import policy as _p
     SENTINEL = "methodcfg-NA12878-secret"
@@ -4050,7 +4050,7 @@ def _():
         _tc.rawls_create_submission = o
 
 
-@case("CC-ControlledAccess3", "register_method returns snapshot id only (sentinel) in controlled mode")
+@case("CC-ControlledAccessGuard", "register_method returns snapshot id only (sentinel) in controlled mode")
 def _():
     from mcp_terra import policy as _p
     SENTINEL = "synopsis-NA12878-secret"
@@ -4068,7 +4068,7 @@ def _():
         _tc.agora_register_method = o
 
 
-@case("CC-ControlledAccess3", "create_method_config returns ack only (sentinel) in controlled mode")
+@case("CC-ControlledAccessGuard", "create_method_config returns ack only (sentinel) in controlled mode")
 def _():
     from mcp_terra import policy as _p
     SENTINEL = "NA12878-secret"
@@ -4086,7 +4086,7 @@ def _():
         _tc.rawls_create_method_config = o
 
 
-@case("CC-ControlledAccess3", "start_runtime returns minimal ack (sentinel) in controlled mode")
+@case("CC-ControlledAccessGuard", "start_runtime returns minimal ack (sentinel) in controlled mode")
 def _():
     from mcp_terra import policy as _p
     SENTINEL = "NA12878-secret-label"
@@ -4103,7 +4103,7 @@ def _():
         _tc.leo_start_runtime = o
 
 
-@case("CC-ControlledAccess3", "get_workflow_cost returns numeric-only (sentinel) in controlled mode")
+@case("CC-ControlledAccessGuard", "get_workflow_cost returns numeric-only (sentinel) in controlled mode")
 def _():
     from mcp_terra import policy as _p
     saved, oc, ot = _p._CONTROLLED_ACCESS, _tc.rawls_get_workflow_cost, server.auth.get_access_token
@@ -4121,7 +4121,7 @@ def _():
         _p._CONTROLLED_ACCESS, _tc.rawls_get_workflow_cost, server.auth.get_access_token = saved, oc, ot
 
 
-@case("CC-ControlledAccess3", "upload_to_bucket returns an ack (no raw gsutil output) in controlled mode")
+@case("CC-ControlledAccessGuard", "upload_to_bucket returns an ack (no raw gsutil output) in controlled mode")
 def _():
     import os as _os
     import tempfile
@@ -4145,7 +4145,7 @@ def _():
         _os.unlink(tmp)
 
 
-@case("CC-ControlledAccess3", "terra_health withholds lock/bucket/IAM principals (sentinel) in controlled mode")
+@case("CC-ControlledAccessGuard", "terra_health withholds lock/bucket/IAM principals (sentinel) in controlled mode")
 def _():
     from mcp_terra import policy as _p
     saved, olock = _p._CONTROLLED_ACCESS, _p.resolve_locked_workspace
@@ -4168,7 +4168,7 @@ def _():
         _p._CONTROLLED_ACCESS, _p.resolve_locked_workspace = saved, olock
 
 
-@case("CC-ControlledAccess3", "write_run_record returns a minimal ack, not the full record (controlled)")
+@case("CC-ControlledAccessGuard", "write_run_record returns a minimal ack, not the full record (controlled)")
 def _():
     # The full behavioral path does bucket I/O + md5 read-back; assert at the
     # source level that controlled mode SHORT-CIRCUITS to an ack BEFORE the
@@ -4186,7 +4186,7 @@ def _():
     assert "{dest!r}" not in src.split("_rr_loc", 1)[1], "error paths must use the redacted _rr_loc, not dest"
 
 
-@case("CC-ControlledAccess3", "get_workflow_cost drops a numeric field whose KEY encodes an id (controlled)")
+@case("CC-ControlledAccessGuard", "get_workflow_cost drops a numeric field whose KEY encodes an id (controlled)")
 def _():
     from mcp_terra import policy as _p
     saved, oc, ot = _p._CONTROLLED_ACCESS, _tc.rawls_get_workflow_cost, server.auth.get_access_token
@@ -4214,26 +4214,35 @@ def _():
     # precondition (server-enforced) — NOT cp -n + read-back. Two VMs on the same
     # bucket run DIFFERENT jobs in parallel but never the SAME job twice; a stale
     # claim (owner gone) is reclaimed via compare-and-swap on the generation.
-    assert "RUNNER_INSTANCE_ID" in s and "MCP_TERRA_RUNTIME_NAME:-legacy-runner" in s
     assert 'CLAIM="$JOB_DIR/.claim"' in s
     assert 'x-goog-if-generation-match:0' in s, "must use the atomic create precondition"
     assert "x-goog-if-generation-match:$CLAIM_GEN" in s, "must reclaim via compare-and-swap"
     assert "CLAIM_TTL" in s
     assert "gsutil cp -n - \"$CLAIM\"" not in s, "the racy cp -n claim must be gone"
-    # security review r11: owner + ts stored as CUSTOM METADATA so a SINGLE stat
-    # yields owner+ts+generation from the SAME version (closes the read-old-ts /
-    # CAS-new-gen double-reclaim race); same-runtime restart reclaims by owner.
+    # security review r12: owner id is UNIQUE per instance (runtime + host + pid +
+    # boot epoch) — two VMs / the no-name fallback can never share it.
+    assert 'RUNNER_INSTANCE_ID="${MCP_TERRA_RUNTIME_NAME:-runner}.$(hostname' in s
+    assert "MCP_TERRA_RUNTIME_NAME:-legacy-runner" not in s, "shared legacy owner removed"
+    # security review r12 (critical): reclaim is STALE-AGE-ONLY — NO owner-based
+    # immediate reclaim (a shared/restarted owner can't be told from a live one).
+    assert 'CLAIM_OWNER" = "$RUNNER_INSTANCE_ID' not in s, "owner-immediate-reclaim must be gone"
     assert "x-goog-meta-claim-owner:" in s and "x-goog-meta-claim-ts:" in s
-    assert 'CLAIM_OWNER" = "$RUNNER_INSTANCE_ID' in s, "must allow same-runtime reclaim"
-    assert "claim-owner:" in s and "claim-ts:" in s  # parsed from one stat
-    # security review r10/r11: durable terminal markers — fail-CLOSED on transient
-    # read errors (obj_state), succeeded/FAILED*/result.json, not just REFUSED.
+    assert "claim-owner:" in s and "claim-ts:" in s  # parsed from ONE stat
+    # security review r12: no-metadata (pre-upgrade/foreign) claim ages out via
+    # the object Update time instead of stranding.
+    assert "Update time:" in s and "date -u -d" in s
+    # security review r10/r11/r12: durable terminal markers — fail-CLOSED on
+    # transient read errors (obj_state classifies access-denied as error FIRST).
     assert "obj_state()" in s and "RESULT_STATE" in s and "STATUS_STATE" in s
+    assert "accessdenied|access denied|permission|forbidden" in s, "auth errors must be fail-closed"
     assert "REFUSED*|succeeded|FAILED*" in s
     assert "transient error checking result" in s  # fail-closed, not fail-open
+    # security review r12: pre-run download is timeout-bounded (can't hold the
+    # claim past the stale margin).
+    assert "notebook download for $JOB_ID failed or timed out" in s
 
 
-@case("CC-ControlledAccess3", "create_runtime/stop_runtime project the Leonardo response (source)")
+@case("CC-ControlledAccessGuard", "create_runtime/stop_runtime project the Leonardo response (source)")
 def _():
     import inspect
     csrc = inspect.getsource(server.terra_create_runtime)
@@ -4248,7 +4257,7 @@ def _():
     assert '"action": "stop"' in ssrc and "controlled_access_enabled()" in ssrc
 
 
-@case("CC-ControlledAccess3", "workflow_logs flags per-task stderr truncation (no false truncated=false)")
+@case("CC-ControlledAccessGuard", "workflow_logs flags per-task stderr truncation (no false truncated=false)")
 def _():
     from mcp_terra import policy as _p, bucket as _bk2
     saved = _p._CONTROLLED_ACCESS
@@ -4276,7 +4285,7 @@ def _():
         _bk2.read_object, safety.safe_bucket_uri = oread, osafe
 
 
-@case("CC-ControlledAccess3", "list_bucket / batch / audio enforce controlled-access (source)")
+@case("CC-ControlledAccessGuard", "list_bucket / batch / audio enforce controlled-access (source)")
 def _():
     import inspect
     assert "assert_data_egress_allowed" in inspect.getsource(server.terra_list_bucket)
@@ -4287,7 +4296,7 @@ def _():
     assert "_MAX_TASKS" in wsrc and "ws_prefix" in wsrc, "workflow_logs needs caps + workspace-bucket binding"
 
 
-@case("CC-ControlledAccess3", "retry aborts on the kill-switch hook + has a total budget")
+@case("CC-ControlledAccessGuard", "retry aborts on the kill-switch hook + has a total budget")
 def _():
     from mcp_terra import terra_client as _t
     saved = _t.abort_check
@@ -4308,7 +4317,7 @@ def _():
     assert "_aborted()" in rsrc and "_deadline" in rsrc and "_req_timeout" in rsrc
 
 
-@case("CC-ControlledAccess3", "audio `say` feeds text via STDIN, never argv (no process-table egress)")
+@case("CC-ControlledAccessGuard", "audio `say` feeds text via STDIN, never argv (no process-table egress)")
 def _():
     import subprocess as _sp
     import sys
@@ -4342,7 +4351,7 @@ def _():
         _sp.run = real
 
 
-@case("CC-ControlledAccess3", "terra://health resource is minimal + data-free")
+@case("CC-ControlledAccessGuard", "terra://health resource is minimal + data-free")
 def _():
     import json as _j
     h = _j.loads(server._res_health())
