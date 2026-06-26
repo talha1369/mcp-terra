@@ -9,6 +9,16 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed (security hardening)
 
+- **First-stage boot integrity + lease-after-exit (follow-up pass).** The runner
+  object is now fetched from a **generation-pinned (immutable) GCS URI** on top of
+  its sha256 verify; the lease is **re-checked after papermill exits AND right
+  before the durable terminal write** (a stale runner writes nothing); the
+  papermill **PGID is recorded synchronously** by the setsid'd child before the
+  workload execs (no orphan-on-halt race). The first-stage `start_runner.sh`
+  residual (fetched from the co-member-writable bucket) is documented as an
+  acknowledged limitation — content-addressed + create-time sha-verified, with the
+  second stage immutable + signed.
+
 - **Runner bootstrap integrity (critical).** The VM boot script + the SSH
   bootstrap now verify the runner script against an MCP-pinned sha256 delivered
   via Leonardo customEnvironmentVariables (not writable by a bucket co-member)

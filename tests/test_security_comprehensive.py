@@ -1382,9 +1382,40 @@ def _():
 def _():
     from mcp_terra import notebook_runner as nbr
     s = nbr.runner_script_template()
-    assert "setsid timeout" in s, "papermill not in its own session/group"
+    assert "setsid sh -c" in s, "papermill not in its own session/group"
     assert "LEASE_ABORTED=1" in s and 'kill -KILL -- "-$PM_PGID"' in s
-    assert "aborted mid-run (lease loss" in s
+    assert "lease lost / halt" in s, "no lease-loss abort path"
+
+@case("CC-Hardening", "PGID recorded SYNCHRONOUSLY before the workload runs (no race)")
+def _():
+    from mcp_terra import notebook_runner as nbr
+    s = nbr.runner_script_template()
+    # the setsid'd child writes its own pid to PGID_FILE as its FIRST action,
+    # before exec'ing the workload — so there is no record-after-sleep race
+    assert 'echo $$ > "$1"; shift; exec "$@"' in s, "PGID not recorded synchronously"
+    assert 'ps -o pgid=' not in s, "stale ps-after-sleep PGID race remains"
+
+@case("CC-Hardening", "lease re-checked AFTER papermill exit + before terminal write")
+def _():
+    from mcp_terra import notebook_runner as nbr
+    s = nbr.runner_script_template()
+    # at least two post-run lease re-checks (after wait, and right before result.json)
+    assert s.count('[ -f "$LOST_CLAIM" ] || [ -f "$RUNNER_ABORT" ]') >= 3, \
+        "missing post-exit / pre-write lease re-checks"
+    assert "just before terminal write" in s
+
+@case("CC-Hardening", "runner object fetched from a generation-pinned (immutable) URI")
+def _():
+    import inspect
+    src = inspect.getsource(server)
+    assert "pin_generation=True" in src
+    assert 'f"{dest}#{_gen}"' in src, "no generation pin on the runner object"
+
+@case("CC-Hardening", "first-stage start-script residual is documented")
+def _():
+    sec = (REPO_ROOT / "SECURITY.md").read_text()
+    assert "First-stage VM start script is fetched from the workspace bucket" in sec
+    assert "co-member trust boundary" in sec
 
 @case("CC-Hardening", "kill_pool terminates recorded papermill process groups")
 def _():

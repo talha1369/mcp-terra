@@ -1079,7 +1079,14 @@ PYVERIFY
         # runner may have stale-reclaimed is never double-executed; (2) the PGID
         # is recorded so kill_pool can terminate the timeout->papermill->kernel
         # tree (not just the wrapper shell) on a VM-wide halt.
-        setsid timeout --verbose --signal=TERM --kill-after=60 "${JOB_BUDGET}s" \
+        # The setsid'd child records its OWN pid (the new session/group leader)
+        # to PGID_FILE SYNCHRONOUSLY as its first action (echo $$), BEFORE exec'ing
+        # the workload — so there is never a window where the group is running but
+        # unrecorded (kill_pool would otherwise miss it on a VM-wide halt). The
+        # workload args are passed as ARGV (not into a -c string), so values like
+        # $PARAMS_JSON cannot break quoting.
+        setsid sh -c 'echo $$ > "$1"; shift; exec "$@"' _ "$PGID_FILE" \
+            timeout --verbose --signal=TERM --kill-after=60 "${JOB_BUDGET}s" \
             env -u MCP_TERRA_RUNNER_SECRET \
             -u MCP_TERRA_ALLOW_WRITES \
             -u MCP_TERRA_WORKSPACE \
@@ -1093,13 +1100,9 @@ PYVERIFY
                       "$LOCAL_NB" "$LOCAL_OUT" \
                       > "$WORK/$JOB_ID.stdout" 2> "$WORK/$JOB_ID.stderr" &
         PM_PID=$!
-        # setsid execs in place (the caller is not a group leader), so PM_PID is
-        # the new group leader → PGID == PM_PID. Read it via ps for certainty;
-        # fall back to PM_PID.
-        sleep 1
-        PM_PGID="$(ps -o pgid= -p "$PM_PID" 2>/dev/null | tr -d ' ')"
-        [ -z "$PM_PGID" ] && PM_PGID="$PM_PID"
-        echo "$PM_PGID" > "$PGID_FILE" 2>/dev/null || true
+        # The leader pid the child just recorded == the process GROUP id.
+        PM_PGID="$(cat "$PGID_FILE" 2>/dev/null || echo "$PM_PID")"
+        case "$PM_PGID" in ''|*[!0-9]*) PM_PGID="$PM_PID" ;; esac
         while kill -0 "$PM_PID" 2>/dev/null; do
             if [ -f "$LOST_CLAIM" ] || [ -f "$RUNNER_ABORT" ]; then
                 echo "[runner] lease lost / runner abort during $JOB_ID — terminating the papermill group (prevents double-execute)." >&2
@@ -1115,12 +1118,13 @@ PYVERIFY
         rm -f "$PGID_FILE" 2>/dev/null || true
         set -e
         RUN_ENDED_AT=$(date +%s)
-        # If the lease was lost / a halt was signalled mid-run, the runner that
-        # HOLDS the claim owns the job — do NOT write a result or move the spec
-        # (result.json no-clobber is the final backstop; this avoids wasted work
-        # and a confusing duplicate terminal write).
-        if [ "$LEASE_ABORTED" -eq 1 ]; then
-            echo "[runner] $JOB_ID aborted mid-run (lease loss / halt); leaving the result + spec to the claim holder." >&2
+        # security review: re-check the lease AFTER the run too — LOST_CLAIM /
+        # RUNNER_ABORT can land AFTER papermill exits but BEFORE we synthesize +
+        # upload terminal state (the in-loop flag alone would miss that). If we no
+        # longer hold the claim, the runner that DOES owns the job: write nothing,
+        # move nothing, leave it to the durable markers.
+        if [ "$LEASE_ABORTED" -eq 1 ] || [ -f "$LOST_CLAIM" ] || [ -f "$RUNNER_ABORT" ]; then
+            echo "[runner] $JOB_ID: lease lost / halt — leaving the result + spec to the claim holder (no terminal write)." >&2
             continue
         fi
         # security review: CAUSAL session-limit detection, not a wall-clock heuristic.
@@ -1319,12 +1323,20 @@ with open(out_path, "w") as f:
     json.dump(payload, f, indent=2)
 PYRESULT
 
-        # security review: write the DURABLE terminal markers FIRST (the MCP
-        # and other runners key terminal state on result.json + status.txt), each
-        # TIMEOUT-bounded, BEFORE the larger best-effort artifact uploads — so a
-        # slow/hung artifact upload can never leave the job without a terminal
-        # marker. The lease refresher keeps our claim alive throughout. Retry the
-        # critical result.json a few times.
+        # security review: FINAL lease check immediately before the durable
+        # terminal write — result synthesis above takes time, and LOST_CLAIM /
+        # RUNNER_ABORT could have landed in that gap. If we no longer hold the
+        # claim, do NOT write result.json / status / move the spec — the claim
+        # holder owns the terminal state (result.json no-clobber is the backstop).
+        if [ -f "$LOST_CLAIM" ] || [ -f "$RUNNER_ABORT" ]; then
+            echo "[runner] $JOB_ID: lease lost just before terminal write — leaving it to the claim holder." >&2
+            continue
+        fi
+        # Write the DURABLE terminal markers FIRST (the MCP and other runners key
+        # terminal state on result.json + status.txt), each TIMEOUT-bounded, BEFORE
+        # the larger best-effort artifact uploads — so a slow/hung artifact upload
+        # can never leave the job without a terminal marker. The lease refresher
+        # keeps our claim alive throughout. Retry the critical result.json a few times.
         _result_ok=0
         for _try in 1 2 3; do
             if timeout --signal=TERM --kill-after=15 120 gsutil cp -n "$RESULT_LOCAL" "$RESULT" 2>/dev/null; then

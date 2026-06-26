@@ -684,15 +684,13 @@ def terra_create_runtime(
         except RuntimeError as e:
             raise PermissionError(str(e))
 
-        def _ensure_versioned_script(stem, body_text):
+        def _ensure_versioned_script(stem, body_text, pin_generation=False):
             # Content-addressed name: <stem>.<full-sha256>.sh — dedups by version
             # (a template change → a NEW object; no overwrite, no destruction).
             # GCS does NOT enforce name==hash(content), so an existing object is
             # NOT trusted by name: read it back and verify its sha256 equals the
             # expected digest, failing CLOSED on mismatch (catches accidental
-            # corruption AND a co-member pre-staging a tampered script). This is a
-            # create-time check; see SOP threat-model note for the residual
-            # VM-boot/resume fetch from a co-member-writable bucket.
+            # corruption AND a co-member pre-staging a tampered script).
             digest = _hashlib.sha256(body_text.encode("utf-8")).hexdigest()
             dest = f"{bucket_clean}/{nbr.JOBS_PREFIX}/{stem}.{digest}.sh"
             if safety.bucket_object_exists(dest):
@@ -707,19 +705,41 @@ def terra_create_runtime(
                         f"existing object {dest} does not match the expected "
                         f"script content (sha256 mismatch) — refusing to wire a "
                         f"possibly-tampered startup script.")
-                return dest
-            with tempfile.NamedTemporaryFile("w", suffix=".sh",
-                                             delete=False) as fh:
-                fh.write(body_text)
-                tmp = fh.name
-            try:
-                bk.upload_file(tmp, dest, recursive=False)
-            finally:
-                _os.unlink(tmp)
+            else:
+                with tempfile.NamedTemporaryFile("w", suffix=".sh",
+                                                 delete=False) as fh:
+                    fh.write(body_text)
+                    tmp = fh.name
+                try:
+                    bk.upload_file(tmp, dest, recursive=False)
+                finally:
+                    _os.unlink(tmp)
+            # security review: PIN the GCS generation for objects FETCHED BY GSUTIL
+            # on the VM (the runner). The workspace bucket is co-member-writable;
+            # a generation-pinned URI (gs://…#<gen>) makes gsutil fetch the EXACT
+            # immutable version — a co-member who later overwrites the object
+            # produces a NEW generation, so the pinned URI fetches the original (or
+            # fails closed if the bucket lacks versioning). The runner is ALSO
+            # sha256-verified on the VM, so this is defense-in-depth. NOTE: we do
+            # NOT pin the Leonardo startUserScriptUri this way — it is fetched by
+            # the runtime's own localization (not plain gsutil) and an unverified
+            # `#generation` could break create for everyone; that first-stage
+            # residual is documented in SECURITY.md (co-member trust boundary).
+            if pin_generation:
+                try:
+                    _stat = bk._run_gsutil(["stat", dest], timeout=30.0)
+                    for _ln in _stat.splitlines():
+                        if "Generation:" in _ln:
+                            _gen = _ln.split(":", 1)[1].strip()
+                            if _gen.isdigit():
+                                return f"{dest}#{_gen}"
+                            break
+                except bk.BucketError:
+                    pass
             return dest
 
         runner_obj = _ensure_versioned_script(
-            "mcp_terra_runner", nbr.runner_script_template())
+            "mcp_terra_runner", nbr.runner_script_template(), pin_generation=True)
         start_user_script_uri = _ensure_versioned_script(
             "start_runner", nbr.start_runner_script_template())
         custom_env_vars = {
