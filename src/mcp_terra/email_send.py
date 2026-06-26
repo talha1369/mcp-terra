@@ -1,8 +1,11 @@
 """Email-send helper for the MCP — strictly scoped to one purpose:
 
   Deliver an end-of-run report to the AUTH'D TERRA USER (and ONLY that
-  address). No third-party recipients, no arbitrary headers, no
-  attachments — to defeat data-exfil-via-email.
+  address). No third-party recipients, no arbitrary headers, and no ARBITRARY
+  attachments — to defeat data-exfil-via-email. The ONLY permitted attachment
+  is the run's own audio explainer (.mp3/.m4a), whose path the caller derives
+  from job_id + the locked bucket (never an arbitrary path); size-capped and
+  audio-MIME-locked here.
 
 Configuration (env, snapshotted at startup):
   MCP_TERRA_SMTP_HOST          required for live send (else file fallback)
@@ -209,8 +212,20 @@ def _validate_from_address(recipient: str) -> str:
     )
 
 
+# Attachments are NARROWLY scoped: the ONLY thing that may be attached is the
+# run's own audio explainer (.mp3/.m4a), and the caller (server tool) derives
+# its path from job_id + the locked bucket — never an arbitrary path. Combined
+# with the hard recipient-lock (mail only ever goes to the data owner), this
+# preserves the anti-exfil posture: it cannot be coerced into mailing out an
+# arbitrary file to a third party.
+_MAX_ATTACH_BYTES = 15 * 1024 * 1024
+_AUDIO_SUBTYPE = {"mp3": "mpeg", "m4a": "mp4"}   # ext -> MIME audio subtype
+
+
 def _build_message(recipient: str, subject: str, body: str,
-                    job_id: str, acknowledgment: str) -> email.message.EmailMessage:
+                    job_id: str, acknowledgment: str,
+                    audio_attachment: tuple[bytes, str] | None = None,
+                    ) -> email.message.EmailMessage:
     msg = email.message.EmailMessage()
     msg["From"] = _validate_from_address(recipient)
     msg["To"] = recipient
@@ -225,11 +240,15 @@ def _build_message(recipient: str, subject: str, body: str,
     # prompt-injection markers in the reviewer agent's text don't propagate
     # into the user's inbox.
     safe_ack = safety.sanitize_output(acknowledgment.strip())[:_MAX_ACK_LEN]
+    attach_note = ""
+    if audio_attachment is not None:
+        attach_note = "\nAn audio explainer of the results is attached.\n"
     full_body = (
         f"This is an automated end-of-run report from mcp-terra.\n"
         f"Job ID: {job_id}\n"
         f"Reviewed-by agent acknowledgment:\n"
         f"  {safe_ack}\n"
+        f"{attach_note}"
         f"\n"
         f"--- report ---\n"
         f"{body}\n"
@@ -238,6 +257,29 @@ def _build_message(recipient: str, subject: str, body: str,
         f"({recipient}). The MCP refuses to send mail to anyone else.\n"
     )
     msg.set_content(full_body)
+
+    if audio_attachment is not None:
+        data, filename = audio_attachment
+        if not isinstance(data, (bytes, bytearray)):
+            raise EmailError("audio attachment must be bytes")
+        if not data:
+            raise EmailError("audio attachment is empty")
+        if len(data) > _MAX_ATTACH_BYTES:
+            raise EmailError(
+                f"audio attachment too large ({len(data)} bytes; "
+                f"cap {_MAX_ATTACH_BYTES}).")
+        # Filename is locked to a basename + an audio extension — defense in
+        # depth even though the caller derives it.
+        safe_name = os.path.basename(str(filename))
+        if "\r" in safe_name or "\n" in safe_name:
+            raise EmailError("attachment filename contains CR/LF")
+        ext = safe_name.rsplit(".", 1)[-1].lower() if "." in safe_name else ""
+        subtype = _AUDIO_SUBTYPE.get(ext)
+        if subtype is None:
+            raise EmailError(
+                f"attachment must be an audio file (.mp3/.m4a); got {safe_name!r}")
+        msg.add_attachment(bytes(data), maintype="audio", subtype=subtype,
+                           filename=safe_name)
     return msg
 
 
@@ -349,15 +391,21 @@ def _fallback_to_file(msg: email.message.EmailMessage, job_id: str) -> dict:
 
 
 def send_run_report(*, subject: str, body: str, job_id: str,
-                     verification_acknowledgment: str) -> dict:
+                     verification_acknowledgment: str,
+                     audio_attachment: tuple[bytes, str] | None = None) -> dict:
     """Send the end-of-run report.
 
     Recipient is HARD-LOCKED to the auth'd Terra user. No `to` parameter.
+
+    audio_attachment: optional (bytes, filename) of the run's own audio
+        explainer. The caller MUST derive it from the job (never an arbitrary
+        path); only .mp3/.m4a are accepted and the size is capped.
     """
     _validate_inputs(subject, body, job_id, verification_acknowledgment)
     recipient = _safe_recipient()
     msg = _build_message(recipient, subject, body, job_id,
-                          verification_acknowledgment)
+                          verification_acknowledgment,
+                          audio_attachment=audio_attachment)
     if _smtp_configured():
         send_info = _send_via_smtp(msg)
     else:
@@ -367,5 +415,6 @@ def send_run_report(*, subject: str, body: str, job_id: str,
         "recipient": recipient,
         "subject": subject,
         "job_id": job_id,
+        "audio_attached": audio_attachment is not None,
         **send_info,
     }

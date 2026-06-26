@@ -1695,9 +1695,15 @@ def terra_get_run_log(bucket_uri: str, job_id: str,
 @server.tool(title="Send end-of-run report email (recipient-locked)",
               annotations=ANN_WRITE_NEW)
 def terra_send_run_report_email(subject: str, body: str, job_id: str,
-                                  verification_acknowledgment: str) -> str:
+                                  verification_acknowledgment: str,
+                                  attach_audio: bool = False) -> str:
     """Send the end-of-run report by email. Recipient is HARD-LOCKED to the
     Terra-authenticated user's email — there is no `to` parameter.
+
+    attach_audio: if True, attach the run's own audio explainer. Its path is
+    DERIVED from job_id + the locked bucket (mcp_terra_jobs/<job_id>/summary.
+    m4a|mp3) — never an arbitrary path — so this cannot be coerced into mailing
+    out some other file. Render it first with terra_render_audio_summary.
 
     *** WRITE-class operation (network side-effect) — gated by writes_allowed. ***
 
@@ -1731,11 +1737,52 @@ def terra_send_run_report_email(subject: str, body: str, job_id: str,
     and returning the path for manual delivery.
     """
     _pre("terra_send_run_report_email", WRITE_SAFE,
-         f"job={job_id} subject={subject[:80]!r}")
+         f"job={job_id} subject={subject[:80]!r} attach_audio={attach_audio}")
+
+    # Optionally attach the run's OWN audio explainer. The path is derived from
+    # job_id + the locked bucket and fixed to summary.{m4a,mp3} — the agent
+    # cannot point this at an arbitrary object (exfil-safe; recipient is also
+    # hard-locked to the data owner).
+    audio_attachment = None
+    if attach_audio:
+        safety.validate_identifier(job_id, "job_id")   # path component — no traversal
+        _lk = policy.resolve_locked_workspace()
+        if not _lk or not _lk.get("bucketName"):
+            raise ValueError("attach_audio requires a workspace lock to locate the audio")
+        _adir = f"gs://{_lk['bucketName']}/{nbr.JOBS_PREFIX}/{job_id}"
+        _found = None
+        for _ext in ("m4a", "mp3"):
+            _cand = f"{_adir}/summary.{_ext}"
+            if safety.bucket_object_exists(_cand):
+                _found = (_cand, _ext)
+                break
+        if _found is None:
+            raise ValueError(
+                f"no audio explainer found for job {job_id} "
+                f"(expected summary.m4a or summary.mp3 in the bucket). Render it "
+                f"first with terra_render_audio_summary.")
+        _cand, _ext = _found
+        import os as _os_em
+        import tempfile as _tf_em
+        fd, _tmp = _tf_em.mkstemp(prefix="mcp_audio_em_", suffix=f".{_ext}")
+        _os_em.close(fd)
+        _os_em.unlink(_tmp)                 # free the name so gsutil cp -n can write it
+        try:
+            bk.download_file(_cand, _tmp)
+            with open(_tmp, "rb") as _fh:
+                _audio_bytes = _fh.read()
+        finally:
+            try:
+                _os_em.unlink(_tmp)         # never leave the audio blob on disk
+            except OSError:
+                pass
+        audio_attachment = (_audio_bytes, f"summary.{_ext}")
+
     try:
         info = email_send.send_run_report(
             subject=subject, body=body, job_id=job_id,
             verification_acknowledgment=verification_acknowledgment,
+            audio_attachment=audio_attachment,
         )
     except email_send.EmailError as e:
         # Sanitize the message — could contain SMTP host names etc.

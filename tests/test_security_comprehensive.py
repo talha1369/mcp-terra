@@ -2882,6 +2882,64 @@ def _():
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# CC-AudioAttach — audio explainer as an email attachment (exfil-safe: only the
+# run's own audio, path derived from job_id; no arbitrary attachments)
+# ──────────────────────────────────────────────────────────────────────────
+from mcp_terra import email_send as _es_aa
+
+
+@case("CC-AudioAttach", "email attaches audio as an audio/* MIME part")
+def _():
+    msg = _es_aa._build_message("u@x.org", "subj", "body text", "job-1",
+                                "x" * 60,
+                                audio_attachment=(b"fake-audio-bytes" * 30, "summary.m4a"))
+    assert msg.is_multipart(), "must be multipart when an attachment is present"
+    cts = [p.get_content_type() for p in msg.iter_parts()]
+    assert any(ct.startswith("audio/") for ct in cts), f"no audio/* part: {cts}"
+
+
+@case("CC-AudioAttach", "email refuses a NON-audio attachment extension (anti-exfil)")
+def _():
+    must_raise(_es_aa._build_message, _es_aa.EmailError,
+               "u@x.org", "s", "b", "job-1", "x" * 60,
+               audio_attachment=(b"#!/bin/sh\nevil" * 10, "exfil.sh"))
+
+
+@case("CC-AudioAttach", "email refuses an oversized / empty audio attachment")
+def _():
+    must_raise(_es_aa._build_message, _es_aa.EmailError,
+               "u@x.org", "s", "b", "job-1", "x" * 60,
+               audio_attachment=(b"A" * (16 * 1024 * 1024), "summary.mp3"))
+    must_raise(_es_aa._build_message, _es_aa.EmailError,
+               "u@x.org", "s", "b", "job-1", "x" * 60,
+               audio_attachment=(b"", "summary.m4a"))
+
+
+@case("CC-AudioAttach", "no-attachment email stays single-part (default behavior)")
+def _():
+    msg = _es_aa._build_message("u@x.org", "subj", "body", "job-1", "x" * 60)
+    assert not msg.is_multipart(), "report with no attachment must stay single-part"
+
+
+@case("CC-AudioAttach", "send_run_report exposes audio_attached flag")
+def _():
+    import inspect
+    src = inspect.getsource(_es_aa.send_run_report)
+    assert "audio_attached" in src and "audio_attachment" in src
+
+
+@case("CC-AudioAttach", "email tool DERIVES the audio path from job_id (never arbitrary)")
+def _():
+    import inspect
+    src = inspect.getsource(server.terra_send_run_report_email)
+    # path is built from job_id + locked bucket, fixed to summary.{ext}
+    assert 'summary.{_ext}' in src and "bucket_object_exists(_cand)" in src
+    assert 'validate_identifier(job_id' in src, "job_id must be path-validated for attach"
+    # temp blob is always cleaned up (Codex-style hygiene)
+    assert "unlink(_tmp)" in src and "finally:" in src
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # RUN
 # ──────────────────────────────────────────────────────────────────────────
 

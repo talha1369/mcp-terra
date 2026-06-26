@@ -27,7 +27,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     secret-scanned before send.
   - **Audio explainer** stays `terra_render_audio_summary` (Cloud TTS, with the
     `X-Goog-User-Project` quota-project header) — render "what the results mean"
-    from the run record's verified `results[]`.
+    from the run record's verified `results[]`. A **macOS `say` fallback** makes
+    audio work with no Cloud-TTS IAM (renders a local `.m4a`).
+  - **Audio email attachment** — `terra_send_run_report_email(attach_audio=True)`
+    attaches the run's OWN audio explainer. The path is derived from `job_id` +
+    the locked bucket and fixed to `summary.{m4a,mp3}` (never an arbitrary
+    path), audio-MIME-locked, and size-capped — so the long-standing "no
+    arbitrary attachments" anti-exfil invariant holds. (Slack file upload is
+    NOT possible via an incoming webhook — the Slack ping links the audio; true
+    Slack upload needs a bot token + `files:write`.)
 
 - **Read-only superset of `broadinstitute/fiss-mcp`** — nine new READ-class
   tools (no spend, no write, no destruction) close fiss-mcp's read-side lead so
