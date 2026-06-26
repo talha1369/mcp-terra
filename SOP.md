@@ -3,8 +3,7 @@
 **For anyone who wants to run notebooks on Terra through an MCP-aware AI
 assistant with strong safety guarantees.**
 
-> New here? The 1-minute "why" is in [`README.md`](README.md); a 5-minute pitch
-> deck is at [`docs/pitch/index.html`](docs/pitch/index.html). This SOP is the
+> New here? The 1-minute "why" is in [`README.md`](README.md). This SOP is the
 > operational detail.
 
 This SOP covers the full workflow end-to-end: first-time setup, daily use,
