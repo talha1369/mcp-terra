@@ -227,7 +227,7 @@ def terra_list_workspaces() -> str:
     if lock is not None:
         rows = [r for r in rows
                 if r["namespace"] == lock["namespace"] and r["name"] == lock["name"]]
-    # security review r6: workspace namespace/name are user-controlled identifiers that
+    # security review: workspace namespace/name are user-controlled identifiers that
     # could encode subject/cohort/consent ids. In controlled mode, only the
     # LOCKED workspace is disclosed; with no lock, return a count only.
     if policy.controlled_access_enabled() and lock is None:
@@ -261,7 +261,7 @@ def terra_get_workspace(namespace: str, name: str) -> str:
     _pre("terra_get_workspace", READ, f"{namespace}/{name}")
     token = auth.get_access_token()
     ws = tc.rawls_get_workspace(token, namespace, name)
-    # security review round-5: workspace.attributes is an operator free-form bag that can
+    # security review: workspace.attributes is an operator free-form bag that can
     # encode identifiers (sample descriptions, consent/DUO codes). In guard mode
     # withhold it; keep the system-generated operational identifiers (bucket,
     # project, access level) that downstream tools need.
@@ -313,7 +313,7 @@ def terra_list_runtimes(google_project: str = "") -> str:
     token = auth.get_access_token()
     runtimes = _redact_runtime_env(
         tc.leo_list_runtimes(token, google_project=google_project or None))
-    # security review r7: runtime NAMES/labels/URLs are user-controlled and can encode
+    # security review: runtime NAMES/labels/URLs are user-controlled and can encode
     # cohort/sample ids. In guard mode return count + statuses only (no names).
     if policy.controlled_access_enabled():
         statuses = ([(r or {}).get("status") for r in runtimes]
@@ -345,7 +345,7 @@ def terra_get_runtime(google_project: str, runtime_name: str) -> str:
     _pre("terra_get_runtime", READ, f"{google_project}/{runtime_name}")
     token = auth.get_access_token()
     rt = _redact_runtime_env(tc.leo_get_runtime(token, google_project, runtime_name))
-    # security review r7: keep only the caller-supplied name + status + machine config;
+    # security review: keep only the caller-supplied name + status + machine config;
     # withhold labels / proxy URLs / creator (auditInfo) — operator-controlled
     # strings that can encode identifiers.
     if policy.controlled_access_enabled() and isinstance(rt, dict):
@@ -382,7 +382,7 @@ def terra_start_runtime(google_project: str, runtime_name: str) -> str:
     token = auth.get_access_token()
     resp = tc.leo_start_runtime(token, google_project, runtime_name)
     if policy.controlled_access_enabled():
-        # security review r8: a Leonardo response can carry labels/proxyUrl/creator —
+        # security review: a Leonardo response can carry labels/proxyUrl/creator —
         # return a minimal ack (caller-echoed name + the requested action).
         return _ok({"runtimeName": runtime_name, "action": "start",
                     "_controlled_access_withheld":
@@ -407,7 +407,7 @@ def terra_stop_runtime(google_project: str, runtime_name: str) -> str:
     token = auth.get_access_token()
     resp = tc.leo_stop_runtime(token, google_project, runtime_name)
     if policy.controlled_access_enabled():
-        # security review r8: minimal ack (caller-echoed name + action); no raw Leo payload.
+        # security review: minimal ack (caller-echoed name + action); no raw Leo payload.
         return _ok({"runtimeName": runtime_name, "action": "stop",
                     "_controlled_access_withheld":
                         "Leonardo response withheld (MCP_TERRA_CONTROLLED_ACCESS)."})
@@ -459,7 +459,7 @@ def terra_recommend_runtime_for_notebook(notebook_gcs: str) -> str:
         raise safety.SafetyError(
             f"notebook_gcs must end in '.ipynb'; got {notebook_gcs!r}"
         )
-    # security review r7: this `gsutil cat`s the notebook bytes into the LOCAL MCP process.
+    # security review: this `gsutil cat`s the notebook bytes into the LOCAL MCP process.
     # A controlled notebook can contain outputs/paths/sample ids — so in guard
     # mode refuse unless the bucket is public/allowlisted (same rule as read/
     # download). The recommendation could otherwise pull controlled data out.
@@ -731,7 +731,7 @@ def terra_create_runtime(
             # Auto-install Claude Code on the VM for on-VM live coding (the
             # start script does this best-effort, backgrounded; auth per-user).
             "MCP_TERRA_INSTALL_CLAUDE": "1" if install_claude_code else "0",
-            # security review r5: propagate the operator's session-budget policy so the
+            # security review: propagate the operator's session-budget policy so the
             # on-VM runner ENFORCES the same ~24h window the MCP advertises
             # (otherwise the runner silently used its built-in default).
             "MCP_TERRA_MAX_RUN_HOURS": str(policy.max_run_hours()),
@@ -753,7 +753,7 @@ def terra_create_runtime(
     # Never echo the secret back (Leonardo's create response may include the
     # customEnvironmentVariables we just sent).
     create_resp = _redact_runtime_env(create_resp)
-    # security review r8: in guard mode don't echo the raw Leonardo payload (labels/
+    # security review: in guard mode don't echo the raw Leonardo payload (labels/
     # proxyUrl/creator/config) — keep a minimal caller-echoed ack. Applies to
     # BOTH the early return and the embedded leo_create_response below.
     if policy.controlled_access_enabled():
@@ -823,7 +823,7 @@ def terra_create_runtime(
         time.sleep(10)
 
     if hb_age is None or hb_age >= 30:
-        # security review r10: in controlled mode the error must NOT expose the bucket-
+        # security review: in controlled mode the error must NOT expose the bucket-
         # derived heartbeat path or the runner log tail (it can echo bucket/
         # project/path strings) — surface a generic, path-free failure instead.
         if policy.controlled_access_enabled():
@@ -859,9 +859,9 @@ def terra_create_runtime(
                     "no manual runner startup needed."),
         "leo_create_response": create_resp,
     }
-    # security review r9: bucket_uri may be DERIVED from the locked workspace, so it can
+    # security review: bucket_uri may be DERIVED from the locked workspace, so it can
     # disclose the locked bucket in guard mode — withhold it here too (the
-    # round-8 projection only covered leo_create_response, not this ready block).
+    # the earlier projection only covered leo_create_response, not this ready block).
     if policy.controlled_access_enabled():
         ready.pop("bucket_uri", None)
         ready["_controlled_access_withheld"] = (
@@ -1024,7 +1024,7 @@ def terra_upload_to_bucket(local_path: str, bucket_uri: str,
     if dest_exists and version_existing:
         safety.version_existing_bucket(effective_dest, method=version_method)
     up = bk.upload_file(local_path, bucket_uri, recursive=recursive)
-    # security review r8: raw `gsutil cp` output can enumerate object paths (esp. recursive).
+    # security review: raw `gsutil cp` output can enumerate object paths (esp. recursive).
     # In guard mode return a minimal ack (the destination is the caller's own
     # argument); the raw output is back-compat for non-controlled deployments.
     if policy.controlled_access_enabled():
@@ -1065,7 +1065,7 @@ def terra_download_from_bucket(bucket_uri: str, local_path: str,
     if version_method not in ("timestamp", "bak"):
         raise ValueError("version_method must be 'timestamp' or 'bak'")
     safety.safe_bucket_uri(bucket_uri)
-    # security review round-5: downloading pulls the actual object BYTES out of Terra onto
+    # security review: downloading pulls the actual object BYTES out of Terra onto
     # the local (possibly non-NIST-800-171) host — the largest egress of all. In
     # guard mode refuse unless the bucket is an EXACT-name public/allowlisted one
     # (same rule as terra_read_bucket_object). GDS/DUC: controlled data stays in
@@ -2273,7 +2273,7 @@ def terra_health() -> str:
         "tools_count": len(tools_index),
         "tools_index": tools_index,
     }
-    # security review r9/r10: terra_health is directly LLM-callable. In guard mode build a
+    # security review: terra_health is directly LLM-callable. In guard mode build a
     # fresh ALLOWLISTED snapshot — booleans / counts / status / generic
     # remediation ONLY — instead of subtractively mutating the full dict (which
     # left absolute paths: kill_file, audit_log; plus the domain sample, code
@@ -2337,7 +2337,7 @@ def terra_list_method_configs(namespace: str, name: str) -> str:
     _pre("terra_list_method_configs", READ, f"{namespace}/{name}")
     token = auth.get_access_token()
     mcs = tc.rawls_list_method_configs(token, namespace, name)
-    # security review round-5: config names + method refs are operator-controlled strings
+    # security review: config names + method refs are operator-controlled strings
     # that could encode identifiers — in guard mode return the COUNT only.
     if policy.controlled_access_enabled():
         mcs = {
@@ -2391,7 +2391,7 @@ def terra_submit_workflow(namespace: str, name: str,
         entity_type=entity_type or None,
         entity_name=entity_name or None,
         use_call_cache=use_call_cache)
-    # security review r8: the createSubmission response echoes methodConfigurationName +
+    # security review: the createSubmission response echoes methodConfigurationName +
     # submissionEntity (operator/user-controlled). In guard mode project to
     # ids + status only.
     if policy.controlled_access_enabled() and isinstance(sub, dict):
@@ -2483,7 +2483,7 @@ def terra_list_data_tables(namespace: str, name: str) -> str:
     _pre("terra_list_data_tables", READ, f"{namespace}/{name}")
     token = auth.get_access_token()
     dts = tc.rawls_list_data_tables(token, namespace, name)
-    # security review r6: data-table SCHEMA (entity-type names, attribute names, id-column)
+    # security review: data-table SCHEMA (entity-type names, attribute names, id-column)
     # is operator-controlled and can encode identifiers. In guard mode return
     # table COUNT + the (anonymous, sorted) row counts only — no names.
     if policy.controlled_access_enabled():
@@ -2565,7 +2565,7 @@ def terra_list_submissions(namespace: str, name: str) -> str:
     _pre("terra_list_submissions", READ, f"{namespace}/{name}")
     token = auth.get_access_token()
     subs = tc.rawls_list_submissions(token, namespace, name)
-    # security review r6: submission listings carry methodConfigurationName/Namespace +
+    # security review: submission listings carry methodConfigurationName/Namespace +
     # submissionEntity names (operator/user-controlled, can encode identifiers).
     # In guard mode project each to non-identifying ids/status/date + workflow
     # status COUNTS only.
@@ -2712,11 +2712,11 @@ def terra_get_workflow_cost(namespace: str, name: str,
     token = auth.get_access_token()
     cost = tc.rawls_get_workflow_cost(token, namespace, name,
                                       submission_id, workflow_id)
-    # security review r8: the cost payload could carry workflowName / methodConfigurationName
+    # security review: the cost payload could carry workflowName / methodConfigurationName
     # / entity ids. In guard mode keep ONLY numeric cost fields + the caller's own
     # ids (workflowId is the caller's argument).
     if policy.controlled_access_enabled() and isinstance(cost, dict):
-        # security review r9/r10/r11: numeric-only AND an EXACT key allowlist (not
+        # security review: numeric-only AND an EXACT key allowlist (not
         # a substring heuristic — "subjectAliceCost" would have passed). Only
         # these known, non-identifying cost keys are returned; anything else
         # (incl. a schema-drifted or identifier-bearing key) is dropped.
@@ -2786,7 +2786,7 @@ def terra_get_workflow_logs(namespace: str, name: str,
     _TOTAL_BYTE_BUDGET = 1024 * 1024     # 1 MiB total across all task stderr reads
     tasks: list[dict] = []
     truncated = False          # task-count / aggregate-byte-budget limit (BREAKS iteration)
-    content_truncated = False  # a single stderr was truncated (does NOT break — security review r5)
+    content_truncated = False  # a single stderr was truncated (does NOT break — security review)
     bytes_used = 0
     for call_name, shards in calls.items():
         if truncated:
@@ -2871,7 +2871,7 @@ def terra_get_method_config(namespace: str, name: str,
     mc = tc.rawls_get_method_config(token, namespace, name,
                                     config_namespace, config_name)
     # Controlled-access: direct-input configs embed literal VALUES (sample ids,
-    # gs:// paths). security review round-4 also flagged that the input/output KEY NAMES
+    # gs:// paths). security review also flagged that the input/output KEY NAMES
     # are operator-controlled free text that could themselves encode identifiers
     # (sample/DUO/consent ids, object-prefix hints). So in guard mode we drop the
     # key-name lists entirely and return only param COUNTS plus the method
@@ -2879,7 +2879,7 @@ def terra_get_method_config(namespace: str, name: str,
     # which is enough to select/verify a config. (config_namespace/config_name
     # are echoes of the caller's OWN arguments — no new disclosure.)
     if policy.controlled_access_enabled() and isinstance(mc, dict):
-        # security review round-5: method NAMESPACE/NAME and rootEntityType are ALSO
+        # security review: method NAMESPACE/NAME and rootEntityType are ALSO
         # operator-controlled free text that could encode an identifier — so in
         # guard mode keep ONLY non-identifying fields: the caller's own config
         # namespace/name (already known to them), the integer method version,
@@ -2948,14 +2948,14 @@ def terra_get_bucket_object_metadata(bucket_uri: str) -> str:
     safety.safe_bucket_uri(bucket_uri)
     _pre("terra_get_bucket_object_metadata", READ, bucket_uri)
     stat_text = bk.stat_object(bucket_uri)
-    # security review round-5: `gsutil stat` includes a custom-Metadata block that can
+    # security review: `gsutil stat` includes a custom-Metadata block that can
     # carry operator-set identifiers. In guard mode keep ONLY the non-identifying
     # integrity fields (size / hash / type / times / class) and drop the rest.
     if policy.controlled_access_enabled() and isinstance(stat_text, str):
-        # security review r6: match EXACT safe labels at the start of the (stripped) line
+        # security review: match EXACT safe labels at the start of the (stripped) line
         # — NOT a substring anywhere — and STOP at the custom "Metadata:" block,
         # so a key like `x-goog-meta-Content-Type-NA12878:` can't slip through.
-        # security review r7: Content-Type is operator-SETTABLE object metadata (e.g.
+        # security review: Content-Type is operator-SETTABLE object metadata (e.g.
         # `application/x-NA12878`) — withhold it too. Keep only fields that are
         # numeric/enum/hash/timestamp and cannot carry a free-form identifier.
         _safe_labels = ("Content-Length:", "Storage class:",
@@ -3127,7 +3127,7 @@ def terra_write_run_record(run_id: str, record_json: str,
     # No-clobber PREFLIGHT: refuse loudly on an existing record rather than let
     # `gsutil cp -n` silently skip while we report success. Records are
     # immutable provenance. (security review finding.)
-    # security review r11: in controlled mode these failure messages must NOT
+    # security review: in controlled mode these failure messages must NOT
     # echo `dest` (a bucket path) to the LLM, just like the success ack.
     _rr_loc = "[withheld]" if policy.controlled_access_enabled() else repr(dest)
     if safety.bucket_object_exists(dest):
@@ -3143,7 +3143,7 @@ def terra_write_run_record(run_id: str, record_json: str,
     try:
         with _os_rr.fdopen(fd, "w") as fh:
             fh.write(blob)
-        # security review r12: in controlled mode a raw bk.BucketError (gsutil
+        # security review: in controlled mode a raw bk.BucketError (gsutil
         # stderr) can echo the dest bucket URI — catch + re-raise path-redacted,
         # preserving fail-loud behaviour without leaking the path.
         try:
@@ -3179,7 +3179,7 @@ def terra_write_run_record(run_id: str, record_json: str,
             _os_rr.unlink(tmp)
         except OSError:
             pass
-    # security review r10: `rec` is the FULL enriched record — it carries the locked
+    # security review: `rec` is the FULL enriched record — it carries the locked
     # workspace ns/name/project/bucket AND the caller's descriptive body (which
     # can hold controlled results). `dest` is a bucket path. In guard mode return
     # only a minimal write ack (no bucket path, no record body).
@@ -3306,7 +3306,7 @@ def terra_register_method(method_namespace: str, method_name: str,
     token = auth.get_access_token()
     reg = tc.agora_register_method(token, method_namespace, method_name, wdl,
                                    synopsis=synopsis)
-    # security review r8: the Agora response echoes the WDL payload + synopsis + method
+    # security review: the Agora response echoes the WDL payload + synopsis + method
     # namespace/name. In guard mode return only the (integer) snapshot id.
     if policy.controlled_access_enabled() and isinstance(reg, dict):
         reg = {
@@ -3359,7 +3359,7 @@ def terra_create_method_config(namespace: str, name: str,
         method_namespace=method_namespace, method_name=method_name,
         method_version=method_version, inputs=inputs, outputs=outputs,
         root_entity_type=root_entity_type or None)
-    # security review r8: the created-config response echoes inputs/outputs maps,
+    # security review: the created-config response echoes inputs/outputs maps,
     # rootEntityType, and method/config names. In guard mode return a minimal
     # ack with the caller's own config namespace/name only.
     if policy.controlled_access_enabled() and isinstance(mc_resp, dict):
@@ -3540,7 +3540,7 @@ def terra_refresh_workspace_allowlist() -> str:
     """
     _pre("terra_refresh_workspace_allowlist", READ, "Rawls bucket refresh")
     fresh = safety.force_refresh_bucket_allowlist()
-    # security review r8: `fresh` is the FULL Rawls allowlist across ALL visible
+    # security review: `fresh` is the FULL Rawls allowlist across ALL visible
     # workspaces — even with a lock set, returning it leaks other workspaces'
     # bucket names. In guard mode ALWAYS return the count only.
     if policy.controlled_access_enabled():

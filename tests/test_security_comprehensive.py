@@ -3175,7 +3175,7 @@ def _():
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# CC-ControlledAccessEgress — round-3 fixes: close ALL controlled-access egress
+# CC-ControlledAccessEgress — close ALL controlled-access egress
 # paths + exact-name public allowlist. Tests EXECUTE the documented bypasses.
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -3483,7 +3483,7 @@ def _():
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# CC-ControlledAccessGuard — round-4 egress closure across ALL data-returning tools
+# CC-ControlledAccessGuard — egress closure across ALL data-returning tools
 # ──────────────────────────────────────────────────────────────────────────
 
 # Every registered tool MUST be explicitly classified into exactly one of these
@@ -3492,36 +3492,36 @@ def _():
 # can't satisfy it). NO_DATA tools are writes/control/notifications/metadata/
 # schema/status/cost that do not egress workspace data rows/objects to the model.
 # A NEW tool that is not added to either set FAILS the meta-test (fail-closed):
-# the author must classify it, and if it returns data, guard it. (security review round-4.)
+# the author must classify it, and if it returns data, guard it. (security review.)
 _DATA_TOOLS_REQUIRING_GUARD = {
     "terra_read_bucket_object", "terra_list_bucket", "terra_get_entities",
     "terra_get_method_config", "terra_get_submission", "terra_get_workflow_outputs",
     "terra_get_workflow_metadata", "terra_get_workflow_logs", "terra_get_run_log",
     "terra_get_notebook_job_result", "terra_get_batch_job_status",
     "terra_render_audio_summary",
-    # security review r5: these return UNPROJECTED Rawls/gsutil payloads that can carry
+    # security review: these return UNPROJECTED Rawls/gsutil payloads that can carry
     # operator-controlled identifiers (workspace attributes, config names/refs,
     # custom object metadata) or pull the bytes to local disk → guarded + tested.
     "terra_get_workspace", "terra_list_method_configs",
     "terra_get_bucket_object_metadata", "terra_download_from_bucket",
-    # security review r6: listings whose payloads carry operator/user-controlled strings
+    # security review: listings whose payloads carry operator/user-controlled strings
     # (workspace names, data-table schema, methodConfigurationName) → guarded.
     "terra_list_workspaces", "terra_list_data_tables", "terra_list_submissions",
     "terra_summarize_submissions",
-    # security review r7: runtime names/labels/URLs are user-controlled; recommend cats the
+    # security review: runtime names/labels/URLs are user-controlled; recommend cats the
     # notebook bytes locally; refresh enumerates bucket names → all guarded.
     "terra_list_runtimes", "terra_get_runtime",
     "terra_recommend_runtime_for_notebook", "terra_refresh_workspace_allowlist",
-    # security review r8: write/lifecycle RETURN VALUES echo operator-controlled strings
+    # security review: write/lifecycle RETURN VALUES echo operator-controlled strings
     # (createSubmission method/entity names, WDL payload, config inputs/outputs,
     # Leonardo labels/URLs, cost workflow names) → projected + guarded.
     "terra_submit_workflow", "terra_register_method", "terra_create_method_config",
     "terra_create_runtime", "terra_start_runtime", "terra_stop_runtime",
     "terra_get_workflow_cost", "terra_upload_to_bucket",
-    # security review r9: terra_health returns workspace_lock + bucket/heartbeat paths + IAM
+    # security review: terra_health returns workspace_lock + bucket/heartbeat paths + IAM
     # writer principals — projected to booleans/counts/status in guard mode.
     "terra_health",
-    # security review r10: write_run_record returns the FULL enriched record (workspace
+    # security review: write_run_record returns the FULL enriched record (workspace
     # identifiers + caller body) — projected to a minimal ack in guard mode.
     "terra_write_run_record",
 }
@@ -3542,7 +3542,7 @@ _NO_DATA_TOOLS = {
 # _NO_DATA tools that DO call a remote service (tc.*/bk.*) but provably return
 # only an ack / caller-echo / the caller's OWN identity — NOT workspace data.
 # A new _NO_DATA tool that calls a remote service must be added here deliberately
-# (fail-closed), which forces a human to confirm it doesn't leak. (security review r9.)
+# (fail-closed), which forces a human to confirm it doesn't leak. (security review.)
 _NO_DATA_REMOTE_OK = {
     "terra_whoami",                  # caller's own Sam/gcloud identity
     "terra_submit_notebook_job",     # job_id + gcs paths under the caller's OWN bucket_uri arg
@@ -3590,7 +3590,7 @@ def _raw_returns_remote_service(fn) -> bool:
     """True if the tool returns a raw remote-service (tc.*/bk.*) payload to _ok —
     either directly (`return _ok(tc.x())`) OR via a local var tainted by a remote
     call (`r = tc.x(); return _ok(r)`). Catches the write/lifecycle leak class
-    (security review r8) + the local-var shape (security review r9). AST-based, ignores docstrings."""
+    (security review) + the local-var shape (security review). AST-based, ignores docstrings."""
     import ast
     import inspect
     try:
@@ -3618,7 +3618,7 @@ def _raw_returns_remote_service(fn) -> bool:
 
 
 def _calls_remote_service(fn) -> bool:
-    """True if the tool makes ANY tc.*/bk.* remote-service call (security review r9). Used
+    """True if the tool makes ANY tc.*/bk.* remote-service call (security review). Used
     to keep the _NO_DATA set fail-closed: a no-data tool that touches a remote
     service must be explicitly justified in _NO_DATA_REMOTE_OK."""
     import ast
@@ -3638,7 +3638,7 @@ def _calls_remote_service(fn) -> bool:
 
 @case("CC-ControlledAccessGuard", "META(fail-closed): no _NO_DATA tool raw-returns a remote payload")
 def _():
-    # security review r8 root cause: _NO_DATA tools were trusted to not leak, but several
+    # security review root cause: _NO_DATA tools were trusted to not leak, but several
     # raw-returned a Rawls/Leonardo/gsutil response (write/lifecycle paths).
     # A _NO_DATA tool must NOT pass a raw remote payload to the LLM — it must
     # project (and move to the guarded set). The only allowed raw return is the
@@ -3654,7 +3654,7 @@ def _():
 
 @case("CC-ControlledAccessGuard", "META(fail-closed): _NO_DATA tools make no UNjustified remote call")
 def _():
-    # security review r9: the raw-return check missed remote-derived data reaching _ok via
+    # security review: the raw-return check missed remote-derived data reaching _ok via
     # dicts/helpers/subprocess. Stronger rule: a _NO_DATA tool may call a remote
     # service ONLY if explicitly justified in _NO_DATA_REMOTE_OK (each returns an
     # ack / caller-echo / own identity). A new no-data tool that touches tc.*/bk.*
@@ -4182,7 +4182,7 @@ def _():
         out = server.terra_health()
         assert SENTINEL not in out, "terra_health leaked the locked bucket name!"
         assert "proj" not in out, "terra_health leaked the google project!"
-        # security review r10: absolute local paths + inventories must be gone too
+        # security review: absolute local paths + inventories must be gone too
         assert str(_p.KILL_FILE) not in out, "terra_health leaked the kill_file path!"
         assert str(_p.AUDIT_LOG) not in out, "terra_health leaked the audit_log path!"
         assert "tools_index" not in out and "code_integrity" not in out
@@ -4204,7 +4204,7 @@ def _():
     ack_idx = src.index('"written": True')
     full_idx = src.index('"run_record": rec')
     assert ack_idx < full_idx, "controlled ack must short-circuit before the full record"
-    # security review r11: the FAILURE paths (existing-record, md5 mismatch) must
+    # security review: the FAILURE paths (existing-record, md5 mismatch) must
     # also redact the bucket path (dest) in controlled mode.
     assert "_rr_loc" in src and 'if policy.controlled_access_enabled() else repr(dest)' in src
     assert "{dest!r}" not in src.split("_rr_loc", 1)[1], "error paths must use the redacted _rr_loc, not dest"
@@ -4234,7 +4234,7 @@ def _():
 def _():
     from mcp_terra import notebook_runner as nbr
     s = nbr.runner_script_template()
-    # security review r10: a REAL atomic create-if-absent via the GCS generation
+    # security review: a REAL atomic create-if-absent via the GCS generation
     # precondition (server-enforced) — NOT cp -n + read-back. Two VMs on the same
     # bucket run DIFFERENT jobs in parallel but never the SAME job twice; a stale
     # claim (owner gone) is reclaimed via compare-and-swap on the generation.
@@ -4243,25 +4243,25 @@ def _():
     assert "x-goog-if-generation-match:$CLAIM_GEN" in s, "must reclaim via compare-and-swap"
     assert "CLAIM_TTL" in s
     assert "gsutil cp -n - \"$CLAIM\"" not in s, "the racy cp -n claim must be gone"
-    # security review r12: owner id is UNIQUE per instance (runtime + host + pid +
+    # security review: owner id is UNIQUE per instance (runtime + host + pid +
     # boot epoch) — two VMs / the no-name fallback can never share it.
     assert 'RUNNER_INSTANCE_ID="${MCP_TERRA_RUNTIME_NAME:-runner}.$(hostname' in s
     assert "MCP_TERRA_RUNTIME_NAME:-legacy-runner" not in s, "shared legacy owner removed"
-    # security review r12 (critical): reclaim is STALE-AGE-ONLY — NO owner-based
+    # security review: reclaim is STALE-AGE-ONLY — NO owner-based
     # immediate reclaim (a shared/restarted owner can't be told from a live one).
     assert 'CLAIM_OWNER" = "$RUNNER_INSTANCE_ID' not in s, "owner-immediate-reclaim must be gone"
     assert "x-goog-meta-claim-owner:" in s and "x-goog-meta-claim-ts:" in s
     assert "claim-owner:" in s and "claim-ts:" in s  # parsed from ONE stat
-    # security review r12: no-metadata (pre-upgrade/foreign) claim ages out via
+    # security review: no-metadata (pre-upgrade/foreign) claim ages out via
     # the object Update time instead of stranding.
     assert "Update time:" in s and "date -u -d" in s
-    # security review r10/r11/r12: durable terminal markers — fail-CLOSED on
+    # security review: durable terminal markers — fail-CLOSED on
     # transient read errors (obj_state classifies access-denied as error FIRST).
     assert "obj_state()" in s and "RESULT_STATE" in s and "STATUS_STATE" in s
     assert "accessdenied|access denied|permission|forbidden" in s, "auth errors must be fail-closed"
     assert "REFUSED*|succeeded|FAILED*" in s
     assert "transient error checking result" in s  # fail-closed, not fail-open
-    # security review r13: LEASE HEARTBEAT — a background refresher CAS-updates the
+    # security review: LEASE HEARTBEAT — a background refresher CAS-updates the
     # claim every CLAIM_REFRESH_SEC for the whole job so a live owner is never
     # reclaimed mid-run; a crashed owner ages out fast (TTL = 3x refresh).
     assert "CLAIM_REFRESH_SEC" in s and "CLAIM_TTL=$(( CLAIM_REFRESH_SEC * 3 ))" in s
@@ -4270,7 +4270,7 @@ def _():
     # the refresher must be stopped at the TOP of each spec iteration (covers all
     # continue paths so it can never strand a claim)
     assert s.index("stop_refresher\n        JOB_DIR=") > 0 or "stop_refresher\n        JOB_DIR" in s
-    # security review r12: pre-run download is timeout-bounded (can't hold the
+    # security review: pre-run download is timeout-bounded (can't hold the
     # claim past the stale margin).
     assert "notebook download for $JOB_ID failed or timed out" in s
 
@@ -4280,10 +4280,10 @@ def _():
     import inspect
     csrc = inspect.getsource(server.terra_create_runtime)
     assert 'create_resp = {' in csrc and "controlled_access_enabled()" in csrc
-    # security review r9: the auto-start "ready" block must ALSO drop the (lock-derived)
+    # security review: the auto-start "ready" block must ALSO drop the (lock-derived)
     # bucket_uri in controlled mode, not just leo_create_response.
     assert 'ready.pop("bucket_uri"' in csrc
-    # security review r10: the heartbeat-FAILURE raise must redact hb_path + log tail in
+    # security review: the heartbeat-FAILURE raise must redact hb_path + log tail in
     # controlled mode (it is derived from the bucket).
     assert "Details (heartbeat" in csrc and "withheld in controlled-access mode" in csrc
     ssrc = inspect.getsource(server.terra_stop_runtime)
@@ -4309,7 +4309,7 @@ def _():
         out = server.terra_get_workflow_logs("ns", "ws", "sub", "wf")
         assert '"stderr_truncated": true' in out, "per-task truncation must be reported"
         assert '"content_truncated": true' in out, "content_truncated must surface"
-        # security review r5: a single long stderr must NOT flip the break-driving top-level
+        # security review: a single long stderr must NOT flip the break-driving top-level
         # 'truncated' flag (that would drop OTHER failed tasks from diagnostics).
         assert '"truncated": false' in out, "per-object truncation must not set the early-break flag"
     finally:
@@ -4428,12 +4428,12 @@ def _():
     # Total budget computed from the session window (hours), minus a margin.
     assert "MCP_TERRA_MAX_RUN_HOURS" in s and "SESSION_BUDGET_SEC" in s
     assert "SESSION_MARGIN_SEC" in s
-    # security review r5: a SINGLE deadline anchored at runner start; per-job budget is the
+    # security review: a SINGLE deadline anchored at runner start; per-job budget is the
     # REMAINING time, and a near-exhausted window REFUSES new jobs.
     assert "RUNNER_START_EPOCH" in s and "SESSION_DEADLINE" in s
     assert "SESSION_REMAINING" in s and "JOB_BUDGET" in s
     assert "REFUSED-SESSION-WINDOW" in s and "SESSION_MIN_JOB_SEC" in s
-    # security review r6: a refused job is only marked processed once the spec MOVE
+    # security review: a refused job is only marked processed once the spec MOVE
     # (durable terminal marker) succeeds — else it stays RETRYABLE.
     assert "leaving it RETRYABLE" in s
     # The WHOLE papermill run is wrapped in coreutils `timeout` (TERM→KILL) at
@@ -4441,7 +4441,7 @@ def _():
     assert 'timeout --verbose --signal=TERM --kill-after=60 "${JOB_BUDGET}s"' in s
     assert "command -v timeout" in s, "must fail loud if timeout(1) is missing"
     assert "PER_CELL_SEC=$JOB_BUDGET" in s, "per-cell timeout capped to remaining budget"
-    # security review r6: CAUSAL detection — RC 124, or the `timeout --verbose` marker.
+    # security review: CAUSAL detection — RC 124, or the `timeout --verbose` marker.
     # An OOM RC 137 without the marker must NOT be labelled a session limit.
     assert '"$RC" -eq 124' in s
     assert '"^timeout: sending signal"' in s, "must use the causal timeout marker"
@@ -4459,6 +4459,34 @@ def _():
     assert "session_limit_advisory" in src
     assert "policy.max_run_hours()" in src
     assert "FAILED-SESSION-LIMIT" in src and "terra_submit_workflow" in src
+
+
+@case("CC-Hygiene", "no internal iteration-revealing identifiers in shipped files")
+def _():
+    # Fail-closed: review-round numbers / numbered internal class codes must not
+    # leak into shipped source or docs (professional optics). The test file
+    # itself is excluded (it necessarily contains these patterns).
+    import glob
+    import os
+    import re
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    pats = [re.compile(r"\breview r\d", re.I),
+            re.compile(r"\bround[ -]\d"),
+            re.compile(r"\bCC-[A-Za-z]+\d")]
+    files = (glob.glob(os.path.join(repo, "src/mcp_terra/*.py"))
+             + [os.path.join(repo, f) for f in ("SECURITY.md", "CHANGELOG.md",
+                                                "README.md", "SOP.md")]
+             + glob.glob(os.path.join(repo, "docs/*.md"))
+             + glob.glob(os.path.join(repo, ".claude/skills/*/SKILL.md")))
+    bad = []
+    for fp in files:
+        if not os.path.exists(fp):
+            continue
+        txt = open(fp, encoding="utf-8").read()
+        for p in pats:
+            for m in p.finditer(txt):
+                bad.append(f"{os.path.basename(fp)}: {m.group(0)!r}")
+    assert not bad, f"iteration-revealing identifiers leaked into shipped files: {bad[:10]}"
 
 
 # ──────────────────────────────────────────────────────────────────────────

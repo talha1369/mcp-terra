@@ -39,7 +39,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   Terra through the MCP). Refusals are fail-loud. `terra_health` and the startup
   banner surface the posture; see [docs/compliance.md](docs/compliance.md) for
   the policy mapping (GDS/DUC + NIST 800-171 + the self-hosted-model path).
-  - **Round-3 adversarial-review hardening** closed the egress paths the first
+  - **Adversarial-review hardening** closed the egress paths the first
     cut missed: in controlled-access mode `terra_get_run_log` withholds
     stdout/stderr content, `terra_get_notebook_job_result` withholds the cell
     source/traceback (and disables the Tier-2 external-LLM fix proposal),
@@ -260,7 +260,7 @@ tests exercise the templates in isolation, so these were latent):
     `terra_write_run_record` does a no-clobber **preflight** so it can't report
     success while `gsutil cp -n` silently skipped.
   - Guarded by 10 new regression tests (`CC-WriteSafety`).
-- **Adversarial-review hardening — round 2** — 6 more findings on the
+- **Adversarial-review hardening** — 6 more findings on the
   attachment/delivery work:
   - **CRITICAL** — `assert_local_write_policy` matched blocklist prefixes with a
     trailing slash, so EXACT protected directories (`/usr/bin`, `/bin`,
@@ -279,7 +279,7 @@ tests exercise the templates in isolation, so these were latent):
     **read back (md5)** after upload so a `cp -n` skip/race can't report a
     write that didn't persist.
   - Guarded by 7 new regression tests (`CC-DeliverySafety`).
-- **Adversarial-review hardening — round 4** — egress closure across the
+- **Adversarial-review hardening** — egress closure across the
   full read surface + retry safety, on the new robustness work:
   - **Controlled-access leaks closed** in `terra_list_bucket` (object paths now
     require a public/allowlisted bucket), `terra_get_method_config` (projected to
@@ -302,7 +302,7 @@ tests exercise the templates in isolation, so these were latent):
     fails if any lacks a controlled-access check (prevents a future tool from
     silently re-opening an egress path). Guarded by 7 new regression tests
     (`CC-ControlledAccessGuard`).
-- **Adversarial-review hardening — round 4b** (re-review of the round-4
+- **Adversarial-review hardening** (re-review of the a follow-up pass
   fixes): closed 5 more findings.
   - **Audio in controlled mode** now feeds the summary text to `say` via
     **stdin**, never argv — argv is world-readable (`ps` / process accounting),
@@ -331,7 +331,7 @@ tests exercise the templates in isolation, so these were latent):
   `session_limit_note`. `terra_submit_notebook_job` advises the limit and points
   long jobs to the WDL/Cromwell path (Batch tasks auto-refresh credentials).
   Guarded by CC-SessionLimit.
-- **Adversarial-review hardening — round 5** (re-review of round-4b +
+- **Adversarial-review hardening** (re-review of a follow-up pass +
   the 24h guard): closed 6 more findings.
   - `terra_get_method_config` controlled-mode projection now returns **counts +
     integer version only** — method namespace/name and rootEntityType are also
@@ -355,7 +355,7 @@ tests exercise the templates in isolation, so these were latent):
   - `terra_get_workflow_logs` splits per-object `content_truncated` from the
     break-driving `truncated`, so one long stderr no longer drops later failed
     tasks from diagnostics.
-- **Adversarial-review hardening — round 6** (re-review of round-5):
+- **Adversarial-review hardening** :
   closed 6 more findings.
   - `terra_get_bucket_object_metadata` controlled projection now matches EXACT
     safe labels at line start and **drops the whole custom-Metadata block** — a
@@ -376,7 +376,7 @@ tests exercise the templates in isolation, so these were latent):
     --verbose` "sending signal" marker — no longer a wall-clock heuristic, so an
     OOM SIGKILL (RC 137 without the marker) is correctly a normal `FAILED` and a
     backward clock step can't hide a real timeout.
-- **Adversarial-review hardening — round 7** (re-review of round-6):
+- **Adversarial-review hardening** :
   closed 6 more findings.
   - The causal session-limit marker (`timeout --verbose` "sending signal") is now
     **gated to RC 137** — an ordinary papermill failure can no longer be
@@ -392,7 +392,7 @@ tests exercise the templates in isolation, so these were latent):
     guard mode (it cats the notebook bytes into the MCP host).
   - `Content-Type` (operator-settable) dropped from the `gsutil stat`
     controlled-mode allowlist.
-- **Adversarial-review hardening — round 8** (re-review of round-7):
+- **Adversarial-review hardening** :
   closed 7 more findings — the **write/lifecycle return values** were the last
   unprojected controlled-access surface.
   - Controlled-mode projections added to `terra_submit_workflow` (ids + status),
@@ -410,16 +410,16 @@ tests exercise the templates in isolation, so these were latent):
     raw-returns a `tc.*`/`bk.*` payload** (the root cause that let the
     write-side leaks pass), with `terra_whoami` (caller's own identity) the only
     allowlisted exception. 31/43 tools now carry controlled-mode projections.
-- **Adversarial-review hardening — round 9** (re-review of round-8):
+- **Adversarial-review hardening** :
   closed 5 more findings.
-  - **Atomic per-spec runner claim** — the round-8 `REFUSED` status-skip wasn't
+  - **Atomic per-spec runner claim** — the a follow-up pass `REFUSED` status-skip wasn't
     atomic; two runners (two VMs on one bucket) could both pick up the same
     pending spec. The runner now wins an atomic claim (stable per-runtime id +
     no-clobber `.claim` marker with read-back) BEFORE any verify/execute/refuse.
     This is also the foundation for **parallel jobs**: different VMs claim and
     run DIFFERENT specs concurrently, never the same one twice.
   - `terra_create_runtime` auto-start "ready" block now drops the (lock-derived)
-    `bucket_uri` in guard mode (round-8 only projected `leo_create_response`).
+    `bucket_uri` in guard mode (a follow-up pass only projected `leo_create_response`).
   - `terra_health` is projected in guard mode to booleans/counts/status —
     `workspace_lock` identifiers, bucket/heartbeat paths, and sampled IAM writer
     principals are withheld (it's directly LLM-callable).
@@ -428,7 +428,7 @@ tests exercise the templates in isolation, so these were latent):
   - The structural meta-test now also catches the **local-var taint**
     (`r = tc.x(); return _ok(r)`) and forbids any `_NO_DATA` tool from calling a
     remote service unless justified in `_NO_DATA_REMOTE_OK` (fail-closed).
-- **Adversarial-review hardening — round 11** (re-review of round-10): the
+- **Adversarial-review hardening** : the
   runner lease now stores owner+timestamp as GCS custom metadata so a single
   stat yields owner+ts+generation from the SAME object version and the
   compare-and-swap targets that exact generation (closes a two-VM
@@ -437,7 +437,7 @@ tests exercise the templates in isolation, so these were latent):
   restart reclaims its own job by owner; get_workflow_cost uses an EXACT cost-key
   allowlist; terra_write_run_record error paths redact the bucket path in guard
   mode.
-- **Adversarial-review hardening — round 12** (re-review of round-11): the on-VM
+- **Adversarial-review hardening** : the on-VM
   runner lease owner is now UNIQUE per instance (runtime+host+pid+boot-epoch) and
   reclaim is STALE-AGE-ONLY — removing the critical shared-owner double-execution
   (two VMs sharing a legacy owner). A no-metadata claim ages out via the object

@@ -112,7 +112,7 @@ def _validate_secret_strength(secret) -> None:
 
     Requirements:
       • Type: str
-      • Length: ≥ 32 chars (raised from 16 per round-3 audit)
+      • Length: ≥ 32 chars (raised from 16 per a hardening audit)
       • Character diversity: ≥ 12 unique chars (defeats 'aaaa…' or simple
         repeating patterns that pass length but have low entropy)
       • Not a recognizable trivial string (UUIDs, hex of common words)
@@ -420,7 +420,7 @@ SESSION_MARGIN_SEC="${MCP_TERRA_SESSION_MARGIN_SEC:-1800}"   # 30-min headroom
 case "$SESSION_MARGIN_SEC" in ''|*[!0-9]*) SESSION_MARGIN_SEC=1800 ;; esac
 SESSION_BUDGET_SEC=$(( MAX_RUN_HOURS * 3600 - SESSION_MARGIN_SEC ))
 [ "$SESSION_BUDGET_SEC" -lt 300 ] && SESSION_BUDGET_SEC=300   # floor 5 min
-# security review r5: the credential window is per-SESSION, not per-job. Anchor a single
+# security review: the credential window is per-SESSION, not per-job. Anchor a single
 # deadline at runner START (≈ when this VM/session booted and credentials were
 # issued), so a job submitted after a long prior job / idle is capped to what
 # REMAINS of the window — not given a fresh full budget each time.
@@ -462,7 +462,7 @@ command -v papermill >/dev/null 2>&1 || {
 
 echo "[runner] polling $BUCKET/mcp_terra_jobs/ every ${POLL_SEC}s (Ctrl-C to stop)"
 
-# security review r11: positively distinguish "object absent" (a 404, safe to
+# security review: positively distinguish "object absent" (a 404, safe to
 # proceed) from a TRANSIENT gsutil/auth/network error (must NOT be read as
 # absent — that would let a terminal job be re-executed). Echoes
 # present|absent|error.
@@ -471,7 +471,7 @@ obj_state() {
     _err="$(gsutil stat "$1" 2>&1 >/dev/null)"; _rc=$?
     if [ "$_rc" -eq 0 ]; then
         echo present
-    # security review r12: an ACL/auth failure makes gsutil ALSO print "No URLs
+    # security review: an ACL/auth failure makes gsutil ALSO print "No URLs
     # matched" (match count 0) — so check the access/permission signatures FIRST
     # and classify them as ERROR (fail-closed), before the not-found signatures.
     elif printf '%s' "$_err" | grep -qiE "accessdenied|access denied|permission|forbidden|403|401|not authorized|unauthorized|credential|reauth"; then
@@ -544,7 +544,7 @@ while true; do
         RESULT="$JOB_DIR/result.json"
         EXECUTED="$JOB_DIR/executed.ipynb"
 
-        # security review r8/r10/r11: DURABLE terminal markers — never (re-)execute
+        # security review: DURABLE terminal markers — never (re-)execute
         # a job that already reached a terminal state, even when our LOCAL
         # PROCESSED_FILE is missing (a different VM, or a fresh local disk). Covers
         # REFUSED (session-window), succeeded / FAILED* (a runner that wrote the
@@ -577,7 +577,7 @@ while true; do
             esac
         fi
 
-        # security review r9/r10/r11: ATOMIC cross-runner claim via the GCS
+        # security review: ATOMIC cross-runner claim via the GCS
         # GENERATION PRECONDITION (server-enforced create-if-absent) — NOT cp -n
         # (which has a real two-writer race). Exactly one runner creates the
         # marker; a concurrent create returns HTTP 412. The owner + timestamp are
@@ -603,7 +603,7 @@ while true; do
                 echo "[runner] could not stat claim for $JOB_ID; skipping this poll." >&2
                 continue   # fail-closed (transient stat error)
             fi
-            # security review r12/r13: no claim-ts metadata? (a pre-upgrade /
+            # security review: no claim-ts metadata? (a pre-upgrade /
             # foreign claim) → fall back to the object's Update time so it can age
             # out. If THAT is also unparseable, do NOT silently treat it as a live
             # age-0 owner (livelock) and do NOT auto-reclaim (a metadata-parse
@@ -619,7 +619,7 @@ while true; do
                 fi
             fi
             CLAIM_AGE=$(( NOW - CLAIM_TS ))
-            # security review r12 (critical): reclaim is STALE-AGE-ONLY — NO
+            # security review: reclaim is STALE-AGE-ONLY — NO
             # owner-based immediate reclaim (a shared/restarted owner cannot be
             # distinguished from a live one). The owner id is unique per instance
             # and used only for logging. The lease heartbeat keeps a LIVE owner's
@@ -798,7 +798,7 @@ PYVERIFY
 
         LOCAL_NB="$WORK/$JOB_ID.in.ipynb"
         LOCAL_OUT="$WORK/$JOB_ID.out.ipynb"
-        # security review r12: bound the pre-run download so a hung transfer can't
+        # security review: bound the pre-run download so a hung transfer can't
         # hold the claim past the stale margin (which would let another VM
         # reclaim + double-execute). On timeout, skip this poll (claim ages out).
         if ! timeout --signal=TERM --kill-after=30 900 gsutil cp "$NOTEBOOK_GCS" "$LOCAL_NB"; then
@@ -836,7 +836,7 @@ PYVERIFY
         # halted at the session budget (TERM, then KILL after 60s grace) rather
         # than hitting the Terra credential cliff. `timeout` exits 124 when it
         # has to stop the job — we surface that as a clear session-limit result.
-        # security review r5: cap THIS job to what REMAINS of the session window (computed
+        # security review: cap THIS job to what REMAINS of the session window (computed
         # from the single runner-start deadline), not a fresh full budget. If too
         # little remains, refuse the job loudly rather than start a run that would
         # hit the credential cliff mid-execution.
@@ -844,7 +844,7 @@ PYVERIFY
         SESSION_REMAINING=$(( SESSION_DEADLINE - NOW ))
         if [ "$SESSION_REMAINING" -lt "$SESSION_MIN_JOB_SEC" ]; then
             echo "[runner] only ${SESSION_REMAINING}s remain in the Terra session window (< ${SESSION_MIN_JOB_SEC}s floor); REFUSING job $JOB_ID. Restart the runtime for a fresh session, or use the WDL/Cromwell path for long compute." >&2
-            # security review r7: the STATUS write is the poller's terminal signal
+            # security review: the STATUS write is the poller's terminal signal
             # (terra_get_notebook_job_result keys terminal off status.txt /
             # result.json). It MUST land before we move the spec or mark the job
             # processed — otherwise a poller keeps seeing the earlier 'running'
@@ -880,7 +880,7 @@ PYVERIFY
         RC=$?
         set -e
         RUN_ENDED_AT=$(date +%s)
-        # security review r6: CAUSAL session-limit detection, not a wall-clock heuristic.
+        # security review: CAUSAL session-limit detection, not a wall-clock heuristic.
         # RC 124 is coreutils' unambiguous "command timed out" status. For RC 137
         # (SIGKILL — which ALSO occurs on OOM or a manual kill) we ONLY count it
         # as a session limit when `timeout --verbose` actually logged that IT sent
@@ -893,7 +893,7 @@ PYVERIFY
         if [ "$RC" -eq 124 ]; then
             SESSION_LIMITED=1
         elif [ "$RC" -eq 137 ] && grep -q "^timeout: sending signal" "$WORK/$JOB_ID.stderr" 2>/dev/null; then
-            # security review r7: gate the marker to RC 137 (the KILL-escalation exit) so an
+            # security review: gate the marker to RC 137 (the KILL-escalation exit) so an
             # ordinary papermill failure (RC 1, etc.) whose stderr happens to
             # contain that line is NOT relabelled as a session limit.
             SESSION_LIMITED=1
@@ -1076,7 +1076,7 @@ with open(out_path, "w") as f:
     json.dump(payload, f, indent=2)
 PYRESULT
 
-        # security review r13: write the DURABLE terminal markers FIRST (the MCP
+        # security review: write the DURABLE terminal markers FIRST (the MCP
         # and other runners key terminal state on result.json + status.txt), each
         # TIMEOUT-bounded, BEFORE the larger best-effort artifact uploads — so a
         # slow/hung artifact upload can never leave the job without a terminal
