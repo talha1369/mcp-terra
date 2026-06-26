@@ -9,6 +9,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **`terra_summarize_submissions`** — one-call OVERVIEW of all workspace submissions (id, status, date, per-workflow status counts), newest-first, with `active_only` + `limit`. For monitoring MANY parallel runs (or a scattered workflow's sibling submissions) without paging raw JSON. READ-class, controlled-access-aware (method-config + entity names withheld in guard mode). Wired into the terra-wdl-run skill.
+
 - **MCP resources + prompts (discoverability).** Read-only
   resources `terra://health` (live posture) and `terra://posture` (safety/
   compliance one-pager) — config only, never workspace data — plus reusable
@@ -16,7 +18,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   New **`docs/auth.md`** documents the credential posture (gcloud ADC only, no
   token minting/storage, env-snapshot per-channel secrets). (Per-tool
   `outputSchema` deferred — the structured-error envelope + `_schema_version`
-  already give clients a contract; full output schemas across 43 tools is a
+  already give clients a contract; full output schemas across 44 tools is a
   large change for modest gain.)
 - **`terra_get_workflow_logs`** — per-task Cromwell stderr/stdout (paths +
   return code + stderr tail for failed tasks), the real failure signal for

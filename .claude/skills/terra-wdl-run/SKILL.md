@@ -2,7 +2,7 @@
 name: terra-wdl-run
 description: Author (or take) a WDL workflow, validate it, run it on Terra/Cromwell with DIRECT inputs, monitor to completion with an auto-fix loop, then email a verified report + NotebookLM-style audio explainer of the outputs. This is the PARALLEL-compute path — use WDL scatter to fan hundreds of tasks across Google Batch, and run many submissions at once. The MCP half is credentialed primitives only (no delete); this skill is the authoring + orchestration. Use when the user wants to run a WDL workflow (not a notebook) on Terra, or any large parallel workload.
 argument-hint: [wdl_path_or_spec] [--config namespace/name] [--email] [--audio]
-allowed-tools: mcp-terra:terra_health, mcp-terra:terra_get_workspace, mcp-terra:terra_list_method_configs, mcp-terra:terra_register_method, mcp-terra:terra_create_method_config, mcp-terra:terra_submit_workflow, mcp-terra:terra_get_submission, mcp-terra:terra_get_workflow_outputs, mcp-terra:terra_render_audio_summary, mcp-terra:terra_send_run_report_email, Read, Edit, Bash, Task
+allowed-tools: mcp-terra:terra_health, mcp-terra:terra_get_workspace, mcp-terra:terra_list_method_configs, mcp-terra:terra_register_method, mcp-terra:terra_create_method_config, mcp-terra:terra_submit_workflow, mcp-terra:terra_get_submission, mcp-terra:terra_summarize_submissions, mcp-terra:terra_get_workflow_outputs, mcp-terra:terra_render_audio_summary, mcp-terra:terra_send_run_report_email, Read, Edit, Bash, Task
 ---
 
 # terra-wdl-run — run a WDL workflow on Terra (Cromwell)
@@ -108,8 +108,7 @@ the top-line status — one line per check, e.g.
 `wf: Running — 142/200 shards Succeeded, 55 Running, 3 Failed`.
 
 - To watch **multiple submissions at once**, poll each `submissionId` and report
-  a compact per-submission roll-up. (A future `terra_summarize_submissions` tool
-  will make this one call; until then, loop over `terra_get_submission`.)
+  a compact per-submission roll-up. Use `terra_summarize_submissions` for a one-call roll-up across all submissions; drill into one with `terra_get_submission`.
 - **Partial failure in a scatter:** if some shards `Failed` while others
   `Succeeded`, report which shards failed + their messages; fix the root cause
   (usually one bad input or a task-level runtime issue) and re-submit — Cromwell

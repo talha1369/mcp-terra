@@ -2572,6 +2572,68 @@ def terra_list_submissions(namespace: str, name: str) -> str:
     return _ok(subs)
 
 
+@server.tool(title="Summarize workspace submissions (overview)", annotations=ANN_READ_REMOTE)
+def terra_summarize_submissions(namespace: str, name: str,
+                                active_only: bool = False, limit: int = 50) -> str:
+    """One-call OVERVIEW of the workspace's workflow submissions — for monitoring
+    MANY parallel runs at once. Newest first. For each submission: id, status,
+    date, and per-workflow status COUNTS (Succeeded/Running/Failed/…). No cost.
+
+    Use this to watch a fan-out of concurrent submissions (or a scattered
+    workflow's sibling submissions) without paging raw JSON per submission.
+
+    Args:
+        active_only: only submissions not yet in a terminal state (Done/Aborted).
+        limit: max submissions to return (1..200), newest first.
+    """
+    safety.validate_freeform_string(namespace, "namespace", allow_empty=False)
+    safety.validate_freeform_string(name, "name", allow_empty=False)
+    if not (1 <= limit <= 200):
+        raise ValueError(f"limit must be 1..200; got {limit}")
+    _assert_workspace_allowed(namespace, name)
+    _pre("terra_summarize_submissions", READ,
+         f"{namespace}/{name} active_only={active_only} limit={limit}")
+    token = auth.get_access_token()
+    subs = tc.rawls_list_submissions(token, namespace, name)
+    if not isinstance(subs, list):
+        subs = []
+    _TERMINAL = {"Done", "Aborted"}
+    controlled = policy.controlled_access_enabled()
+    rows = []
+    for s in sorted(subs, key=lambda x: (x or {}).get("submissionDate", ""),
+                    reverse=True):
+        st = (s or {}).get("status")
+        if active_only and st in _TERMINAL:
+            continue
+        wf_counts = (s or {}).get("workflowStatuses") or {}
+        row = {
+            "submissionId": (s or {}).get("submissionId"),
+            "status": st,
+            "submissionDate": (s or {}).get("submissionDate"),
+            "workflow_status_counts": wf_counts,
+            "workflow_total": sum(v for v in wf_counts.values()
+                                  if isinstance(v, int)),
+        }
+        # Controlled-access: methodConfigurationName + entity names are
+        # operator-controlled strings — withhold (same rule as list_submissions).
+        if not controlled:
+            row["methodConfigurationName"] = (s or {}).get("methodConfigurationName")
+        rows.append(row)
+        if len(rows) >= limit:
+            break
+    out: dict = {
+        "namespace": namespace, "name": name,           # caller-supplied echoes
+        "submission_count": len(rows),
+        "active_count": sum(1 for r in rows if r["status"] not in _TERMINAL),
+        "submissions": rows,
+    }
+    if controlled:
+        out["_controlled_access_withheld"] = (
+            "method config + entity names withheld (MCP_TERRA_CONTROLLED_ACCESS); "
+            "submission ids / status / date / workflow-status counts only.")
+    return _ok(out)
+
+
 @server.tool(title="Get workflow metadata (Cromwell)", annotations=ANN_READ_REMOTE)
 def terra_get_workflow_metadata(namespace: str, name: str,
                                 submission_id: str, workflow_id: str,

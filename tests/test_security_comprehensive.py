@@ -378,10 +378,10 @@ def _():
     bad = [t for t in tools if "delete" in t.lower() or "remove" in t.lower() or "rm" in t.lower()]
     assert not bad, f"destructive tools found: {bad}"
 
-@case("F-Tools", "43 tools registered (incl. WDL, reads, run-record, pings, logs)")
+@case("F-Tools", "44 tools registered (incl. WDL, reads, run-record, pings, logs)")
 def _():
     tools = [t.name for t in server.server._tool_manager.list_tools()]
-    assert len(tools) == 43, f"expected 43, got {len(tools)}: {tools}"
+    assert len(tools) == 44, f"expected 44, got {len(tools)}: {tools}"
     expected = {
         "terra_whoami", "terra_list_workspaces", "terra_get_workspace",
         "terra_list_runtimes", "terra_get_runtime",
@@ -403,6 +403,7 @@ def _():
         "terra_register_method", "terra_create_method_config",
         # comprehensive-read read-only tools (all READ-class)
         "terra_list_data_tables", "terra_get_entities", "terra_list_submissions",
+        "terra_summarize_submissions",
         "terra_get_workflow_metadata", "terra_get_workflow_cost",
         "terra_get_method_config", "terra_read_bucket_object",
         "terra_get_bucket_object_metadata", "terra_get_batch_job_status",
@@ -3482,6 +3483,7 @@ _DATA_TOOLS_REQUIRING_GUARD = {
     # security review r6: listings whose payloads carry operator/user-controlled strings
     # (workspace names, data-table schema, methodConfigurationName) → guarded.
     "terra_list_workspaces", "terra_list_data_tables", "terra_list_submissions",
+    "terra_summarize_submissions",
     # security review r7: runtime names/labels/URLs are user-controlled; recommend cats the
     # notebook bytes locally; refresh enumerates bucket names → all guarded.
     "terra_list_runtimes", "terra_get_runtime",
@@ -3888,6 +3890,26 @@ def _():
         out = server.terra_list_submissions("ns", "ws")
         assert SENTINEL not in out, "methodConfigurationName / entity name leaked!"
         assert '"submissionId": "s1"' in out and '"Succeeded": 3' in out
+    finally:
+        _p._CONTROLLED_ACCESS, _tc.rawls_list_submissions, server.auth.get_access_token = saved, ol, ot
+
+
+@case("CC-ControlledAccess3", "summarize_submissions withholds method-config names (sentinel) in controlled mode")
+def _():
+    from mcp_terra import policy as _p
+    saved, ol, ot = _p._CONTROLLED_ACCESS, _tc.rawls_list_submissions, server.auth.get_access_token
+    SENTINEL = "methodcfg-NA12878-secret"
+    _tc.rawls_list_submissions = lambda *a, **k: [{
+        "submissionId": "s1", "status": "Running", "submissionDate": "2026-01-02",
+        "methodConfigurationName": SENTINEL,
+        "workflowStatuses": {"Running": 5, "Succeeded": 195}}]
+    server.auth.get_access_token = lambda: "tok"
+    try:
+        _p._CONTROLLED_ACCESS = True
+        out = server.terra_summarize_submissions("ns", "ws")
+        assert SENTINEL not in out, "summarize leaked methodConfigurationName!"
+        assert '"submissionId": "s1"' in out and '"workflow_total": 200' in out
+        assert '"Succeeded": 195' in out  # status counts (parallel monitoring) kept
     finally:
         _p._CONTROLLED_ACCESS, _tc.rawls_list_submissions, server.auth.get_access_token = saved, ol, ot
 
