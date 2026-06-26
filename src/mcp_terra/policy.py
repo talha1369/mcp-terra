@@ -19,14 +19,17 @@ policy by passing a parameter.
 from __future__ import annotations
 
 import collections
+import contextlib
 import datetime
 import hashlib
 import hmac
 import json
+import math
 import os
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 
@@ -165,6 +168,8 @@ def budget_usd() -> float:
         b = float(os.environ.get("MCP_TERRA_BUDGET_USD", "0") or "0")
     except (TypeError, ValueError):
         b = 0.0
+    if not math.isfinite(b):  # inf/nan would silently disable the ceiling — treat as off
+        b = 0.0
     return max(0.0, b)
 
 
@@ -177,29 +182,52 @@ def budget_window_days() -> int:
     return max(1, min(d, 366))
 
 
+def _read_ledger_window(now_epoch: float) -> tuple[list[str], float]:
+    """Read the ledger and return (in_window_raw_json_lines, summed_cap_usd).
+    Malformed and out-of-window lines are dropped, so a caller that rewrites the
+    file with the returned lines compacts it to the active window (keeps the
+    ledger from growing without bound). Negative caps are clamped to 0 so a
+    tampered entry can't shrink the committed total."""
+    if not _SPEND_LEDGER.exists():
+        return [], 0.0
+    cutoff = now_epoch - budget_window_days() * 86400
+    try:
+        raw = _SPEND_LEDGER.read_text(encoding="utf-8")
+    except OSError:
+        return [], 0.0
+    kept: list[str] = []
+    total = 0.0
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            rec = json.loads(s)
+        except (ValueError, TypeError):
+            continue
+        try:
+            ts = float(rec.get("ts", 0))
+            usd = float(rec.get("usd", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if ts >= cutoff:
+            kept.append(s)
+            total += max(0.0, usd)
+    return kept, total
+
+
 def windowed_spend_usd(now_epoch: float) -> float:
     """Sum the per-run caps recorded in the ledger within the rolling window."""
-    if not _SPEND_LEDGER.exists():
-        return 0.0
-    cutoff = now_epoch - budget_window_days() * 86400
-    total = 0.0
-    try:
-        for line in _SPEND_LEDGER.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except (ValueError, TypeError):
-                continue
-            try:
-                if float(rec.get("ts", 0)) >= cutoff:
-                    total += max(0.0, float(rec.get("usd", 0)))
-            except (TypeError, ValueError):
-                continue
-    except OSError:
-        pass
-    return total
+    return _read_ledger_window(now_epoch)[1]
+
+
+def _atomic_write_ledger(lines: list[str]) -> None:
+    """Rewrite the ledger atomically from raw json lines (tmp + os.replace).
+    Call only while holding _ledger_locked()."""
+    _SPEND_LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _SPEND_LEDGER.parent / (_SPEND_LEDGER.name + ".tmp")
+    tmp.write_text(("\n".join(lines) + "\n") if lines else "", encoding="utf-8")
+    os.replace(str(tmp), str(_SPEND_LEDGER))
 
 
 def assert_within_budget(new_run_usd: float, now_epoch: float) -> None:
@@ -228,7 +256,12 @@ def assert_within_budget(new_run_usd: float, now_epoch: float) -> None:
 
 def record_run_cost(usd: float, ref: str, now_epoch: float) -> None:
     """Append a run's committed per-run cap to the ledger (only when a budget is
-    active and the cap is positive). Best-effort; never raises."""
+    active and the cap is positive). Best-effort; never raises.
+
+    NOTE: this is the non-atomic primitive (check + append are separate). The
+    server's create path uses reserve_within_budget() instead, which makes the
+    budget check and the ledger append a single locked operation so two
+    concurrent creates cannot both pass the ceiling."""
     if budget_usd() <= 0 or usd <= 0:
         return
     try:
@@ -238,6 +271,119 @@ def record_run_cost(usd: float, ref: str, now_epoch: float) -> None:
                                  "ref": str(ref)[:200]}) + "\n")
     except OSError:
         pass
+
+
+_SPEND_LEDGER_LOCK = CONFIG_DIR / "spend_ledger.lock"
+_LEDGER_THREAD_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _ledger_locked():
+    """Serialize ledger read-modify-write across threads AND processes.
+
+    threading.Lock covers concurrent tool threads inside one MCP process; an
+    flock (POSIX) on a dedicated lock file extends mutual exclusion to multiple
+    MCP processes sharing the same ~/.mcp-terra. If flock is unavailable
+    (non-POSIX) we degrade to thread-only — still correct for the common
+    single-process case. The thread lock is held for the whole critical section
+    so the flock fd is always opened/closed by one thread at a time."""
+    with _LEDGER_THREAD_LOCK:
+        fd = None
+        try:
+            import fcntl
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(_SPEND_LEDGER_LOCK), os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except (ImportError, OSError):
+            # degrade to thread-only lock; close the fd if open() succeeded but
+            # flock() failed, so we never leak a descriptor
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                fd = None
+        try:
+            yield
+        finally:
+            if fd is not None:
+                try:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(fd)
+
+
+def reserve_within_budget(new_run_usd: float, ref: str, now_epoch: float) -> str | None:
+    """Atomically (1) assert this run fits the rolling budget and (2) record its
+    per-run cap to the ledger, under an exclusive cross-thread/process lock so two
+    concurrent creates cannot both pass the ceiling (closes the check-then-record
+    TOCTOU). Returns a reservation token to pass to release_reservation() if the
+    create later fails, or None when no budget is configured.
+
+    Fail-LOUD with PolicyError when the run is uncapped under a budget, when the
+    budget would be exceeded, or when the reservation cannot be persisted (a
+    silent failure here could let the next concurrent run blow the ceiling)."""
+    if budget_usd() <= 0:
+        return None
+    if new_run_usd <= 0:
+        raise PolicyError(
+            "A rolling spend budget (MCP_TERRA_BUDGET_USD) is set, so each run "
+            "MUST specify a per-run cap (max_cost_usd) — otherwise spend cannot "
+            "be bounded against the budget.",
+            code="E_BUDGET_REQUIRES_CAP",
+            user_action_required="pass a max_cost_usd to this run")
+    with _ledger_locked():
+        b = budget_usd()
+        kept, spent = _read_ledger_window(now_epoch)
+        if spent + new_run_usd > b:
+            raise PolicyError(
+                f"rolling spend budget would be exceeded: ${spent:.2f} already "
+                f"committed in the last {budget_window_days()}d + ${new_run_usd:.2f} "
+                f"for this run > ${b:.2f} budget (MCP_TERRA_BUDGET_USD). Wait for the "
+                f"window to roll off, lower this run's cap, or raise the budget.",
+                code="E_BUDGET_EXCEEDED",
+                user_action_required="lower the run cap, wait, or raise the budget")
+        token = uuid.uuid4().hex
+        kept.append(json.dumps({"ts": now_epoch, "usd": float(new_run_usd),
+                                "ref": str(ref)[:200], "id": token}))
+        try:
+            # rewrite (not append) so out-of-window entries are pruned each time —
+            # the ledger stays bounded to the active window
+            _atomic_write_ledger(kept)
+        except OSError as e:
+            raise PolicyError(
+                f"could not persist the spend reservation to the ledger: {e}",
+                code="E_BUDGET_LEDGER_WRITE",
+                user_action_required="ensure ~/.mcp-terra is writable") from e
+        return token
+
+
+def release_reservation(token: str | None) -> None:
+    """Remove a previously reserved ledger entry (e.g. when the create failed)
+    so a failed run does not permanently consume the budget. Best-effort;
+    never raises. A no-op for a falsy token (no budget was active)."""
+    if not token:
+        return
+    with _ledger_locked():
+        try:
+            if not _SPEND_LEDGER.exists():
+                return
+            kept = []
+            for line in _SPEND_LEDGER.read_text(encoding="utf-8").splitlines():
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    rec = json.loads(s)
+                except (ValueError, TypeError):
+                    kept.append(s)  # preserve anything we can't parse
+                    continue
+                if rec.get("id") != token:
+                    kept.append(s)
+            _atomic_write_ledger(kept)
+        except OSError:
+            pass
 
 
 def runner_concurrency() -> int:

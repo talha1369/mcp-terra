@@ -810,20 +810,32 @@ def terra_create_runtime(
         }
 
     token = auth.get_access_token()
-    create_resp = tc.leo_create_runtime(
-        token, google_project, runtime_name,
-        machine_type=machine_type,
-        disk_size_gb=disk_size_gb,
-        gpu_type=gpu_type or None,
-        num_gpus=num_gpus,
-        auto_pause_threshold_minutes=auto_pause_threshold_minutes,
-        tool_docker_image=tool_docker_image or None,
-        start_user_script_uri=start_user_script_uri,
-        custom_env_vars=custom_env_vars,
-    )
-    # Commit this run's per-run cap to the rolling-budget ledger (no-op unless a
-    # budget is configured). Records the worst-case cap; actual spend <= the cap.
-    policy.record_run_cost(_eff_cap, runtime_name, _time_budget.time())
+    # Atomically reserve this run's per-run cap against the rolling budget RIGHT
+    # before provisioning (no-op unless a budget is set). The reservation + the
+    # budget check are one locked operation, so two concurrent creates cannot both
+    # pass the ceiling. If the create itself fails, release the reservation so a
+    # failed run doesn't permanently consume the budget; once Leonardo accepts the
+    # create the VM bills, so we KEEP the reservation even if a later step fails.
+    try:
+        _budget_token = policy.reserve_within_budget(
+            _eff_cap, runtime_name, _time_budget.time())
+    except policy.PolicyError as e:
+        raise PermissionError(str(e))
+    try:
+        create_resp = tc.leo_create_runtime(
+            token, google_project, runtime_name,
+            machine_type=machine_type,
+            disk_size_gb=disk_size_gb,
+            gpu_type=gpu_type or None,
+            num_gpus=num_gpus,
+            auto_pause_threshold_minutes=auto_pause_threshold_minutes,
+            tool_docker_image=tool_docker_image or None,
+            start_user_script_uri=start_user_script_uri,
+            custom_env_vars=custom_env_vars,
+        )
+    except BaseException:
+        policy.release_reservation(_budget_token)
+        raise
     # Never echo the secret back (Leonardo's create response may include the
     # customEnvironmentVariables we just sent).
     create_resp = _redact_runtime_env(create_resp)

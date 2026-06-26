@@ -4878,6 +4878,10 @@ def _():
     assert "_eff_cap = float(max_cost_usd) if max_cost_usd > 0 else policy.max_cost_usd()" in csrc
     ssrc = inspect.getsource(server.terra_start_runner_on_vm)
     assert "MCP_TERRA_MAX_COST_USD=" in ssrc and "MCP_TERRA_VM_HOURLY_USD=" in ssrc
+    # the create path reserves ATOMICALLY (closes the check-then-record TOCTOU)
+    # and releases the reservation if the provision call fails
+    assert "policy.reserve_within_budget(" in csrc
+    assert "policy.release_reservation(_budget_token)" in csrc
     # submit warns in advance when a cap is set
     sub = inspect.getsource(server.terra_submit_notebook_job)
     assert "spend_cap_advisory" in sub
@@ -4907,6 +4911,119 @@ def _():
         policy.assert_within_budget(0, now)
     finally:
         policy._SPEND_LEDGER = led
+        for k, v in saved.items():
+            if v is None: _os.environ.pop(k, None)
+            else: _os.environ[k] = v
+
+@case("CC-SpendCap", "atomic reserve/release: ledger commit is locked + reversible")
+def _():
+    import os as _os
+    import tempfile
+    import pathlib
+    saved = {k: _os.environ.get(k) for k in ("MCP_TERRA_BUDGET_USD", "MCP_TERRA_BUDGET_WINDOW_DAYS")}
+    led, lock = policy._SPEND_LEDGER, policy._SPEND_LEDGER_LOCK
+    try:
+        base = pathlib.Path(tempfile.mkdtemp())
+        policy._SPEND_LEDGER = base / "ledger.jsonl"
+        policy._SPEND_LEDGER_LOCK = base / "ledger.lock"
+        now = 1_000_000_000.0
+        # no budget → reserve is a no-op, returns None
+        _os.environ["MCP_TERRA_BUDGET_USD"] = "0"
+        assert policy.reserve_within_budget(10, "r0", now) is None
+        # budget on: reserve records atomically and returns a token
+        _os.environ["MCP_TERRA_BUDGET_USD"] = "100"
+        _os.environ["MCP_TERRA_BUDGET_WINDOW_DAYS"] = "30"
+        t1 = policy.reserve_within_budget(60, "r1", now)
+        assert t1 and policy.windowed_spend_usd(now) == 60.0
+        # a second reserve that would exceed the ceiling is refused, and does NOT
+        # leave a partial entry behind (windowed spend unchanged)
+        must_raise(policy.reserve_within_budget, policy.PolicyError, 50, "r2", now)
+        assert policy.windowed_spend_usd(now) == 60.0
+        # uncapped run under a budget → refuse
+        must_raise(policy.reserve_within_budget, policy.PolicyError, 0, "r3", now)
+        # releasing the first reservation frees the budget again
+        policy.release_reservation(t1)
+        assert policy.windowed_spend_usd(now) == 0.0
+        # releasing None / unknown token is a safe no-op
+        policy.release_reservation(None)
+        policy.release_reservation("does-not-exist")
+        # inf/nan budget is treated as OFF (cannot silently disable the ceiling)
+        _os.environ["MCP_TERRA_BUDGET_USD"] = "inf"
+        assert policy.budget_usd() == 0.0
+        _os.environ["MCP_TERRA_BUDGET_USD"] = "nan"
+        assert policy.budget_usd() == 0.0
+    finally:
+        policy._SPEND_LEDGER, policy._SPEND_LEDGER_LOCK = led, lock
+        for k, v in saved.items():
+            if v is None: _os.environ.pop(k, None)
+            else: _os.environ[k] = v
+
+@case("CC-SpendCap", "concurrent reservations cannot overshoot the budget ceiling")
+def _():
+    import os as _os
+    import tempfile
+    import pathlib
+    import threading
+    saved = {k: _os.environ.get(k) for k in ("MCP_TERRA_BUDGET_USD", "MCP_TERRA_BUDGET_WINDOW_DAYS")}
+    led, lock = policy._SPEND_LEDGER, policy._SPEND_LEDGER_LOCK
+    try:
+        _os.environ["MCP_TERRA_BUDGET_USD"] = "100"
+        _os.environ["MCP_TERRA_BUDGET_WINDOW_DAYS"] = "30"
+        base = pathlib.Path(tempfile.mkdtemp())
+        policy._SPEND_LEDGER = base / "ledger.jsonl"
+        policy._SPEND_LEDGER_LOCK = base / "ledger.lock"
+        now = 1_000_000_000.0
+        # 12 threads fire $30 reservations at once against a $100 budget. A correct
+        # lock admits EXACTLY 3 (3*30=90<=100; a 4th=120>100) and the total never
+        # exceeds the ceiling — no check-then-record TOCTOU overshoot.
+        ok = []
+        n = 12
+        barrier = threading.Barrier(n)
+
+        def _worker(i):
+            barrier.wait()
+            try:
+                ok.append(policy.reserve_within_budget(30, "r%d" % i, now))
+            except policy.PolicyError:
+                pass
+        threads = [threading.Thread(target=_worker, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        spent = policy.windowed_spend_usd(now)
+        assert len(ok) == 3, "expected exactly 3 reservations, got %d" % len(ok)
+        assert spent == 90.0 and spent <= 100.0, "budget overshoot: $%s" % spent
+    finally:
+        policy._SPEND_LEDGER, policy._SPEND_LEDGER_LOCK = led, lock
+        for k, v in saved.items():
+            if v is None: _os.environ.pop(k, None)
+            else: _os.environ[k] = v
+
+@case("CC-SpendCap", "ledger self-compacts to the window (no unbounded growth)")
+def _():
+    import os as _os
+    import tempfile
+    import pathlib
+    saved = {k: _os.environ.get(k) for k in ("MCP_TERRA_BUDGET_USD", "MCP_TERRA_BUDGET_WINDOW_DAYS")}
+    led, lock = policy._SPEND_LEDGER, policy._SPEND_LEDGER_LOCK
+    try:
+        _os.environ["MCP_TERRA_BUDGET_USD"] = "1000"
+        _os.environ["MCP_TERRA_BUDGET_WINDOW_DAYS"] = "30"
+        base = pathlib.Path(tempfile.mkdtemp())
+        policy._SPEND_LEDGER = base / "l.jsonl"
+        policy._SPEND_LEDGER_LOCK = base / "l.lock"
+        now = 1_000_000_000.0
+        # seed 40 OUT-OF-WINDOW entries; one reserve must prune them all
+        for i in range(40):
+            policy.record_run_cost(5, "old%d" % i, now - 40 * 86400)
+        assert len(policy._SPEND_LEDGER.read_text().splitlines()) == 40
+        policy.reserve_within_budget(7, "new", now)
+        lines = policy._SPEND_LEDGER.read_text().splitlines()
+        assert len(lines) == 1, "expected ledger compacted to 1 line, got %d" % len(lines)
+        assert policy.windowed_spend_usd(now) == 7.0
+    finally:
+        policy._SPEND_LEDGER, policy._SPEND_LEDGER_LOCK = led, lock
         for k, v in saved.items():
             if v is None: _os.environ.pop(k, None)
             else: _os.environ[k] = v
