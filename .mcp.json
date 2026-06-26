@@ -1,0 +1,5 @@
+{
+  "terra": {
+    "command": "${CLAUDE_PLUGIN_ROOT}/scripts/terra-mcp-launch.sh"
+  }
+}

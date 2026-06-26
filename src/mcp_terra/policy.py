@@ -1087,7 +1087,7 @@ def print_startup_banner() -> None:
     print(f"[mcp-terra policy] controlled-access:    {ca_msg}", file=sys.stderr)
     print(f"[mcp-terra policy] workspace allowlist:  {allow_msg}", file=sys.stderr)
     print(f"[mcp-terra policy] workspace lock:       {lock_msg}", file=sys.stderr)
-    print(f"[mcp-terra policy] rate limit:           {_RATE_LIMIT}/min", file=sys.stderr)
+    print(f"[mcp-terra policy] rate limit:           {_RATE_LIMIT}/min, {_RATE_LIMIT_HOUR}/hr (call frequency, not job duration)", file=sys.stderr)
     print(f"[mcp-terra policy] audit log:            {AUDIT_LOG}", file=sys.stderr)
     print("[mcp-terra policy] code integrity SHA-256 (record these to detect tampering):",
           file=sys.stderr)

@@ -1,0 +1,21 @@
+{
+  "name": "mcp-terra",
+  "owner": {
+    "name": "Broad Institute"
+  },
+  "metadata": {
+    "description": "Run, auto-fix, and explain Terra notebooks & WDL workflows from Claude Code.",
+    "version": "0.2.0"
+  },
+  "plugins": [
+    {
+      "name": "mcp-terra",
+      "description": "Provision a Terra VM, run a notebook/WDL on it, auto-fix bugs, and email a verified report + audio explainer. No-delete, controlled-access-aware.",
+      "version": "0.2.0",
+      "author": {
+        "name": "Broad Institute"
+      },
+      "source": "."
+    }
+  ]
+}

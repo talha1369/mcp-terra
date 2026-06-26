@@ -9,6 +9,19 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **One-command Claude Code plugin.** The repo is now also a Claude Code plugin
+  (`.claude-plugin/plugin.json` + `.claude-plugin/marketplace.json`) so teams can
+  `/plugin marketplace add talha1369/mcp-terra` → `/plugin install mcp-terra` and
+  get the MCP server **and** all four Terra skills in one step. The plugin's
+  `.mcp.json` launches the server via `scripts/terra-mcp-launch.sh`, which sources
+  a per-user `~/.mcp-terra/config.env` (written by a one-time bootstrap) and execs
+  the venv server — secrets stay in `~/.mcp-terra` (mode 0600), never in the shared
+  plugin. `install.sh` gained a `MCP_TERRA_PLUGIN_MODE` path that writes
+  `config.env` and skips `claude mcp add` (the plugin registers the server). The
+  classic `./install.sh ns/ws` path is unchanged. Smoke-tested end-to-end against
+  real Terra (bootstrap → config.env → launcher boots the server, workspace lock
+  loads, secret read from file).
+
 - **Long-run / parallel robustness (Terra-fact hardening).** Folded real Terra
   operational behaviors into the MCP so multi-hour and many-job-parallel runs are
   not disrupted:

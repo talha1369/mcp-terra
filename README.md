@@ -2,7 +2,7 @@
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)
-![Tests](https://img.shields.io/badge/tests-244%20passing-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-357%20passing-brightgreen.svg)
 ![Lint](https://img.shields.io/badge/lint-ruff-black.svg)
 ![Security](https://img.shields.io/badge/security-detect--secrets%20%2B%20pip--audit-success.svg)
 <!-- After publishing, add the live CI badge:
@@ -21,30 +21,62 @@ Built for the Broad / Stanford Terra ecosystem. Wraps these Terra services:
 - **Cromwell** (via Rawls) — workflow submission, metadata, cost
 - plus **gsutil** for bucket I/O
 
-## 60-second quickstart
+## Install
+
+Two ways in. Both end at the same place: the MCP connected + the Terra skills
+loaded. **Prerequisite for both** (one-time per machine):
 
 ```bash
-# 1. Auth with the email registered on Terra (one-time per machine)
-gcloud auth application-default login
+gcloud auth application-default login   # auth with your Terra-registered email
+```
 
-# 2. Get the repo
-git clone <repo-url> ~/projects/mcp-terra && cd ~/projects/mcp-terra
+### Option A — Claude Code plugin (recommended for teams)
 
-# 3. One-shot installer — handles deps, runner secret, MCP registration
-./install.sh claussnitzer-fdp/your-workspace
+Bundles the MCP server **and** the Terra skills (`terra-bugfix-loop`,
+`terra-wdl-run`, `terra-setup-check`, `terra-share-pack`) in one install:
 
-# 4. Open Claude Code from anywhere
+```text
+# In Claude Code:
+/plugin marketplace add talha1369/mcp-terra
+/plugin install mcp-terra
+```
+
+Then run the one-time bootstrap (creates a dedicated venv, the runner secret,
+and `~/.mcp-terra/config.env` — it does NOT touch your system Python or shell
+rc), and restart Claude Code:
+
+```bash
+# Locate the bootstrap the plugin installed, then run it once with your workspace:
+BOOTSTRAP="$(find ~/.claude/plugins -name terra-bootstrap.sh -path '*mcp-terra*' 2>/dev/null | head -1)"
+bash "$BOOTSTRAP" claussnitzer-fdp/your-workspace
+```
+
+The plugin's MCP server launches via `scripts/terra-mcp-launch.sh`, which loads
+that config and starts the server from the venv. Re-run the bootstrap any time
+to change workspace; it's idempotent.
+
+### Option B — one-shot installer (single user / no marketplace)
+
+```bash
+git clone https://github.com/talha1369/mcp-terra ~/projects/mcp-terra
+cd ~/projects/mcp-terra
+./install.sh claussnitzer-fdp/your-workspace     # deps, secret, `claude mcp add`
 claude
-
-# 5. First prompt:    Run terra_health.
-#    Then any time:   Run <my-notebook>.ipynb via the auto-fix loop, auto-stop on success, email me the report.
 ```
 
 `install.sh` is idempotent — re-run any time to refresh the MCP registration.
 It validates gcloud auth, runner-secret strength, your Terra workspace access
-(via Rawls), then registers the MCP with Claude Code via `claude mcp add`. No
-manual editing of `settings.json`, no env-vars in your shell rc, no PATH
-guessing.
+(via Rawls), then registers the MCP via `claude mcp add`. No manual editing of
+`settings.json`, no env-vars in your shell rc, no PATH guessing. (Skills load
+when you open Claude Code from the repo dir, or install Option A for them
+globally.)
+
+### First prompts (either option)
+
+```text
+Run terra_health.
+Run <my-notebook>.ipynb via the auto-fix loop, auto-stop on success, email me the report.
+```
 
 ## Architecture (trust boundaries)
 

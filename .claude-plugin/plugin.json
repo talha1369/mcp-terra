@@ -1,0 +1,11 @@
+{
+  "name": "mcp-terra",
+  "version": "0.2.0",
+  "description": "Run, auto-fix, and explain Terra notebooks & WDL workflows from Claude Code: provision the right-sized VM, execute on it, auto-fix bugs, and email a verified report plus an audio explainer of the results. Credentialed, no-delete, controlled-access-aware.",
+  "author": {
+    "name": "Broad Institute"
+  },
+  "homepage": "https://github.com/talha1369/mcp-terra",
+  "repository": "https://github.com/talha1369/mcp-terra",
+  "keywords": ["terra", "bioinformatics", "wdl", "cromwell", "notebooks", "gcp", "broad"]
+}
