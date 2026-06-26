@@ -1140,13 +1140,19 @@ PYVERIFY
         rm -f "$PGID_FILE" 2>/dev/null || true
         set -e
         RUN_ENDED_AT=$(date +%s)
-        # security review: re-check the lease AFTER the run too — LOST_CLAIM /
-        # RUNNER_ABORT can land AFTER papermill exits but BEFORE we synthesize +
-        # upload terminal state (the in-loop flag alone would miss that). If we no
-        # longer hold the claim, the runner that DOES owns the job: write nothing,
-        # move nothing, leave it to the durable markers.
-        if [ "$LEASE_ABORTED" -eq 1 ] || [ -f "$LOST_CLAIM" ] || [ -f "$RUNNER_ABORT" ]; then
-            echo "[runner] $JOB_ID: lease lost / halt — leaving the result + spec to the claim holder (no terminal write)." >&2
+        # security review: distinguish a KILLED run from a COMPLETED one here.
+        # LEASE_ABORTED=1 means the watch loop KILLED papermill mid-run (lease
+        # lost / halt fired DURING execution) — that is NOT a notebook completion,
+        # so we skip synthesis + terminalization AND cost-control accounting (it is
+        # an infra abort, not a bug-loop failure for fail-streak; its compute is
+        # still counted by the VM-uptime spend cap). This is the ONLY post-wait
+        # `continue`, and only for a non-completed run.
+        # A run that COMPLETED and only then had its lease/abort sentinel appear
+        # (LEASE_ABORTED=0) deliberately does NOT continue here: it flows down, the
+        # terminal-write section skips the write when unowned, and the shared
+        # fail-streak + auto-stop block STILL runs for the completed billable run.
+        if [ "$LEASE_ABORTED" -eq 1 ]; then
+            echo "[runner] $JOB_ID: papermill killed mid-run (lease loss / halt); skipping terminalization + cost accounting (not a completion)." >&2
             continue
         fi
         # security review: CAUSAL session-limit detection, not a wall-clock heuristic.

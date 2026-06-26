@@ -1384,7 +1384,7 @@ def _():
     s = nbr.runner_script_template()
     assert "setsid sh -c" in s, "papermill not in its own session/group"
     assert "LEASE_ABORTED=1" in s and 'kill -KILL -- "-$PM_PGID"' in s
-    assert "lease lost / halt" in s, "no lease-loss abort path"
+    assert "prevents double-execute" in s, "no lease-loss abort path"
 
 @case("CC-Hardening", "PGID recorded SYNCHRONOUSLY before the workload runs (no race)")
 def _():
@@ -1399,10 +1399,13 @@ def _():
 def _():
     from mcp_terra import notebook_runner as nbr
     s = nbr.runner_script_template()
-    # at least two post-run lease re-checks (after wait, and right before result.json)
-    assert s.count('[ -f "$LOST_CLAIM" ] || [ -f "$RUNNER_ABORT" ]') >= 3, \
-        "missing post-exit / pre-write lease re-checks"
+    # lease re-checks: the in-run watch loop AND the synchronous pre-terminal-write
+    # gate (the post-wait branch distinguishes a KILLED run separately).
+    assert s.count('[ -f "$LOST_CLAIM" ] || [ -f "$RUNNER_ABORT" ]') >= 2, \
+        "missing in-run / pre-write lease re-checks"
     assert "skipping the terminal write" in s
+    # a run KILLED mid-execution is handled distinctly (not a completion)
+    assert "papermill killed mid-run" in s
 
 @case("CC-Hardening", "runner object fetched from a generation-pinned (immutable) URI")
 def _():
