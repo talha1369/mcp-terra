@@ -95,7 +95,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 - **One-command Claude Code plugin.** The repo is now also a Claude Code plugin
   (`.claude-plugin/plugin.json` + `.claude-plugin/marketplace.json`) so teams can
-  `/plugin marketplace add your-org/mcp-terra` → `/plugin install mcp-terra` and
+  `/plugin marketplace add talha1369/mcp-terra` → `/plugin install mcp-terra` and
   get the MCP server **and** all four Terra skills in one step. The plugin's
   `.mcp.json` launches the server via `scripts/terra-mcp-launch.sh`, which sources
   a per-user `~/.mcp-terra/config.env` (written by a one-time bootstrap) and execs

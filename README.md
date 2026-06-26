@@ -6,7 +6,7 @@
 ![Lint](https://img.shields.io/badge/lint-ruff-black.svg)
 ![Security](https://img.shields.io/badge/security-detect--secrets%20%2B%20pip--audit-success.svg)
 <!-- After publishing, add the live CI badge:
-![CI](https://github.com/your-org/mcp-terra/actions/workflows/ci.yml/badge.svg) -->
+![CI](https://github.com/talha1369/mcp-terra/actions/workflows/ci.yml/badge.svg) -->
 
 An MCP (Model Context Protocol) server that lets an AI assistant — any MCP-aware
 agent — manage Terra (terra.bio) workspaces, runtime VMs, workspace buckets,
@@ -49,7 +49,7 @@ Bundles the MCP server **and** the Terra skills (`terra-bugfix-loop`,
 
 ```text
 # In Claude Code:
-/plugin marketplace add your-org/mcp-terra
+/plugin marketplace add talha1369/mcp-terra
 /plugin install mcp-terra
 ```
 
@@ -70,7 +70,7 @@ to change workspace; it's idempotent.
 ### Option B — one-shot installer (single user / no marketplace)
 
 ```bash
-git clone https://github.com/your-org/mcp-terra ~/projects/mcp-terra
+git clone https://github.com/talha1369/mcp-terra ~/projects/mcp-terra
 cd ~/projects/mcp-terra
 ./install.sh your-namespace/your-workspace     # deps, secret, `claude mcp add`
 claude

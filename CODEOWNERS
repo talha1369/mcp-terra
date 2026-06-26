@@ -1,17 +1,17 @@
 # Code owners for mcp-terra.
 #
 # Owners are requested for review automatically on every pull request.
-# Maintainer: @your-org. If the repo is published under an org, you can
+# Maintainer: @talha1369. If the repo is published under an org, you can
 # additionally assign an org team (e.g. @broadinstitute/terra-mcp-maintainers).
 
 # Default owner for everything in the repo:
-* @your-org
+* @talha1369
 
 # Security-sensitive surfaces deserve explicit ownership:
-/src/mcp_terra/policy.py        @your-org
-/src/mcp_terra/safety.py        @your-org
-/src/mcp_terra/secret_scan.py   @your-org
-/src/mcp_terra/email_send.py    @your-org
-/SECURITY.md                    @your-org
-/.github/                       @your-org
-/.secrets.baseline              @your-org
+/src/mcp_terra/policy.py        @talha1369
+/src/mcp_terra/safety.py        @talha1369
+/src/mcp_terra/secret_scan.py   @talha1369
+/src/mcp_terra/email_send.py    @talha1369
+/SECURITY.md                    @talha1369
+/.github/                       @talha1369
+/.secrets.baseline              @talha1369
