@@ -22,6 +22,7 @@ import collections
 import datetime
 import hashlib
 import hmac
+import json
 import os
 import sys
 import threading
@@ -145,6 +146,98 @@ def vm_hourly_usd() -> float:
     except (TypeError, ValueError):
         r = 0.0
     return max(0.0, r)
+
+
+# ── Rolling spend budget (opt-in; per-run cap OR over a time window) ─────────
+# The PER-RUN cap is passed to terra_create_runtime (max_cost_usd) and enforced
+# by the on-VM runner (the VM self-stops before that estimate). The ROLLING
+# budget below is an opt-in ceiling over a time window (e.g. $500 / 30 days): the
+# MCP refuses a new run when the sum of per-run caps committed within the window
+# plus this run's cap would exceed it. It is a WORST-CASE bound (each run cannot
+# exceed its own cap, so actual spend <= committed caps); for an authoritative,
+# cloud-enforced monthly cap, ALSO set a GCP billing budget on the project.
+_SPEND_LEDGER = CONFIG_DIR / "spend_ledger.jsonl"
+
+
+def budget_usd() -> float:
+    """Opt-in rolling spend budget (USD) over budget_window_days(). 0/unset = off."""
+    try:
+        b = float(os.environ.get("MCP_TERRA_BUDGET_USD", "0") or "0")
+    except (TypeError, ValueError):
+        b = 0.0
+    return max(0.0, b)
+
+
+def budget_window_days() -> int:
+    """The rolling window (days) the budget applies over. Default 30; clamp 1..366."""
+    try:
+        d = int(os.environ.get("MCP_TERRA_BUDGET_WINDOW_DAYS", "30") or "30")
+    except (TypeError, ValueError):
+        d = 30
+    return max(1, min(d, 366))
+
+
+def windowed_spend_usd(now_epoch: float) -> float:
+    """Sum the per-run caps recorded in the ledger within the rolling window."""
+    if not _SPEND_LEDGER.exists():
+        return 0.0
+    cutoff = now_epoch - budget_window_days() * 86400
+    total = 0.0
+    try:
+        for line in _SPEND_LEDGER.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            try:
+                if float(rec.get("ts", 0)) >= cutoff:
+                    total += max(0.0, float(rec.get("usd", 0)))
+            except (TypeError, ValueError):
+                continue
+    except OSError:
+        pass
+    return total
+
+
+def assert_within_budget(new_run_usd: float, now_epoch: float) -> None:
+    """Refuse a new run when a rolling budget is set and it would be exceeded.
+    Fail-LOUD. No-op when no budget is configured."""
+    b = budget_usd()
+    if b <= 0:
+        return
+    if new_run_usd <= 0:
+        raise PolicyError(
+            "A rolling spend budget (MCP_TERRA_BUDGET_USD) is set, so each run "
+            "MUST specify a per-run cap (max_cost_usd) — otherwise spend cannot "
+            "be bounded against the budget.",
+            code="E_BUDGET_REQUIRES_CAP",
+            user_action_required="pass a max_cost_usd to this run")
+    spent = windowed_spend_usd(now_epoch)
+    if spent + new_run_usd > b:
+        raise PolicyError(
+            f"rolling spend budget would be exceeded: ${spent:.2f} already "
+            f"committed in the last {budget_window_days()}d + ${new_run_usd:.2f} "
+            f"for this run > ${b:.2f} budget (MCP_TERRA_BUDGET_USD). Wait for the "
+            f"window to roll off, lower this run's cap, or raise the budget.",
+            code="E_BUDGET_EXCEEDED",
+            user_action_required="lower the run cap, wait, or raise the budget")
+
+
+def record_run_cost(usd: float, ref: str, now_epoch: float) -> None:
+    """Append a run's committed per-run cap to the ledger (only when a budget is
+    active and the cap is positive). Best-effort; never raises."""
+    if budget_usd() <= 0 or usd <= 0:
+        return
+    try:
+        _SPEND_LEDGER.parent.mkdir(parents=True, exist_ok=True)
+        with open(_SPEND_LEDGER, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"ts": now_epoch, "usd": float(usd),
+                                 "ref": str(ref)[:200]}) + "\n")
+    except OSError:
+        pass
 
 
 def runner_concurrency() -> int:

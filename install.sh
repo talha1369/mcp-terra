@@ -110,6 +110,55 @@ fi
   || fail "mcp_terra failed to import after install"
 ok "Package importable from venv"
 
+# ── 3b. Pre-authorize the MCP tools (no per-call permission prompts) ─────────
+# Every install pre-approves the terra MCP tools in ~/.claude/settings.json
+# (permissions.allow) so the auto-fix loop runs automatically, without a
+# permission prompt on each tool call. The MCP's OWN hard guards remain the
+# safety net regardless: there is NO delete/overwrite primitive anywhere, plus
+# the spend cap, per-session submit cap, controlled-access guard, rate limit, and
+# kill-switch. Opt OUT with MCP_TERRA_NO_AUTO_APPROVE=1 (then you'll be prompted
+# per tool, as Claude Code does by default).
+if [ -z "${MCP_TERRA_NO_AUTO_APPROVE:-}" ]; then
+  step "Pre-authorizing MCP tools (Claude Code permissions.allow)"
+  if "$VENV_PY" - <<'PYAUTH'
+import contextlib, io, json, os, sys, tempfile
+settings = os.path.expanduser("~/.claude/settings.json")
+# Enumerate the ACTUAL registered tool surface (future-proof; no hardcoded list).
+try:
+    with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+        from mcp_terra import server as _s
+        tools = sorted(t.name for t in _s.server._tool_manager.list_tools())
+except Exception as e:
+    print(f"could not enumerate tools: {e}", file=sys.stderr); sys.exit(1)
+want = [f"mcp-terra:{t}" for t in tools] + ["mcp-terra:*"]
+os.makedirs(os.path.dirname(settings), exist_ok=True)
+data = {}
+if os.path.exists(settings):
+    try:
+        with open(settings) as fh:
+            data = json.load(fh)
+    except Exception:
+        # Never clobber an unreadable/foreign settings file — fail loud instead.
+        print("~/.claude/settings.json is not valid JSON; refusing to modify it", file=sys.stderr)
+        sys.exit(1)
+allow = data.setdefault("permissions", {}).setdefault("allow", [])
+added = sum(1 for w in want if w not in allow and not allow.append(w))
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(settings))
+with os.fdopen(fd, "w") as fh:
+    json.dump(data, fh, indent=2)
+os.chmod(tmp, 0o600)
+os.replace(tmp, settings)
+print(f"pre-authorized {len(tools)} terra tools (+ wildcard); {added} new entry(ies)")
+PYAUTH
+  then
+    ok "MCP tools pre-authorized in ~/.claude/settings.json (opt out: MCP_TERRA_NO_AUTO_APPROVE=1)"
+  else
+    info "Could not pre-authorize MCP tools automatically (non-fatal; you may see per-tool prompts)."
+  fi
+else
+  info "MCP_TERRA_NO_AUTO_APPROVE set — leaving Claude Code to prompt per tool."
+fi
+
 # ── 4. Runner secret ───────────────────────────────────────────────────────
 step "Runner secret (HMAC key)"
 

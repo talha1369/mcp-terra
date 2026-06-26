@@ -575,6 +575,8 @@ def terra_create_runtime(
     auto_start_runner: bool = True,
     runner_ready_timeout_s: int = 600,
     install_claude_code: bool = True,
+    max_cost_usd: float = 0.0,
+    vm_hourly_usd: float = 0.0,
 ) -> str:
     """Create a new Terra runtime (Jupyter VM) — ATOMIC: by default the VM
     comes back with a LIVE runner, or this call fails loud.
@@ -616,6 +618,21 @@ def terra_create_runtime(
             (default True). Set False for the legacy fire-and-forget behavior
             (returns as soon as Leonardo accepts the create).
         runner_ready_timeout_s: max seconds to wait for Running (clamped 120..1800).
+        max_cost_usd: OPTIONAL per-run hard spend cap in USD for THIS VM. 0 (the
+            default) falls back to the env default (MCP_TERRA_MAX_COST_USD, also 0
+            = no cap). When set, the on-VM runner self-STOPS the VM (pause; the
+            persistent disk is kept — it NEVER deletes) before the estimated spend
+            crosses the cap, warning at 80% first. Pass this when the user says
+            e.g. "run with a $20 cap".
+        vm_hourly_usd: OPTIONAL hourly rate (USD/hr) used to estimate spend for the
+            cap. 0 falls back to MCP_TERRA_VM_HOURLY_USD; only meaningful with a cap.
+
+    Rolling budget (opt-in, env-only): if MCP_TERRA_BUDGET_USD > 0, this call is
+    refused PRE-FLIGHT (before any VM is provisioned) when the sum of per-run caps
+    started within the trailing MCP_TERRA_BUDGET_WINDOW_DAYS window (default 30)
+    plus this run's cap would exceed the budget — and it refuses any UNCAPPED run
+    while a budget is in force (an uncapped run can't be bounded). Because the
+    refusal happens before provisioning, no running VM is ever killed by the budget.
 
     Returns a ready/created status block. VM takes ~3-4 min to provision.
     """
@@ -641,6 +658,20 @@ def terra_create_runtime(
     if not (0 <= auto_pause_threshold_minutes <= 1440):
         raise ValueError(f"auto_pause_threshold_minutes out of range (0–1440): "
                          f"{auto_pause_threshold_minutes}")
+    # Per-run spend controls. max_cost_usd caps THIS VM's estimated spend (the
+    # on-VM runner self-stops before it); vm_hourly_usd is the $/hr used for the
+    # estimate. Both override the env defaults for this run only. A rolling budget
+    # (MCP_TERRA_BUDGET_USD over MCP_TERRA_BUDGET_WINDOW_DAYS), if set, is checked
+    # against the sum of per-run caps committed in the window.
+    if max_cost_usd < 0 or vm_hourly_usd < 0:
+        raise ValueError("max_cost_usd and vm_hourly_usd must be >= 0")
+    _eff_cap = float(max_cost_usd) if max_cost_usd > 0 else policy.max_cost_usd()
+    _eff_rate = float(vm_hourly_usd) if vm_hourly_usd > 0 else policy.vm_hourly_usd()
+    import time as _time_budget
+    try:
+        policy.assert_within_budget(_eff_cap, _time_budget.time())
+    except policy.PolicyError as e:
+        raise PermissionError(str(e))
     # Resolve the workspace bucket (for the runner scripts + heartbeat path).
     # Default to the locked workspace bucket.
     if not bucket_uri:
@@ -771,8 +802,9 @@ def terra_create_runtime(
             "MCP_TERRA_MAX_RUN_HOURS": str(policy.max_run_hours()),
             "MCP_TERRA_SESSION_MARGIN_SEC": str(policy.session_margin_sec()),
             # Spend cap (the runner self-halts the VM before this estimated spend).
-            "MCP_TERRA_MAX_COST_USD": str(policy.max_cost_usd()),
-            "MCP_TERRA_VM_HOURLY_USD": str(policy.vm_hourly_usd()),
+            # Per-run max_cost_usd / vm_hourly_usd override the env defaults.
+            "MCP_TERRA_MAX_COST_USD": str(_eff_cap),
+            "MCP_TERRA_VM_HOURLY_USD": str(_eff_rate),
             # Single-VM concurrency: how many jobs this VM runs at once.
             "MCP_TERRA_RUNNER_CONCURRENCY": str(policy.runner_concurrency()),
         }
@@ -789,6 +821,9 @@ def terra_create_runtime(
         start_user_script_uri=start_user_script_uri,
         custom_env_vars=custom_env_vars,
     )
+    # Commit this run's per-run cap to the rolling-budget ledger (no-op unless a
+    # budget is configured). Records the worst-case cap; actual spend <= the cap.
+    policy.record_run_cost(_eff_cap, runtime_name, _time_budget.time())
     # Never echo the secret back (Leonardo's create response may include the
     # customEnvironmentVariables we just sent).
     create_resp = _redact_runtime_env(create_resp)

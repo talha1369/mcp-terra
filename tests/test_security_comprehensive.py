@@ -4872,13 +4872,44 @@ def _():
 def _():
     import inspect
     csrc = inspect.getsource(server.terra_create_runtime)
-    assert '"MCP_TERRA_MAX_COST_USD": str(policy.max_cost_usd())' in csrc
-    assert '"MCP_TERRA_VM_HOURLY_USD": str(policy.vm_hourly_usd())' in csrc
+    # per-run cap/rate override the env defaults, then propagate to the VM cEV
+    assert '"MCP_TERRA_MAX_COST_USD": str(_eff_cap)' in csrc
+    assert '"MCP_TERRA_VM_HOURLY_USD": str(_eff_rate)' in csrc
+    assert "_eff_cap = float(max_cost_usd) if max_cost_usd > 0 else policy.max_cost_usd()" in csrc
     ssrc = inspect.getsource(server.terra_start_runner_on_vm)
     assert "MCP_TERRA_MAX_COST_USD=" in ssrc and "MCP_TERRA_VM_HOURLY_USD=" in ssrc
     # submit warns in advance when a cap is set
     sub = inspect.getsource(server.terra_submit_notebook_job)
     assert "spend_cap_advisory" in sub
+
+@case("CC-SpendCap", "per-run cap + rolling budget: opt-in, refuses over-budget / uncapped")
+def _():
+    import os as _os
+    import tempfile
+    import pathlib
+    saved = {k: _os.environ.get(k) for k in ("MCP_TERRA_BUDGET_USD", "MCP_TERRA_BUDGET_WINDOW_DAYS")}
+    led = policy._SPEND_LEDGER
+    try:
+        _os.environ["MCP_TERRA_BUDGET_USD"] = "100"
+        _os.environ["MCP_TERRA_BUDGET_WINDOW_DAYS"] = "30"
+        policy._SPEND_LEDGER = pathlib.Path(tempfile.mktemp())
+        now = 1_000_000_000.0
+        # uncapped run under a budget → refuse (can't bound)
+        must_raise(policy.assert_within_budget, policy.PolicyError, 0, now)
+        # commit caps up to the budget, then refuse the one that exceeds it
+        policy.assert_within_budget(60, now); policy.record_run_cost(60, "r1", now)
+        must_raise(policy.assert_within_budget, policy.PolicyError, 50, now)  # 60+50>100
+        # entries outside the window roll off
+        policy.record_run_cost(999, "old", now - 31 * 86400)
+        assert policy.windowed_spend_usd(now) == 60.0
+        # no budget set → no-op (uncapped allowed)
+        _os.environ["MCP_TERRA_BUDGET_USD"] = "0"
+        policy.assert_within_budget(0, now)
+    finally:
+        policy._SPEND_LEDGER = led
+        for k, v in saved.items():
+            if v is None: _os.environ.pop(k, None)
+            else: _os.environ[k] = v
 
 
 # ──────────────────────────────────────────────────────────────────────────

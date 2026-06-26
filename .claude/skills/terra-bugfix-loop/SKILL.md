@@ -59,7 +59,22 @@ so they never double-run a job. Size each env to its workload.
    - **No runtime** → `terra_create_runtime(google_project, name,
      **create_runtime_args)`. This is the **atomic** create: it returns only
      once the VM is Running AND the on-VM runner is live (fresh heartbeat),
-     or fails loud with the runner-log tail. Confirm the spend first.
+     or fails loud with the runner-log tail. **Provision automatically — do NOT
+     pause to ask permission to spend.** The run is bounded by the MCP's own hard
+     caps (the per-session submit cap and, when set, the `MCP_TERRA_MAX_COST_USD`
+     spend cap that self-stops the VM); recommend the user set
+     `MCP_TERRA_MAX_COST_USD` for a hard credit ceiling.
+     - **If the user names a per-run limit** ("run with a $20 cap", "don't spend
+       more than $X") → pass `max_cost_usd=<X>` (and optionally `vm_hourly_usd=`)
+       to `terra_create_runtime`. At the cap the on-VM runner self-STOPS the VM
+       (pause; persistent disk kept — it NEVER deletes), warning at 80% first.
+     - **If the user names an overall/time-window budget** ("cap me at $200/month")
+       → that's the opt-in rolling budget: set `MCP_TERRA_BUDGET_USD` (and
+       `MCP_TERRA_BUDGET_WINDOW_DAYS`, default 30) in config.env. Once a budget is
+       in force, every run MUST carry a `max_cost_usd`; `terra_create_runtime`
+       refuses PRE-FLIGHT (no VM is provisioned) if this run's cap plus the caps
+       already committed in the window would exceed the budget — so a budget never
+       kills a running VM, it only declines to start a new one.
    - **Adequate** (GPU matches; machine ≥; disk ≥ recommended) → if
      `Stopped`/`Paused`, `terra_start_runtime`; else use as-is. NOTE: a
      pre-existing runtime created before the seamless feature won't have an
@@ -122,7 +137,7 @@ so they never double-run a job. Size each env to its workload.
      |---|---|
      | `missing_module` | prepend a `!pip install <module>` cell; re-upload |
      | `transient_network` | re-submit, no edit |
-     | `oom` | ask the user about a bigger VM (Phase 1 right-size) before retry |
+     | `oom` | auto-escalate ONCE to the next-larger VM (Phase 1 right-size) + re-submit; if it OOMs again, stop + surface |
      | `missing_file` | `terra_list_bucket` to check; fix the path if present, else ask |
      | `name_error`/`attribute_error`/`key_error` | read the failing cell, fix the typo/attr/key, re-upload |
      | `syntax_error`/`type_error`/`value_error`/`assertion_error` | read the cell, fix, re-upload |
