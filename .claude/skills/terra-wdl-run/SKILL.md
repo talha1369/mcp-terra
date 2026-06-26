@@ -1,6 +1,6 @@
 ---
 name: terra-wdl-run
-description: Author (or take) a WDL workflow, validate it, run it on Terra/Cromwell with DIRECT inputs, monitor to completion with an auto-fix loop, then email a verified report + NotebookLM-style audio explainer of the outputs. The MCP half is credentialed primitives only (no delete); this skill is the authoring + orchestration. Use when the user wants to run a WDL workflow (not a notebook) on Terra.
+description: Author (or take) a WDL workflow, validate it, run it on Terra/Cromwell with DIRECT inputs, monitor to completion with an auto-fix loop, then email a verified report + NotebookLM-style audio explainer of the outputs. This is the PARALLEL-compute path — use WDL scatter to fan hundreds of tasks across Google Batch, and run many submissions at once. The MCP half is credentialed primitives only (no delete); this skill is the authoring + orchestration. Use when the user wants to run a WDL workflow (not a notebook) on Terra, or any large parallel workload.
 argument-hint: [wdl_path_or_spec] [--config namespace/name] [--email] [--audio]
 allowed-tools: mcp-terra:terra_health, mcp-terra:terra_get_workspace, mcp-terra:terra_list_method_configs, mcp-terra:terra_register_method, mcp-terra:terra_create_method_config, mcp-terra:terra_submit_workflow, mcp-terra:terra_get_submission, mcp-terra:terra_get_workflow_outputs, mcp-terra:terra_render_audio_summary, mcp-terra:terra_send_run_report_email, Read, Edit, Bash, Task
 ---
@@ -77,10 +77,45 @@ No-clobber: if the config name exists, pick a fresh one.
 leave `entity_type`/`entity_name` empty for the direct-input run. Confirm the
 spend first. Capture the `submissionId`.
 
-## Phase 6 — Monitor (auto-fix loop, cap 5)
+## Parallelism — scatter/gather + concurrent submissions (the parallel path)
+
+WDL/Cromwell is the **native parallel-compute** path on Terra — prefer it over
+notebooks for anything that fans out. Three layers of parallelism, all supported:
+
+1. **Scatter within a workflow.** Author a `scatter (x in array) { call task { ... } }`
+   block — Cromwell runs every shard **in parallel** as separate Google Batch
+   tasks (subject to your project's Batch/quota limits), then gathers the outputs.
+   This is how one submission runs hundreds of tasks at once. When the user wants
+   "run X over N inputs in parallel," scatter over the N inputs rather than
+   submitting N separate workflows.
+2. **Many concurrent submissions.** `terra_submit_workflow` is independent and
+   non-blocking — submit several configs and they all run at once. There is no
+   per-submission serialization in the MCP (each is its own SPEND; confirm each).
+3. **Notebooks in parallel** (the sibling path, for completeness): submit several
+   notebook jobs and run several runtimes — the on-VM runner's **atomic per-spec
+   claim** means each VM picks up a *different* job, so notebooks run in parallel
+   across VMs and the same job is never executed twice. (A single VM still runs
+   its own jobs one at a time, by design.)
+
+Cost scales with parallelism — say so before a wide scatter, and prefer
+preemptible/spot `runtime` where the task tolerates retries.
+
+## Phase 6 — Monitor (auto-fix loop, cap 5; handles many parallel shards)
 Poll `terra_get_submission(namespace, name, submission_id)` until the
 submission status is terminal (`Done`/`Aborted`) and read each workflow's
-status. One line per check: `wf: status=Running (2/3 calls done)`.
+status. For a **scattered** workflow, surface aggregate shard progress, not just
+the top-line status — one line per check, e.g.
+`wf: Running — 142/200 shards Succeeded, 55 Running, 3 Failed`.
+
+- To watch **multiple submissions at once**, poll each `submissionId` and report
+  a compact per-submission roll-up. (A future `terra_summarize_submissions` tool
+  will make this one call; until then, loop over `terra_get_submission`.)
+- **Partial failure in a scatter:** if some shards `Failed` while others
+  `Succeeded`, report which shards failed + their messages; fix the root cause
+  (usually one bad input or a task-level runtime issue) and re-submit — Cromwell
+  **call-caching** (`use_call_cache=True`, the default) means the already-
+  succeeded shards are reused, so only the failed shards re-run. Don't re-run the
+  whole scatter from scratch.
 
 - **All `Succeeded`** → Phase 7.
 - **`Failed`** → read the workflow's failure messages. Fix by category:

@@ -503,6 +503,27 @@ bug it encountered and the specific fix it applied. To send it as an email:
 Use `bak` for code supersession (clear "this is the old/buggy one" signal);
 use `timestamp` for data versioning.
 
+## Running multiple / parallel jobs
+
+The MCP supports running many jobs at once — there is no serialization at the
+submission layer. Three layers of parallelism:
+
+1. **WDL / Cromwell scatter (the parallel-compute path).** `terra_submit_workflow`
+   launches a Cromwell submission; a `scatter` block fans every shard out as a
+   separate Google Batch task, so **one** workflow runs hundreds of tasks in
+   parallel (bounded by your project's Batch quota). Call-caching means a
+   re-submit only re-runs the *failed* shards. This is the right tool for large
+   parallel workloads — see the `terra-wdl-run` skill.
+2. **Many concurrent submissions.** Each `terra_submit_workflow` /
+   `terra_submit_notebook_job` is independent and non-blocking — submit several
+   and they all run at once (each spend is confirmed separately).
+3. **Notebooks across multiple runtimes.** Submit several notebook jobs and run
+   several runtimes (VMs); the on-VM runner takes an **atomic per-spec claim**
+   (a no-clobber `.claim` marker, keyed to the runtime), so each VM picks up a
+   *different* job — notebooks run in parallel across VMs and the same job is
+   never executed twice. (A single VM runs its own jobs sequentially, by design,
+   to avoid OOM — for many notebooks at once, use more runtimes or the WDL path.)
+
 ## Example collaboration flow
 
 ```text
