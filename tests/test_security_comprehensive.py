@@ -3427,6 +3427,27 @@ def _():
 # CC-Discoverability — MCP resources + prompts (discoverability), safe (no data egress)
 # ──────────────────────────────────────────────────────────────────────────
 
+@case("CC-Reads", "list_bucket detailed mode parses gsutil ls -l into structured objects")
+def _():
+    from mcp_terra import bucket as _bk2
+    orun, osafe = _bk2._run_gsutil, safety.safe_bucket_uri
+    safety.safe_bucket_uri = lambda u: u
+    _bk2._run_gsutil = lambda args, **k: (
+        "      1234  2026-06-26T00:00:00Z  gs://fc-x/out/a.txt\n"
+        "    567890  2026-06-26T00:01:00Z  gs://fc-x/out/b.bam\n"
+        "                                 gs://fc-x/out/sub/\n"
+        "TOTAL: 2 objects, 569124 bytes.\n")
+    try:
+        out = server.terra_list_bucket("gs://fc-x/out/", detailed=True)
+        assert '"size_bytes": 1234' in out and '"size_bytes": 567890' in out
+        assert '"updated": "2026-06-26T00:00:00Z"' in out
+        assert '"is_prefix": true' in out          # the sub-prefix line
+        assert "TOTAL" not in out                   # summary line dropped
+        assert '"truncated": false' in out
+    finally:
+        _bk2._run_gsutil, safety.safe_bucket_uri = orun, osafe
+
+
 @case("CC-Discoverability", "MCP resources + prompts are registered")
 def _():
     import asyncio

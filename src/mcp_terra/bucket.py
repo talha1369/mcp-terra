@@ -95,6 +95,42 @@ def list_bucket(bucket_uri: str, recursive: bool = False) -> list[str]:
     return [ln for ln in out.splitlines() if ln.strip()]
 
 
+def list_bucket_detailed(bucket_uri: str, recursive: bool = False,
+                         max_items: int = 1000) -> dict:
+    """Structured listing via `gsutil ls -l` — per object: name, size_bytes,
+    updated (so the agent can find + size + verify outputs in ONE call instead
+    of N follow-up stat calls). Returns {objects, count, truncated}.
+
+    `gsutil ls -l` prints `<size>  <RFC3339 time>  gs://...` per object, a
+    `TOTAL:` summary line, and bare `gs://.../` lines for sub-prefixes.
+    """
+    if not bucket_uri.startswith("gs://"):
+        raise BucketError(f"bucket_uri must start with gs://; got {bucket_uri!r}")
+    n = max(1, min(int(max_items), 10000))
+    args = ["ls", "-l"]
+    if recursive:
+        args.append("-r")
+    args.append(bucket_uri)
+    out = _run_gsutil(args, timeout=120.0)
+    objects: list[dict] = []
+    truncated = False
+    for ln in out.splitlines():
+        s = ln.strip()
+        if not s or s.startswith("TOTAL:"):
+            continue
+        if len(objects) >= n:
+            truncated = True
+            break
+        parts = s.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit():
+            objects.append({"name": parts[2], "size_bytes": int(parts[0]),
+                            "updated": parts[1]})
+        elif s.startswith("gs://"):           # a sub-prefix (no size in ls -l)
+            objects.append({"name": s, "size_bytes": None, "updated": None,
+                            "is_prefix": True})
+    return {"objects": objects, "count": len(objects), "truncated": truncated}
+
+
 def upload_file(local_path: str, bucket_uri: str, *, recursive: bool = False) -> str:
     """Upload a local file (or dir with recursive=True) to a gs:// destination.
 

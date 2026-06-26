@@ -873,13 +873,18 @@ def terra_create_runtime(
 # ── Workspace bucket I/O — read + write with hard safety guards ─────────────
 
 @server.tool(title="List workspace bucket", annotations=ANN_READ_REMOTE)
-def terra_list_bucket(bucket_uri: str, recursive: bool = False) -> str:
+def terra_list_bucket(bucket_uri: str, recursive: bool = False,
+                      detailed: bool = False) -> str:
     """List files at a gs:// path under one of YOUR workspace buckets.
 
     Args:
         bucket_uri: gs:// URI; MUST be a bucket your Terra account has
                     workspace access to (validated against Rawls).
         recursive: walk the prefix recursively.
+        detailed: return structured per-object {name, size_bytes, updated}
+                  (via `gsutil ls -l`, capped at 1000 objects with a `truncated`
+                  flag) instead of bare path strings — find + size + verify run
+                  outputs in ONE call instead of N follow-up stat calls.
 
     SAFETY: refuses any bucket outside your workspace allowlist.
 
@@ -894,7 +899,10 @@ def terra_list_bucket(bucket_uri: str, recursive: bool = False) -> str:
         policy.assert_data_egress_allowed(_bucket, "bucket object listing")
     except policy.PolicyError as e:
         raise PermissionError(str(e))
-    _pre("terra_list_bucket", READ, f"{bucket_uri}  recursive={recursive}")
+    _pre("terra_list_bucket", READ,
+         f"{bucket_uri}  recursive={recursive} detailed={detailed}")
+    if detailed:
+        return _ok(bk.list_bucket_detailed(bucket_uri, recursive=recursive))
     return _ok(bk.list_bucket(bucket_uri, recursive=recursive))
 
 
