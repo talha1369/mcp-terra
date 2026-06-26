@@ -2199,14 +2199,17 @@ def _():
 @case("CC-SeamlessRunner", "runner records PROCESSED on result-upload failure (no infinite re-exec)")
 def _():
     # A permanent result.json upload failure must NOT loop forever re-executing
-    # a succeeding notebook (rc=0 never trips the fail-streak guard).
+    # a succeeding notebook (rc=0 never trips the fail-streak guard), AND must not
+    # let another VM re-run it. The branch writes a TERMINAL cross-VM status
+    # marker, records PROCESSED locally, and stops the lease refresher.
     t = _nbr.runner_script_template()
-    assert "infinite re-execution loop" in t
-    # the failure branch records the job as processed before `continue`
-    blk = t[t.index("failed to upload result.json"):]
+    assert "result.json upload failed for $JOB_ID after retries" in t
+    assert "REFUSED-RESULT-UPLOAD-FAILED" in t, "must write a cross-VM terminal marker"
+    blk = t[t.index("result.json upload failed for $JOB_ID after retries"):]
     nxt = blk[:blk.index("continue")]
     assert 'echo "$JOB_ID" >> "$PROCESSED_FILE"' in nxt, \
         "result-upload failure must record PROCESSED_FILE before continue"
+    assert "stop_refresher" in nxt, "must stop the lease refresher on this exit path"
 
 
 @case("CC-SeamlessRunner", "start_runner.sh auto-installs Claude Code (after runner, backgrounded, gated)")
@@ -4258,6 +4261,15 @@ def _():
     assert "accessdenied|access denied|permission|forbidden" in s, "auth errors must be fail-closed"
     assert "REFUSED*|succeeded|FAILED*" in s
     assert "transient error checking result" in s  # fail-closed, not fail-open
+    # security review r13: LEASE HEARTBEAT — a background refresher CAS-updates the
+    # claim every CLAIM_REFRESH_SEC for the whole job so a live owner is never
+    # reclaimed mid-run; a crashed owner ages out fast (TTL = 3x refresh).
+    assert "CLAIM_REFRESH_SEC" in s and "CLAIM_TTL=$(( CLAIM_REFRESH_SEC * 3 ))" in s
+    assert "REFRESH_ON" in s and "REFRESHER_PID" in s and "stop_refresher" in s
+    assert "LOST_CLAIM" in s, "must detect a lost lease mid-run"
+    # the refresher must be stopped at the TOP of each spec iteration (covers all
+    # continue paths so it can never strand a claim)
+    assert s.index("stop_refresher\n        JOB_DIR=") > 0 or "stop_refresher\n        JOB_DIR" in s
     # security review r12: pre-run download is timeout-bounded (can't hold the
     # claim past the stale margin).
     assert "notebook download for $JOB_ID failed or timed out" in s

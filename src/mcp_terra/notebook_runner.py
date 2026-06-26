@@ -427,15 +427,16 @@ SESSION_BUDGET_SEC=$(( MAX_RUN_HOURS * 3600 - SESSION_MARGIN_SEC ))
 RUNNER_START_EPOCH=$(date +%s)
 SESSION_DEADLINE=$(( RUNNER_START_EPOCH + SESSION_BUDGET_SEC ))
 SESSION_MIN_JOB_SEC=300   # refuse a new job if less than this remains
-# A per-spec claim older than this means its owner is GONE (a job can never run
-# longer than the session budget), so it is safe to reclaim. No refresh needed —
-# an ACTIVE job's claim age is bounded by JOB_BUDGET <= SESSION_BUDGET_SEC. (r10)
-# Generous stale margin: an ACTIVE job holds its claim for the papermill run
-# (bounded by JOB_BUDGET <= SESSION_BUDGET) PLUS the pre-run notebook download and
-# post-run result/log uploads (gsutil I/O). The margin must exceed that I/O so a
-# live owner's claim is never reclaimed mid-run; 1h is ample for realistic
-# notebooks, and the notebook download is additionally `timeout`-bounded. (r12)
-CLAIM_TTL=$(( SESSION_BUDGET_SEC + 3600 ))
+# LEASE HEARTBEAT: while a job runs (incl. its uploads), a background refresher
+# CAS-updates the claim timestamp every CLAIM_REFRESH_SEC, so a LIVE owner's
+# claim is never stale — and a CRASHED owner stops refreshing, so its claim ages
+# past CLAIM_TTL (a small multiple of the interval) within minutes and is
+# reclaimed. This makes the claim safe regardless of job/upload duration AND
+# gives fast crash recovery (no full-session-budget stall). (security review.)
+CLAIM_REFRESH_SEC="${MCP_TERRA_CLAIM_REFRESH_SEC:-60}"
+case "$CLAIM_REFRESH_SEC" in ''|*[!0-9]*) CLAIM_REFRESH_SEC=60 ;; esac
+[ "$CLAIM_REFRESH_SEC" -lt 15 ] && CLAIM_REFRESH_SEC=15
+CLAIM_TTL=$(( CLAIM_REFRESH_SEC * 3 ))
 # UNIQUE id per live runner INSTANCE (runtime + host + pid + boot epoch) — so two
 # VMs (or the legacy/no-name fallback) can NEVER share an owner. (security review
 # r12 critical.) Owner is used only for logging; reclaim is STALE-AGE-ONLY (no
@@ -486,6 +487,19 @@ obj_state() {
 # than ~90s. UX-only (the runner secret HMAC remains the security boundary).
 HEARTBEAT_GCS="${BUCKET%/}/mcp_terra_jobs/.runner_heartbeat.txt"
 
+# Lease-refresher handles (set per job after the claim is won). stop_refresher is
+# idempotent + called at the TOP of every spec iteration (covers every continue
+# path) AND after normal completion — so a refresher never outlives its job and
+# strands a claim. Vars resolve at call time. (security review.)
+REFRESH_ON=""
+REFRESHER_PID=""
+stop_refresher() {
+    [ -n "$REFRESH_ON" ] && rm -f "$REFRESH_ON" 2>/dev/null || true
+    [ -n "$REFRESHER_PID" ] && kill "$REFRESHER_PID" 2>/dev/null || true
+    [ -n "$REFRESHER_PID" ] && wait "$REFRESHER_PID" 2>/dev/null || true
+    REFRESHER_PID=""
+}
+
 while true; do
     # Refresh heartbeat each poll. Allowed to overwrite (intentional —
     # heartbeat is a liveness probe, not a security artifact).
@@ -507,6 +521,9 @@ while true; do
     fi
 
     for SPEC in "${PENDING[@]}"; do
+        # Stop any lease-refresher left running for the PREVIOUS spec — covers
+        # every `continue` exit path so a refresher never strands a claim. (r13)
+        stop_refresher
         JOB_DIR="$(dirname "$SPEC")"
         JOB_ID="$(basename "$JOB_DIR")"
         # STRICT JOB_ID validation BEFORE any use — defends against
@@ -586,19 +603,28 @@ while true; do
                 echo "[runner] could not stat claim for $JOB_ID; skipping this poll." >&2
                 continue   # fail-closed (transient stat error)
             fi
-            # security review r12: no metadata ts? (a pre-upgrade / foreign claim
-            # that stored data in the body) → fall back to the object's Update time
-            # so it can still age out instead of stranding the job forever.
+            # security review r12/r13: no claim-ts metadata? (a pre-upgrade /
+            # foreign claim) → fall back to the object's Update time so it can age
+            # out. If THAT is also unparseable, do NOT silently treat it as a live
+            # age-0 owner (livelock) and do NOT auto-reclaim (a metadata-parse
+            # failure on a CURRENT live claim would double-execute) — log a
+            # DISTINCT warning and skip; an operator can clear it. Observable +
+            # safe + recoverable.
             if [ -z "$CLAIM_TS" ]; then
                 _CL_UPD="$(printf '%s' "$CLAIM_STAT" | sed -n 's/^[[:space:]]*Update time:[[:space:]]*//p' | head -n1)"
                 [ -n "$_CL_UPD" ] && CLAIM_TS="$(date -u -d "$_CL_UPD" +%s 2>/dev/null || echo "")"
+                if [ -z "$CLAIM_TS" ]; then
+                    echo "[runner] WARN: claim for $JOB_ID has NO parseable timestamp (no metadata + unreadable Update time); cannot safely age it out — skipping (an operator can clear $CLAIM if its owner is gone)." >&2
+                    continue
+                fi
             fi
-            CLAIM_AGE=$(( NOW - ${CLAIM_TS:-$NOW} ))
+            CLAIM_AGE=$(( NOW - CLAIM_TS ))
             # security review r12 (critical): reclaim is STALE-AGE-ONLY — NO
             # owner-based immediate reclaim (a shared/restarted owner cannot be
             # distinguished from a live one). The owner id is unique per instance
-            # and used only for logging.
-            if [ -n "$CLAIM_TS" ] && [ "$CLAIM_AGE" -gt "$CLAIM_TTL" ]; then
+            # and used only for logging. The lease heartbeat keeps a LIVE owner's
+            # claim fresh, so age > TTL means the owner is genuinely gone.
+            if [ "$CLAIM_AGE" -gt "$CLAIM_TTL" ]; then
                 # CAS on the SAME generation we just judged — if another runner
                 # reclaimed first, the generation changed and this 412-fails.
                 if printf '%s' "$RUNNER_INSTANCE_ID" \
@@ -617,6 +643,35 @@ while true; do
         fi
 
         echo "[runner] picking up $JOB_ID"
+
+        # ── LEASE HEARTBEAT ──────────────────────────────────────────────────
+        # We now OWN the claim. Start a background refresher that CAS-updates the
+        # claim timestamp every CLAIM_REFRESH_SEC for the WHOLE job (papermill +
+        # all uploads), so a live owner's claim is never stale-reclaimed mid-run
+        # regardless of how long uploads take. If a CAS ever fails (we no longer
+        # own the claim — e.g. the VM was suspended past CLAIM_TTL and another
+        # runner reclaimed), it writes $LOST_CLAIM and stops; the main path checks
+        # that before trusting its terminal write (the result.json no-clobber is
+        # the final backstop against a double-write).
+        REFRESH_ON="$WORK/$JOB_ID.refresh.on"
+        LOST_CLAIM="$WORK/$JOB_ID.lost"
+        : > "$REFRESH_ON"; rm -f "$LOST_CLAIM"
+        (
+            while [ -f "$REFRESH_ON" ]; do
+                sleep "$CLAIM_REFRESH_SEC"
+                [ -f "$REFRESH_ON" ] || break
+                _rg="$(gsutil stat "$CLAIM" 2>/dev/null | awk '/Generation:/{print $2; exit}')"
+                if [ -z "$_rg" ] || ! printf '%s' "$RUNNER_INSTANCE_ID" \
+                     | gsutil -h "x-goog-if-generation-match:$_rg" \
+                              -h "x-goog-meta-claim-owner:$RUNNER_INSTANCE_ID" \
+                              -h "x-goog-meta-claim-ts:$(date -u +%s)" cp - "$CLAIM" 2>/dev/null; then
+                    : > "$LOST_CLAIM"
+                    echo "[runner] WARN: lost the lease for $JOB_ID (claim reclaimed by another runner); stopping refresh." >&2
+                    break
+                fi
+            done
+        ) &
+        REFRESHER_PID=$!
 
         LOCAL_SPEC="$WORK/$JOB_ID.spec.json"
         # Fetch spec locally
@@ -1021,23 +1076,46 @@ with open(out_path, "w") as f:
     json.dump(payload, f, indent=2)
 PYRESULT
 
-        # Upload outputs WITHOUT clobbering (gsutil cp -n via bucket.upload).
-        # Each output dir is unique per JOB_ID so collisions only happen if a
-        # job is re-run with the same id — which is itself a misuse.
-        gsutil cp -n "$LOCAL_OUT" "$EXECUTED" 2>/dev/null || \
-            echo "[runner] WARN: executed.ipynb upload skipped (already exists or upload failed)" >&2
-        if ! gsutil cp -n "$RESULT_LOCAL" "$RESULT"; then
-            echo "[runner] CRITICAL: failed to upload result.json for $JOB_ID; the MCP will see no result. Recording as processed to avoid an infinite re-execution loop (rc=0 would never trip the fail-streak guard); the spec is left in place for inspection." >&2
+        # security review r13: write the DURABLE terminal markers FIRST (the MCP
+        # and other runners key terminal state on result.json + status.txt), each
+        # TIMEOUT-bounded, BEFORE the larger best-effort artifact uploads — so a
+        # slow/hung artifact upload can never leave the job without a terminal
+        # marker. The lease refresher keeps our claim alive throughout. Retry the
+        # critical result.json a few times.
+        _result_ok=0
+        for _try in 1 2 3; do
+            if timeout --signal=TERM --kill-after=15 120 gsutil cp -n "$RESULT_LOCAL" "$RESULT" 2>/dev/null; then
+                _result_ok=1; break
+            fi
+            echo "[runner] WARN: result.json upload attempt $_try for $JOB_ID failed; retrying." >&2
+            sleep 3
+        done
+        if [ "$_result_ok" -ne 1 ]; then
+            # No durable result. Write a TERMINAL status marker so neither this
+            # runner (PROCESSED_FILE) nor another VM (REFUSED* status) re-executes
+            # the (already-run, billable) notebook — avoiding both a same-VM
+            # runaway loop AND a cross-VM retry. The notebook DID run; the failure
+            # is purely the result upload, so re-running would only double-spend.
+            echo "REFUSED-RESULT-UPLOAD-FAILED" | timeout 60 gsutil cp - "$STATUS" 2>/dev/null || \
+                echo "[runner] CRITICAL: could not upload result.json OR a terminal status for $JOB_ID; the spec stays pending and its claim will age out for a later retry." >&2
+            echo "[runner] CRITICAL: result.json upload failed for $JOB_ID after retries (notebook already executed)." >&2
             echo "$JOB_ID" >> "$PROCESSED_FILE"
+            stop_refresher
             continue
         fi
-        gsutil cp -n "$WORK/$JOB_ID.stdout" "$JOB_DIR/runner.stdout" 2>/dev/null || true
-        gsutil cp -n "$WORK/$JOB_ID.stderr" "$JOB_DIR/runner.stderr" 2>/dev/null || true
-
         if [ "$RC" = "0" ]; then
-            echo "succeeded" | gsutil cp - "$STATUS" 2>/dev/null || true
+            echo "succeeded" | timeout 60 gsutil cp - "$STATUS" 2>/dev/null || true
         else
-            echo "FAILED" | gsutil cp - "$STATUS" 2>/dev/null || true
+            echo "FAILED" | timeout 60 gsutil cp - "$STATUS" 2>/dev/null || true
+        fi
+        # Best-effort artifacts (the lease refresher keeps the claim alive even if
+        # these are large/slow); each timeout-bounded.
+        timeout --signal=TERM --kill-after=15 600 gsutil cp -n "$LOCAL_OUT" "$EXECUTED" 2>/dev/null || \
+            echo "[runner] WARN: executed.ipynb upload skipped/failed for $JOB_ID" >&2
+        timeout 300 gsutil cp -n "$WORK/$JOB_ID.stdout" "$JOB_DIR/runner.stdout" 2>/dev/null || true
+        timeout 300 gsutil cp -n "$WORK/$JOB_ID.stderr" "$JOB_DIR/runner.stderr" 2>/dev/null || true
+        if [ -f "$LOST_CLAIM" ]; then
+            echo "[runner] NOTE: the lease for $JOB_ID was lost mid-run; result.json no-clobber guarantees a single valid result (no corruption)." >&2
         fi
 
         # Mark spec consumed via no-clobber rename. If .consumed already
@@ -1049,6 +1127,10 @@ PYRESULT
         fi
         # Record locally so we never re-execute even if the bucket move failed
         echo "$JOB_ID" >> "$PROCESSED_FILE"
+        # Job is durably terminal now — stop the lease refresher (it has done its
+        # job). The top-of-loop stop_refresher is the safety net for any earlier
+        # exit; this stops it promptly on normal completion.
+        stop_refresher
         echo "[runner] done $JOB_ID (rc=$RC)"
 
         # ── Fail-streak accounting (runaway-GPU-cost defense) ──
