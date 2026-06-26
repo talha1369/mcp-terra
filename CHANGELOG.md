@@ -245,9 +245,9 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
     gate and a `pre-commit` hook, with a committed, audited `.secrets.baseline`
     (the only entries are confirmed test fixtures). A credential can no longer
     enter git history locally or pass CI.
-  - **Community/health files** — `CODE_OF_CONDUCT.md` (Contributor Covenant),
-    `CODEOWNERS`, a PR template with a safety checklist, and issue templates
-    that route security reports to private disclosure.
+  - **Community/health files** — `CODEOWNERS`, a PR template with a safety
+    checklist, and issue templates that route security reports to private
+    disclosure.
   - **Ruff config** — a curated `[tool.ruff.lint]` in `pyproject.toml`; the
     default `E`/`F` rule set stays on (real defects still fail), only the three
     cosmetic rules matching the deliberate house style are disabled.
