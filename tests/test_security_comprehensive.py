@@ -3112,6 +3112,64 @@ def _():
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# CC-ControlledAccess — NIH GDS/DUC data-egress guard (no controlled data to LLM)
+# ──────────────────────────────────────────────────────────────────────────
+
+@case("CC-ControlledAccess", "guard OFF by default — lab/public analysis unhindered")
+def _():
+    from mcp_terra import policy as _p
+    saved = _p._CONTROLLED_ACCESS
+    try:
+        _p._CONTROLLED_ACCESS = False
+        assert _p.controlled_access_enabled() is False
+        _p.assert_data_egress_allowed("fc-secure-anything", "x")  # no raise when off
+    finally:
+        _p._CONTROLLED_ACCESS = saved
+
+
+@case("CC-ControlledAccess", "guard ON refuses secure bucket; allows PUBLIC + allowlisted")
+def _():
+    from mcp_terra import policy as _p
+    saved = (_p._CONTROLLED_ACCESS, _p._DATA_EGRESS_ALLOW)
+    try:
+        _p._CONTROLLED_ACCESS = True
+        _p._DATA_EGRESS_ALLOW = frozenset({"my-lab-open"})
+        must_raise(_p.assert_data_egress_allowed, _p.PolicyError,
+                   "fc-secure-7d8a16eb", "object content")
+        for b in ("gnomad-public", "broad-references",
+                  "gcp-public-data--broad-references", "my-lab-open"):
+            _p.assert_data_egress_allowed(b, "x")   # public or allowlisted → ok
+    finally:
+        (_p._CONTROLLED_ACCESS, _p._DATA_EGRESS_ALLOW) = saved
+
+
+@case("CC-ControlledAccess", "guard ON blocks get_entities (data-table rows)")
+def _():
+    from mcp_terra import policy as _p
+    saved = _p._CONTROLLED_ACCESS
+    try:
+        _p._CONTROLLED_ACCESS = True
+        must_raise(server.terra_get_entities, PermissionError, "ns", "ws", "sample")
+    finally:
+        _p._CONTROLLED_ACCESS = saved
+
+
+@case("CC-ControlledAccess", "read_bucket_object enforces the guard; metadata-only does NOT")
+def _():
+    import inspect
+    assert "assert_data_egress_allowed" in inspect.getsource(server.terra_read_bucket_object)
+    # size/hash metadata is not raw data — it must stay available in guard mode
+    assert "assert_data_egress_allowed" not in inspect.getsource(
+        server.terra_get_bucket_object_metadata)
+
+
+@case("CC-ControlledAccess", "terra_health surfaces the controlled_access posture")
+def _():
+    import inspect
+    assert '"controlled_access"' in inspect.getsource(server.terra_health)
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # RUN
 # ──────────────────────────────────────────────────────────────────────────
 

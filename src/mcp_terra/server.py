@@ -2022,6 +2022,17 @@ def terra_health() -> str:
                                     else policy.writes_required_message()),
         "workspace_lock": lock,
         "workspace_allowlist_size": (len(allow) if allow else 0),
+        "controlled_access": {
+            "enabled": policy.controlled_access_enabled(),
+            "data_egress_allowlist_size": len(policy._DATA_EGRESS_ALLOW),
+            "note": ("ON — raw-data egress to the LLM (read_bucket_object / "
+                     "get_entities) is refused for non-public buckets (GDS/DUC); "
+                     "diagnosis + on-VM analysis unaffected"
+                     if policy.controlled_access_enabled() else
+                     "OFF — no data-egress restriction (lab/public analysis "
+                     "unhindered); set MCP_TERRA_CONTROLLED_ACCESS=1 for "
+                     "controlled-access workspaces"),
+        },
         "killswitch": {
             "tripped": ks_tripped,
             "reason": ks_reason,
@@ -2187,10 +2198,23 @@ def terra_get_entities(namespace: str, name: str, entity_type: str,
         entity_type: a table name from `terra_list_data_tables`.
         page: 1-based page index.
         page_size: rows per page (1..500).
+
+    Controlled-access: if MCP_TERRA_CONTROLLED_ACCESS=1, this is refused — data-
+    table ROWS can carry controlled-access attributes (subject ids, phenotypes,
+    file paths), and GDS/DUC forbids sending controlled data to a public LLM.
+    Use `terra_list_data_tables` (schema/counts only), a self-hosted model, or
+    disable the guard for a non-controlled workspace.
     """
     safety.validate_freeform_string(namespace, "namespace", allow_empty=False)
     safety.validate_freeform_string(name, "name", allow_empty=False)
     safety.validate_freeform_string(entity_type, "entity_type", allow_empty=False)
+    if policy.controlled_access_enabled():
+        raise PermissionError(
+            "controlled-access mode (MCP_TERRA_CONTROLLED_ACCESS=1): refusing to "
+            "return data-table rows to the LLM — they may carry controlled-access "
+            "attributes (GDS/DUC Non-Transferability). Use terra_list_data_tables "
+            "(schema + counts only), a self-hosted / NIST-800-171 model, or "
+            "disable the guard for a non-controlled workspace.")
     page = max(1, int(page))
     page_size = max(1, min(int(page_size), 500))
     _assert_workspace_allowed(namespace, name)
@@ -2312,8 +2336,20 @@ def terra_read_bucket_object(bucket_uri: str, max_bytes: int = 102400) -> str:
     Args:
         bucket_uri: gs:// URI of a single object (must be in the allowlisted bucket).
         max_bytes: how many leading bytes to read (1..10485760).
+
+    Controlled-access: if MCP_TERRA_CONTROLLED_ACCESS=1, this raw-DATA read is
+    refused for non-public/non-allowlisted buckets (GDS/DUC — no controlled data
+    to the LLM). Public reference buckets + MCP_TERRA_DATA_EGRESS_ALLOW are still
+    allowed; use `terra_get_bucket_object_metadata` for size/hash either way.
     """
     safety.safe_bucket_uri(bucket_uri)
+    # Controlled-access DATA-egress guard (off by default; never hinders lab or
+    # public-data analysis). Bucket = first path component of the gs:// URI.
+    _bucket = bucket_uri[len("gs://"):].split("/", 1)[0]
+    try:
+        policy.assert_data_egress_allowed(_bucket, "object content")
+    except policy.PolicyError as e:
+        raise PermissionError(str(e))
     _pre("terra_read_bucket_object", READ, f"{bucket_uri} max_bytes={max_bytes}")
     return _ok(bk.read_object(bucket_uri, max_bytes=int(max_bytes)))
 

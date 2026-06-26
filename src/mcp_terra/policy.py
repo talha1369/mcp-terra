@@ -61,6 +61,70 @@ def _env_truthy(name: str) -> bool:
     return v in ("1", "true", "yes", "on")
 
 
+# ── Controlled-access data-egress guard (NIH GDS / DUC) ─────────────────────
+# When MCP_TERRA_CONTROLLED_ACCESS is on, the MCP refuses to return raw
+# workspace DATA (object bytes, data-table rows) to the LLM — controlled-access
+# genomic data must not reach a public generative AI (GDS/DUC Non-
+# Transferability). It is OFF BY DEFAULT, so lab-generated and public-database
+# analysis is never hindered. Even when ON: PUBLIC reference buckets and
+# operator-certified non-controlled buckets are still allowed, and the on-VM
+# analysis loop + all diagnosis tools (logs, metadata, workflow status, cost)
+# remain fully available — the guard only blocks raw-DATA egress to the LLM.
+_CONTROLLED_ACCESS = _env_truthy("MCP_TERRA_CONTROLLED_ACCESS")
+_DATA_EGRESS_ALLOW = frozenset(
+    b.strip().lower()
+    for b in os.environ.get("MCP_TERRA_DATA_EGRESS_ALLOW", "").replace(",", " ").split()
+    if b.strip())
+
+# Well-known PUBLIC genomics/reference bucket-name prefixes — public databases
+# are not controlled-access, so reading them never violates GDS/DUC.
+_PUBLIC_DATA_BUCKET_PREFIXES = (
+    "gcp-public-data", "genomics-public-data",
+    "gnomad-public", "gnomad",
+    "broad-references", "broad-public",
+    "gatk-test-data", "gatk-best-practices",
+    "hail-common", "hail-datasets",
+    "1000genomes", "encode-public",
+)
+
+
+def controlled_access_enabled() -> bool:
+    """True if the controlled-access data-egress guard is active."""
+    return _CONTROLLED_ACCESS
+
+
+def is_egress_allowed_bucket(bucket: str) -> bool:
+    """True if `bucket` may have its DATA returned to the LLM even under the
+    controlled-access guard — a known PUBLIC reference bucket, or an
+    operator-certified non-controlled bucket (MCP_TERRA_DATA_EGRESS_ALLOW)."""
+    b = (bucket or "").strip().lower()
+    if not b:
+        return False
+    if b in _DATA_EGRESS_ALLOW:
+        return True
+    return any(b == p or b.startswith(p) for p in _PUBLIC_DATA_BUCKET_PREFIXES)
+
+
+def assert_data_egress_allowed(bucket: str, what: str) -> None:
+    """Refuse to return raw workspace DATA to the LLM when the guard is on and
+    `bucket` is not public/allowlisted. No-op when the guard is off (lab/public
+    analysis unhindered). Fail-loud — never a silent drop."""
+    if not _CONTROLLED_ACCESS:
+        return
+    if is_egress_allowed_bucket(bucket):
+        return
+    raise PolicyError(
+        f"controlled-access mode (MCP_TERRA_CONTROLLED_ACCESS=1): refusing to "
+        f"return {what} from bucket {bucket!r} to the LLM — it may be NIH "
+        f"controlled-access data, and GDS/DUC Non-Transferability forbids "
+        f"sending controlled-access data to a public generative AI. Options: "
+        f"(a) lab-open or public data → add the bucket to "
+        f"MCP_TERRA_DATA_EGRESS_ALLOW; (b) run the orchestrating agent against a "
+        f"self-hosted / NIST-800-171 model; (c) disable the guard for a "
+        f"non-controlled workspace. Diagnosis tools (logs, workflow metadata, "
+        f"status, cost) and the on-VM analysis loop remain available.")
+
+
 # ── Startup snapshots ──────────────────────────────────────────────────────
 #
 # Per audit: reading MCP_TERRA_ALLOW_WRITES and MCP_TERRA_WORKSPACE on EVERY
@@ -917,7 +981,12 @@ def print_startup_banner() -> None:
                     f"({type(e).__name__}: {str(e)[:200]}). Re-attempted "
                     f"per-call; first write to a workspace bucket will "
                     f"fail-closed if still unresolved.")
+    ca_msg = (f"ON — raw-data egress to the LLM blocked for non-public buckets "
+              f"(GDS/DUC); {len(_DATA_EGRESS_ALLOW)} bucket(s) allowlisted"
+              if _CONTROLLED_ACCESS else
+              "OFF — no data-egress restriction (lab/public analysis unhindered)")
     print(f"[mcp-terra policy] writes:                {writes}", file=sys.stderr)
+    print(f"[mcp-terra policy] controlled-access:    {ca_msg}", file=sys.stderr)
     print(f"[mcp-terra policy] workspace allowlist:  {allow_msg}", file=sys.stderr)
     print(f"[mcp-terra policy] workspace lock:       {lock_msg}", file=sys.stderr)
     print(f"[mcp-terra policy] rate limit:           {_RATE_LIMIT}/min", file=sys.stderr)

@@ -9,6 +9,21 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **Controlled-access data-egress guard (NIH GDS / DUC).** A new
+  `MCP_TERRA_CONTROLLED_ACCESS=1` mode refuses to return raw workspace DATA to
+  the LLM — `terra_read_bucket_object` (object bytes) and `terra_get_entities`
+  (data-table rows) — because controlled-access genomic data must not reach a
+  public generative AI (GDS/DUC Non-Transferability). Designed to **not hinder
+  lab-generated or public-database analysis**: it is **off by default**; even
+  when on, a built-in **public reference-bucket allowlist** (gnomAD,
+  broad-references, gcp-public-data, gatk-*, hail-*, 1000genomes, …) and
+  operator-certified `MCP_TERRA_DATA_EGRESS_ALLOW` buckets are still readable;
+  metadata (`terra_get_bucket_object_metadata`, `terra_list_data_tables`), all
+  diagnosis tools, and the on-VM analysis loop are unaffected (data never leaves
+  Terra through the MCP). Refusals are fail-loud. `terra_health` and the startup
+  banner surface the posture; see [docs/compliance.md](docs/compliance.md) for
+  the policy mapping (GDS/DUC + NIST 800-171 + the self-hosted-model path).
+
 - **Consolidated run record + multi-channel completion delivery, with a
   metadata spec.** A completed run now produces ONE provenance-bearing record
   (`mcp_terra_jobs/<run_id>/run_record.json`) that the email, Slack, and audio

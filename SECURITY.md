@@ -63,7 +63,7 @@ These are real but either out of scope or fundamentally hard:
 
 ## Comprehensive attack-class coverage (`tests/test_security_comprehensive.py`)
 
-**290/290 tests pass** across 41 attack classes. The table below is generated
+**295/295 tests pass** across 42 attack classes. The table below is generated
 from the suite itself; the test file is the authoritative source. Run yourself:
 
 ```bash
@@ -114,6 +114,7 @@ python tests/test_security_comprehensive.py
 | CC-AudioAttach | 6 | Audio email attachment is exfil-safe: audio/* MIME only, non-audio extension refused, oversized/empty refused, no-attachment stays single-part, path DERIVED from job_id (never arbitrary), temp blob cleaned up |
 | CC-SlackUpload | 6 | True Slack file upload (bot Web API): bot config requires token+channel, safe no-op when unconfigured, secret-shaped comment refused before any network, empty/oversized refused before network, env-locked tool (no url/token/channel params) with webhook fallback, user-id→DM resolution + multi-target (DM and/or channel) parsing |
 | CC-CodexFixes2 | 7 | Regressions for the 2nd adversarial-review round: exact protected-dir blocklist bypass (trailing-slash) fixed, download refuses version_existing on a directory, reserved audio path (provenance) blocked from generic upload, audio fetch size-preflights before download, Slack fails loud when all targets fail, audio render preflights both extensions before the TTS side-effect, run-record read-back md5 verify |
+| CC-ControlledAccess | 5 | NIH GDS/DUC data-egress guard: off by default (lab/public unhindered), guard ON refuses the secure bucket but allows public + operator-allowlisted buckets, blocks `get_entities` rows, `read_bucket_object` enforces it while metadata-only stays available, `terra_health` surfaces the posture |
 
 ## Single-workspace lock (`MCP_TERRA_WORKSPACE`)
 
