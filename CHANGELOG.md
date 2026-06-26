@@ -279,6 +279,29 @@ tests exercise the templates in isolation, so these were latent):
     **read back (md5)** after upload so a `cp -n` skip/race can't report a
     write that didn't persist.
   - Guarded by 7 new regression tests (`CC-CodexFixes2`).
+- **Adversarial-review hardening (Codex) — round 4** — egress closure across the
+  full read surface + retry safety, on the new robustness work:
+  - **Controlled-access leaks closed** in `terra_list_bucket` (object paths now
+    require a public/allowlisted bucket), `terra_get_method_config` (projected to
+    method ref + param **key names**), `terra_get_submission` (projected to
+    **ids + statuses**), and `terra_get_batch_job_status` (full job JSON withheld;
+    status + events kept).
+  - `terra_render_audio_summary` is **forced to local `say`** in controlled mode
+    (refuses if unavailable) so summary text never reaches external Cloud TTS.
+  - `terra_get_workflow_logs` now **binds reads to the queried workspace's own
+    bucket** — a crafted/stale Cromwell `stderr` path that points outside it is
+    refused with a visible marker (never silently read) — and enforces a
+    50-task / 1 MiB aggregate cap with a `truncated` flag.
+  - The **`terra://health` resource** (auto-read by clients, bypasses the
+    audit/rate path) now returns a minimal, **network-free, identifier-free**
+    posture; the full snapshot stays behind the audited `terra_health` *tool*.
+  - The **retry/backoff loop** (`terra_client._request`) now aborts on the
+    kill-switch hook and obeys a bounded total time budget
+    (`MCP_TERRA_RETRY_TOTAL_BUDGET_SEC`, default 30 s).
+  - A **structural meta-test** now enumerates every data-returning tool and
+    fails if any lacks a controlled-access check (prevents a future tool from
+    silently re-opening an egress path). Guarded by 7 new regression tests
+    (`CC-ControlledAccess3`).
 - **No delete primitive, by design** — no tool (and no `leo_delete_runtime`
   at any layer) deletes a runtime or persistent disk; teardown is the user's
   action in the Terra UI ("Keep persistent disk"). The MCP detects a

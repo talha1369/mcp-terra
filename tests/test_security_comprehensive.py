@@ -3384,7 +3384,9 @@ def _():
     from mcp_terra import policy as _p
     saved = _p._CONTROLLED_ACCESS
     orig_md, orig_tok = _tc.rawls_get_workflow_metadata, server.auth.get_access_token
+    orig_ws = _tc.rawls_get_workspace
     _tc.rawls_get_workflow_metadata = lambda *a, **k: _WF_MD
+    _tc.rawls_get_workspace = lambda *a, **k: {"workspace": {"bucketName": "fc-secure-x"}}
     server.auth.get_access_token = lambda: "tok"
     try:
         _p._CONTROLLED_ACCESS = True
@@ -3394,6 +3396,7 @@ def _():
     finally:
         _p._CONTROLLED_ACCESS = saved
         _tc.rawls_get_workflow_metadata, server.auth.get_access_token = orig_md, orig_tok
+        _tc.rawls_get_workspace = orig_ws
 
 
 @case("CC-WorkflowLogs", "off-mode reads the FAILED task's stderr tail (failed_only)")
@@ -3401,8 +3404,9 @@ def _():
     from mcp_terra import policy as _p, bucket as _bk2
     saved = _p._CONTROLLED_ACCESS
     orig_md, orig_tok = _tc.rawls_get_workflow_metadata, server.auth.get_access_token
-    orig_read, orig_safe = _bk2.read_object, safety.safe_bucket_uri
+    orig_read, orig_safe, orig_ws = _bk2.read_object, safety.safe_bucket_uri, _tc.rawls_get_workspace
     _tc.rawls_get_workflow_metadata = lambda *a, **k: _WF_MD
+    _tc.rawls_get_workspace = lambda *a, **k: {"workspace": {"bucketName": "fc-secure-x"}}
     server.auth.get_access_token = lambda: "tok"
     safety.safe_bucket_uri = lambda u: u
     _bk2.read_object = lambda uri, max_bytes=0: {"text": "BOOM: real cromwell error"}
@@ -3415,6 +3419,7 @@ def _():
         _p._CONTROLLED_ACCESS = saved
         _tc.rawls_get_workflow_metadata, server.auth.get_access_token = orig_md, orig_tok
         _bk2.read_object, safety.safe_bucket_uri = orig_read, orig_safe
+        _tc.rawls_get_workspace = orig_ws
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -3450,6 +3455,120 @@ def _():
     p2 = server.run_notebook_bugfix_loop("gs://b/n.ipynb")
     assert "terra_get_workflow_logs" in p1 and "no destructive" in p1.lower()
     assert "terra_create_runtime" in p2 and "secret-scan" in p2.lower()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# CC-ControlledAccess3 — round-4 egress closure across ALL data-returning tools
+# ──────────────────────────────────────────────────────────────────────────
+
+@case("CC-ControlledAccess3", "META: every data-returning tool carries a controlled-access check")
+def _():
+    import inspect
+    DATA_TOOLS = [
+        "terra_read_bucket_object", "terra_get_entities", "terra_list_bucket",
+        "terra_get_method_config", "terra_get_submission", "terra_get_workflow_outputs",
+        "terra_get_workflow_metadata", "terra_get_workflow_logs", "terra_get_run_log",
+        "terra_get_notebook_job_result", "terra_get_batch_job_status",
+        "terra_render_audio_summary"]
+    markers = ("controlled_access_enabled", "assert_data_egress_allowed",
+               "assert_no_controlled_data_egress")
+    missing = [nm for nm in DATA_TOOLS
+               if not any(m in inspect.getsource(getattr(server, nm)) for m in markers)]
+    assert not missing, f"data-returning tools missing a controlled-access check: {missing}"
+
+
+@case("CC-ControlledAccess3", "method_config projects to KEY NAMES in controlled mode")
+def _():
+    from mcp_terra import policy as _p
+    saved, om, ot = _p._CONTROLLED_ACCESS, _tc.rawls_get_method_config, server.auth.get_access_token
+    _tc.rawls_get_method_config = lambda *a, **k: {
+        "namespace": "cns", "name": "cn", "methodRepoMethod": {"methodVersion": 3},
+        "rootEntityType": "sample",
+        "inputs": {"wf.x": "gs://controlled/secret.vcf"}, "outputs": {"wf.y": "controlled-out"}}
+    server.auth.get_access_token = lambda: "tok"
+    try:
+        _p._CONTROLLED_ACCESS = True
+        out = server.terra_get_method_config("ns", "ws", "cns", "cn")
+        assert "secret.vcf" not in out and "controlled-out" not in out
+        assert "input_keys" in out and "wf.x" in out
+    finally:
+        _p._CONTROLLED_ACCESS, _tc.rawls_get_method_config, server.auth.get_access_token = saved, om, ot
+
+
+@case("CC-ControlledAccess3", "submission projects to ids+statuses in controlled mode")
+def _():
+    from mcp_terra import policy as _p
+    saved, os_, ot = _p._CONTROLLED_ACCESS, _tc.rawls_get_submission, server.auth.get_access_token
+    _tc.rawls_get_submission = lambda *a, **k: {
+        "submissionId": "s1", "status": "Done", "workflows": [
+            {"workflowId": "w1", "status": "Failed", "messages": ["controlled failure"],
+             "workflowEntity": {"entityName": "NA12878-controlled"}}]}
+    server.auth.get_access_token = lambda: "tok"
+    try:
+        _p._CONTROLLED_ACCESS = True
+        out = server.terra_get_submission("ns", "ws", "s1")
+        assert "NA12878-controlled" not in out and "controlled failure" not in out
+        assert '"workflowId": "w1"' in out and '"status": "Failed"' in out
+    finally:
+        _p._CONTROLLED_ACCESS, _tc.rawls_get_submission, server.auth.get_access_token = saved, os_, ot
+
+
+@case("CC-ControlledAccess3", "workflow_logs refuses stderr OUTSIDE the queried workspace bucket")
+def _():
+    from mcp_terra import policy as _p, bucket as _bk2
+    saved = _p._CONTROLLED_ACCESS
+    ows, omd, ot = _tc.rawls_get_workspace, _tc.rawls_get_workflow_metadata, server.auth.get_access_token
+    oread, osafe = _bk2.read_object, safety.safe_bucket_uri
+    _tc.rawls_get_workspace = lambda *a, **k: {"workspace": {"bucketName": "fc-secure-MINE"}}
+    _tc.rawls_get_workflow_metadata = lambda *a, **k: {"status": "Failed", "calls": {
+        "wf.t": [{"executionStatus": "Failed", "shardIndex": 0,
+                  "stderr": "gs://fc-secure-OTHER/exec/stderr"}]}}
+    server.auth.get_access_token = lambda: "tok"
+    safety.safe_bucket_uri = lambda u: u
+    _bk2.read_object = lambda uri, max_bytes=0: {"text": "SHOULD NOT BE READ"}
+    try:
+        _p._CONTROLLED_ACCESS = False
+        out = server.terra_get_workflow_logs("ns", "ws", "sub", "wf")
+        assert "SHOULD NOT BE READ" not in out, "must not read a foreign-bucket stderr path"
+        assert "not under the queried workspace bucket" in out
+    finally:
+        _p._CONTROLLED_ACCESS = saved
+        _tc.rawls_get_workspace, _tc.rawls_get_workflow_metadata, server.auth.get_access_token = ows, omd, ot
+        _bk2.read_object, safety.safe_bucket_uri = oread, osafe
+
+
+@case("CC-ControlledAccess3", "list_bucket / batch / audio enforce controlled-access (source)")
+def _():
+    import inspect
+    assert "assert_data_egress_allowed" in inspect.getsource(server.terra_list_bucket)
+    assert "_controlled_access_withheld" in inspect.getsource(server.terra_get_batch_job_status)
+    asrc = inspect.getsource(server.terra_render_audio_summary)
+    assert "controlled_access_enabled()" in asrc and "say_available()" in asrc, "audio must force local say"
+    wsrc = inspect.getsource(server.terra_get_workflow_logs)
+    assert "_MAX_TASKS" in wsrc and "ws_prefix" in wsrc, "workflow_logs needs caps + workspace-bucket binding"
+
+
+@case("CC-ControlledAccess3", "retry aborts on the kill-switch hook + has a total budget")
+def _():
+    from mcp_terra import terra_client as _t
+    saved = _t.abort_check
+    _t.abort_check = lambda: True
+    try:
+        assert _t._retry_ok(_t.time.monotonic(), 1, None) is False, "kill-switch must abort retries"
+    finally:
+        _t.abort_check = saved
+    import inspect
+    assert "_RETRY_TOTAL_BUDGET_SEC" in inspect.getsource(_t._retry_ok)
+
+
+@case("CC-ControlledAccess3", "terra://health resource is minimal + data-free")
+def _():
+    import json as _j
+    h = _j.loads(server._res_health())
+    for leak in ("workspace_lock", "bucketName", "googleProject",
+                 "code_integrity_sha256", "runner_heartbeat"):
+        assert leak not in h, f"health resource leaks {leak}"
+    assert "tools_count" in h and "controlled_access" in h
 
 
 # ──────────────────────────────────────────────────────────────────────────

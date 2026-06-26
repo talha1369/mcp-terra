@@ -36,6 +36,27 @@ _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 _MAX_RETRIES = max(0, min(int(os.environ.get("MCP_TERRA_MAX_RETRIES", "3")), 8))
 _RETRY_BASE_SEC = 0.5
 _RETRY_CAP_SEC = 8.0
+# Hard ceiling on TOTAL time spent retrying a single request, so a GET can't sit
+# in backoff sleeps for minutes (e.g. after the operator trips the kill-switch).
+_RETRY_TOTAL_BUDGET_SEC = max(
+    1.0, min(float(os.environ.get("MCP_TERRA_RETRY_TOTAL_BUDGET_SEC", "30")), 120.0))
+
+# Optional cancellation hook (set by the server layer to the kill-switch check,
+# avoiding a terra_client→policy circular import). Returns True ⇒ stop retrying.
+abort_check = None  # type: ignore[var-annotated]
+
+
+def _retry_ok(start_monotonic: float, attempt: int, retry_after: float | None) -> bool:
+    """Whether to perform another retry: not cancelled, and the NEXT backoff
+    won't push total retry time past the budget."""
+    if abort_check is not None:
+        try:
+            if abort_check():
+                return False
+        except Exception:
+            pass
+    delay = _retry_delay(attempt, retry_after)
+    return (time.monotonic() - start_monotonic) + delay <= _RETRY_TOTAL_BUDGET_SEC
 
 
 def _parse_retry_after(value: str | None) -> float | None:
@@ -99,6 +120,7 @@ def _request(service: str, method: str, base: str, path: str, token: str,
     # error could duplicate the side effect.
     idempotent = method.upper() in ("GET", "HEAD")
     max_attempts = (1 + _MAX_RETRIES) if idempotent else 1
+    _start = time.monotonic()
     with httpx.Client(timeout=timeout, trust_env=False,
                        follow_redirects=False) as client:
         for attempt in range(1, max_attempts + 1):
@@ -106,7 +128,8 @@ def _request(service: str, method: str, base: str, path: str, token: str,
                 resp = client.request(method, url, headers=headers,
                                       json=json_body, params=params)
             except httpx.HTTPError as e:
-                if idempotent and attempt < max_attempts:
+                if (idempotent and attempt < max_attempts
+                        and _retry_ok(_start, attempt, None)):
                     time.sleep(_retry_delay(attempt, None))
                     continue
                 raise TerraAPIError(service, method, path, 0,
@@ -115,10 +138,11 @@ def _request(service: str, method: str, base: str, path: str, token: str,
                 break
             if (idempotent and attempt < max_attempts
                     and resp.status_code in _RETRY_STATUSES):
-                time.sleep(_retry_delay(
-                    attempt, _parse_retry_after(resp.headers.get("Retry-After"))))
-                continue
-            break   # non-retryable status or attempts exhausted → handle below
+                _ra = _parse_retry_after(resp.headers.get("Retry-After"))
+                if _retry_ok(_start, attempt, _ra):   # within budget + not cancelled
+                    time.sleep(_retry_delay(attempt, _ra))
+                    continue
+            break   # non-retryable, exhausted, cancelled, or over budget → handle below
     if not (200 <= resp.status_code < 300):
         # Refuse to echo secrets even if a misbehaving Terra service echoed the
         # request back: the OAuth token, AND the runner HMAC secret (which

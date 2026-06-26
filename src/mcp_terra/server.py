@@ -33,6 +33,12 @@ from mcp.types import ToolAnnotations
 
 from . import auth, terra_client as tc, bucket as bk, safety, policy
 from . import run_record as rr, notify as nt
+
+# Wire the terra_client retry loop to the kill-switch (decoupled hook — avoids a
+# terra_client→policy circular import). A tripped kill-switch (or kill-file)
+# aborts any in-flight retry/backoff immediately. (Codex.)
+tc.abort_check = lambda: bool(
+    getattr(policy, "_killed_flag", False) or policy.KILL_FILE.exists())
 from . import notebook_runner as nbr
 from . import fetch as ft
 from . import email_send
@@ -758,8 +764,18 @@ def terra_list_bucket(bucket_uri: str, recursive: bool = False) -> str:
         recursive: walk the prefix recursively.
 
     SAFETY: refuses any bucket outside your workspace allowlist.
+
+    Controlled-access: object NAMES often encode sample/dataset identifiers, so
+    in MCP_TERRA_CONTROLLED_ACCESS mode this is refused for non-public buckets
+    (use a self-hosted model, or `terra_get_bucket_object_metadata` for a
+    specific known object).
     """
     safety.safe_bucket_uri(bucket_uri)
+    _bucket = bucket_uri[len("gs://"):].split("/", 1)[0]
+    try:
+        policy.assert_data_egress_allowed(_bucket, "bucket object listing")
+    except policy.PolicyError as e:
+        raise PermissionError(str(e))
     _pre("terra_list_bucket", READ, f"{bucket_uri}  recursive={recursive}")
     return _ok(bk.list_bucket(bucket_uri, recursive=recursive))
 
@@ -2179,7 +2195,23 @@ def terra_get_submission(namespace: str, name: str, submission_id: str) -> str:
     _assert_workspace_allowed(namespace, name)
     _pre("terra_get_submission", READ, f"{namespace}/{name} sub={submission_id}")
     token = auth.get_access_token()
-    return _ok(tc.rawls_get_submission(token, namespace, name, submission_id))
+    sub = tc.rawls_get_submission(token, namespace, name, submission_id)
+    # Controlled-access: the raw Rawls submission can carry workflow failure
+    # messages, entity names, inputs. Project to ids + statuses only (an explicit
+    # allowlist, not a schema assumption). (Codex.)
+    if policy.controlled_access_enabled() and isinstance(sub, dict):
+        sub = {
+            "submissionId": sub.get("submissionId"),
+            "status": sub.get("status"),
+            "submissionDate": sub.get("submissionDate"),
+            "workflows": [{"workflowId": (w or {}).get("workflowId"),
+                           "status": (w or {}).get("status")}
+                          for w in (sub.get("workflows") or [])],
+            "_controlled_access_withheld": (
+                "failure messages / entity names / inputs withheld "
+                "(MCP_TERRA_CONTROLLED_ACCESS); ids + statuses only"),
+        }
+    return _ok(sub)
 
 
 @server.tool(title="Get workflow outputs", annotations=ANN_READ_REMOTE)
@@ -2389,42 +2421,71 @@ def terra_get_workflow_logs(namespace: str, name: str,
          f"{namespace}/{name} sub={submission_id} wf={workflow_id} "
          f"failed_only={failed_only}")
     token = auth.get_access_token()
+    # Bind reads to THE QUERIED workspace's own bucket — Cromwell metadata paths
+    # are not a trust boundary; a crafted/stale stderr path could otherwise steer
+    # a read into a DIFFERENT workspace the user can see. (Codex.)
+    ws = tc.rawls_get_workspace(token, namespace, name)
+    ws_bucket = ((ws or {}).get("workspace") or {}).get("bucketName") or ""
+    ws_prefix = f"gs://{ws_bucket}/" if ws_bucket else None
+
     md = tc.rawls_get_workflow_metadata(token, namespace, name,
                                         submission_id, workflow_id)
     calls = (md or {}).get("calls") or {}
     controlled = policy.controlled_access_enabled()
     _ok_statuses = ("Done", "Succeeded")
+    _MAX_TASKS = 50                      # aggregate fan-out cap (Codex)
+    _TOTAL_BYTE_BUDGET = 1024 * 1024     # 1 MiB total across all task stderr reads
     tasks: list[dict] = []
+    truncated = False
+    bytes_used = 0
     for call_name, shards in calls.items():
+        if truncated:
+            break
         for sh in (shards or []):
             st = (sh or {}).get("executionStatus")
             if failed_only and st in _ok_statuses:
                 continue
-            entry = {
-                "call": call_name,
-                "shard": sh.get("shardIndex"),
-                "status": st,
-                "returnCode": sh.get("returnCode"),
-                "stderr_path": sh.get("stderr"),
-                "stdout_path": sh.get("stdout"),
-            }
+            if len(tasks) >= _MAX_TASKS:
+                truncated = True
+                break
             stderr_path = sh.get("stderr")
+            entry: dict = {"call": call_name, "shard": sh.get("shardIndex"),
+                           "status": st, "returnCode": sh.get("returnCode")}
             if controlled:
+                # Redact BOTH content and paths (paths can encode identifiers).
+                entry["stderr_path"] = "[withheld: controlled-access mode]"
+                entry["stdout_path"] = "[withheld: controlled-access mode]"
                 entry["stderr_tail"] = "[withheld: controlled-access mode]"
-            elif stderr_path:
-                try:
-                    safety.safe_bucket_uri(stderr_path)   # must be an allowlisted bucket
-                    entry["stderr_tail"] = bk.read_object(
-                        stderr_path, max_bytes=int(max_bytes)).get("text", "")
-                except (safety.SafetyError, bk.BucketError) as e:
-                    entry["stderr_tail"] = f"[could not read stderr: {type(e).__name__}]"
+            else:
+                entry["stderr_path"] = stderr_path
+                entry["stdout_path"] = sh.get("stdout")
+                in_ws = bool(ws_prefix) and isinstance(stderr_path, str) \
+                    and stderr_path.startswith(ws_prefix)
+                if not stderr_path:
+                    entry["stderr_tail"] = None
+                elif not in_ws:
+                    entry["stderr_tail"] = (
+                        "[refused: stderr path is not under the queried workspace "
+                        "bucket]")
+                elif bytes_used >= _TOTAL_BYTE_BUDGET:
+                    entry["stderr_tail"] = "[skipped: total log byte budget reached]"
+                    truncated = True
+                else:
+                    try:
+                        safety.safe_bucket_uri(stderr_path)
+                        cap = min(int(max_bytes), _TOTAL_BYTE_BUDGET - bytes_used)
+                        txt = bk.read_object(stderr_path, max_bytes=cap).get("text", "")
+                        bytes_used += len(txt.encode("utf-8", "replace"))
+                        entry["stderr_tail"] = txt
+                    except (safety.SafetyError, bk.BucketError) as e:
+                        entry["stderr_tail"] = f"[could not read stderr: {type(e).__name__}]"
             tasks.append(entry)
     out: dict = {"workflow_id": workflow_id, "status": (md or {}).get("status"),
-                 "task_count": len(tasks), "tasks": tasks}
+                 "task_count": len(tasks), "truncated": truncated, "tasks": tasks}
     if controlled:
         out["_controlled_access_withheld"] = (
-            "task stderr content withheld (MCP_TERRA_CONTROLLED_ACCESS) — paths "
-            "+ statuses returned; use a self-hosted / NIST-800-171 model.")
+            "task stderr content AND paths withheld (MCP_TERRA_CONTROLLED_ACCESS) "
+            "— statuses only; use a self-hosted / NIST-800-171 model.")
     return _ok(out)
 
 
@@ -2446,8 +2507,23 @@ def terra_get_method_config(namespace: str, name: str,
     _pre("terra_get_method_config", READ,
          f"{namespace}/{name} config={config_namespace}/{config_name}")
     token = auth.get_access_token()
-    return _ok(tc.rawls_get_method_config(token, namespace, name,
-                                          config_namespace, config_name))
+    mc = tc.rawls_get_method_config(token, namespace, name,
+                                    config_namespace, config_name)
+    # Controlled-access: direct-input configs embed literal VALUES (sample ids,
+    # gs:// paths). Project to the method ref + param KEY NAMES only. (Codex.)
+    if policy.controlled_access_enabled() and isinstance(mc, dict):
+        mc = {
+            "namespace": mc.get("namespace"),
+            "name": mc.get("name"),
+            "methodRepoMethod": mc.get("methodRepoMethod"),
+            "rootEntityType": mc.get("rootEntityType"),
+            "input_keys": sorted((mc.get("inputs") or {}).keys()),
+            "output_keys": sorted((mc.get("outputs") or {}).keys()),
+            "_controlled_access_withheld": (
+                "input/output VALUES withheld (MCP_TERRA_CONTROLLED_ACCESS); "
+                "key names only"),
+        }
+    return _ok(mc)
 
 
 @server.tool(title="Read a bucket object (byte-range)", annotations=ANN_READ_REMOTE)
@@ -2550,6 +2626,16 @@ def terra_get_batch_job_status(google_project: str, region: str,
     except json.JSONDecodeError:
         job = {"_raw": (out.stdout or "")[:2000]}
     state = (job.get("status") or {}).get("state") if isinstance(job, dict) else None
+    # Controlled-access: the full Batch spec carries commands, env, labels, and
+    # input/output paths. Return only state + status events, drop the spec. (Codex.)
+    if policy.controlled_access_enabled():
+        _events = (job.get("status") or {}).get("statusEvents") if isinstance(job, dict) else None
+        return _ok({"job_name": job_name, "status": state,
+                    "status_events": _events,
+                    "_controlled_access_withheld": (
+                        "full Batch job spec (commands/env/labels/paths) withheld "
+                        "(MCP_TERRA_CONTROLLED_ACCESS)"),
+                    "logging_command": logging_cmd})
     return _ok({"job_name": job_name, "status": state, "job": job,
                 "logging_command": logging_cmd})
 
@@ -2903,14 +2989,28 @@ def terra_render_audio_summary(job_id: str, bucket_uri: str,
                 f"audio already exists at {_adir}/summary.{_e}. The MCP refuses "
                 f"to overwrite — use a fresh job_id to regenerate.")
 
+    # Controlled-access: a verified summary may contain controlled RESULTS, and
+    # Cloud TTS is an EXTERNAL (Google) service — sending the text there is a
+    # third-party egress even with a self-hosted agent. Force the LOCAL `say`
+    # backend (no network egress); refuse if it is unavailable. (Codex.)
+    import os as _os_audio
+    _backend = _os_audio.environ.get("MCP_TERRA_TTS_BACKEND", "auto")
+    if policy.controlled_access_enabled():
+        if not audio_summary.say_available():
+            raise PermissionError(
+                "controlled-access mode (MCP_TERRA_CONTROLLED_ACCESS=1): refusing "
+                "to send the run summary to Cloud TTS (an external service). The "
+                "local macOS `say` backend is unavailable here, so no audio can "
+                "be rendered without external egress. Disable the guard for a "
+                "non-controlled workspace, or render audio on a macOS host.")
+        _backend = "say"
+
     # Render — raises AudioSummaryError on any failure (caller sees clean msg).
     try:
         # Cloud TTS (user creds) needs a quota project — default to the locked
         # workspace's google project; overridable via MCP_TERRA_TTS_QUOTA_PROJECT.
         _lock = policy.resolve_locked_workspace()
         _qp = (_lock or {}).get("googleProject", "") if isinstance(_lock, dict) else ""
-        import os as _os_audio
-        _backend = _os_audio.environ.get("MCP_TERRA_TTS_BACKEND", "auto")
         audio_bytes, _ext, _backend_used = audio_summary.render(
             summary_text, voice_name=voice_name or "", quota_project=_qp,
             backend=_backend,
@@ -3045,10 +3145,25 @@ def terra_killswitch_trip(reason: str = "manual trip by agent") -> str:
 
 @server.resource("terra://health", title="MCP health & posture",
                  mime_type="application/json",
-                 description="Live safety-posture snapshot (same as terra_health). "
-                             "No workspace data.")
+                 description="MINIMAL, data-free posture for auto-read clients — "
+                             "no workspace identifiers/paths, no network probe. "
+                             "Call the terra_health TOOL for the full snapshot.")
 def _res_health() -> str:
-    return terra_health()
+    # Codex: a resource is auto-read by clients and bypasses the _pre audit/rate
+    # path, so it must NOT disclose the workspace lock, bucket/project names,
+    # heartbeat paths, or do GCS/IAM probes. Return only non-identifying posture.
+    return json.dumps({
+        "server_version": SERVER_VERSION,
+        "schema_version": OUTPUT_SCHEMA_VERSION,
+        "writes_allowed": policy.writes_allowed(),
+        "controlled_access": policy.controlled_access_enabled(),
+        "killswitch_tripped": bool(getattr(policy, "_killed_flag", False)
+                                   or policy.KILL_FILE.exists()),
+        "tools_count": len(server._tool_manager._tools),  # type: ignore[attr-defined]
+        "note": ("minimal posture only (no workspace identifiers/paths, no "
+                 "network probe); call the terra_health tool for the full, "
+                 "audited snapshot"),
+    }, indent=2)
 
 
 @server.resource("terra://posture", title="Safety & compliance posture",

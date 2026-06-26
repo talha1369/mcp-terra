@@ -36,13 +36,20 @@ compliance reviewer.
 | Tool | Guard OFF (default) | Guard ON |
 |---|---|---|
 | `terra_read_bucket_object` (object bytes) | allowed | **refused** unless the bucket is an EXACT-name public reference bucket or in `MCP_TERRA_DATA_EGRESS_ALLOW` |
+| `terra_list_bucket` (object paths) | allowed | **refused** for non-public/non-allowlisted buckets (object paths can encode controlled identifiers) |
 | `terra_get_entities` (data-table rows) | allowed | **refused** (rows can carry controlled attributes) |
 | `terra_get_workflow_outputs` (output values) | allowed | **refused** (outputs are data + controlled paths) |
 | `terra_get_workflow_metadata` | allowed | **reduced** to `status` + `callsSummary` (inputs/outputs/failures withheld) |
+| `terra_get_method_config` (config contents) | allowed | **reduced** to method ref + param **key names** (direct-input values — sample ids, gs:// paths — withheld) |
+| `terra_get_submission` (per-workflow detail) | allowed | **reduced** to submission/workflow **ids + statuses** (entity names + failure messages withheld) |
+| `terra_get_workflow_logs` (per-task stderr) | allowed (path bound to the queried workspace bucket) | **content AND paths withheld** (per-task status kept; stderr can print controlled data) |
 | `terra_get_run_log` (stdout/stderr) | allowed | **content withheld** (paths + status kept; a notebook can print controlled data) |
 | `terra_get_notebook_job_result` | allowed | **cell source/traceback withheld**; `status`/`rc`/failed-cell-index/triage-category kept. The Tier-2 external-LLM fix proposal is **disabled** (it would egress the traceback) |
+| `terra_get_batch_job_status` (Google Batch job) | allowed | **reduced** to `status` + `status_events` + logging command (full job JSON withheld) |
+| `terra_render_audio_summary` (text→speech) | allowed (auto backend) | **forced to local `say`** (on-host, offline); external Cloud TTS **refused** so summary text never leaves the host |
 | `terra_get_bucket_object_metadata` (size/md5/type) | allowed | allowed (metadata, not data) |
-| `terra_list_data_tables` (schema + counts) · `terra_get_submission` · `terra_list_submissions` · `terra_get_workflow_cost` | allowed | allowed (status/metadata, no row/scalar values) |
+| `terra_list_data_tables` (schema + counts) · `terra_list_submissions` · `terra_get_workflow_cost` | allowed | allowed (status/metadata, no row/scalar values) |
+| `terra://health` **resource** (auto-read by clients) | minimal posture | minimal posture — **no** workspace lock / bucket / project / paths, **no** network probe (call the `terra_health` *tool* for the full audited snapshot) |
 | notebook/WDL **run loop** (executes on the Terra VM) | allowed | allowed (data stays in Terra; the in-process deterministic triager still categorizes failures without egress) |
 
 All matching is by **exact bucket name** — a controlled bucket *named* to look
@@ -50,6 +57,11 @@ public (e.g. `gnomad-public-impostor`) is **not** trusted.
 
 Refusals are **fail-loud** with a clear message and remediation — never a silent
 drop or placeholder.
+
+This table is **enforced by a structural meta-test** (`CC-ControlledAccess3`):
+the suite enumerates every data-returning tool and fails if any one of them
+ships without a controlled-access check, so a future tool cannot silently
+re-open an egress path.
 
 ### Not hindering lab-generated or public data
 
