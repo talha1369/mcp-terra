@@ -3418,6 +3418,41 @@ def _():
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# CC-Seqera — MCP resources + prompts (discoverability), safe (no data egress)
+# ──────────────────────────────────────────────────────────────────────────
+
+@case("CC-Seqera", "MCP resources + prompts are registered")
+def _():
+    import asyncio
+    res = asyncio.run(server.server.list_resources())
+    prompts = asyncio.run(server.server.list_prompts())
+    res_uris = {str(r.uri) for r in res}
+    assert {"terra://health", "terra://posture"} <= res_uris, res_uris
+    pnames = {p.name for p in prompts}
+    assert {"diagnose_failed_workflow", "run_notebook_bugfix_loop"} <= pnames, pnames
+
+
+@case("CC-Seqera", "posture resource exposes config only — NO workspace data")
+def _():
+    md = server._res_posture()
+    assert "no delete" in md.lower() and "controlled-access" in md.lower()
+    # it must be generated from posture, not read any bucket/entity/data path
+    import inspect
+    src = inspect.getsource(server._res_posture)
+    for forbidden in ("read_object", "rawls_get_entities", "download_file",
+                      "bucket_object", "get_entities"):
+        assert forbidden not in src, f"posture resource must not touch data ({forbidden})"
+
+
+@case("CC-Seqera", "prompts are guidance-only (no destructive instruction)")
+def _():
+    p1 = server.diagnose_failed_workflow("ns", "ws", "sub")
+    p2 = server.run_notebook_bugfix_loop("gs://b/n.ipynb")
+    assert "terra_get_workflow_logs" in p1 and "no destructive" in p1.lower()
+    assert "terra_create_runtime" in p2 and "secret-scan" in p2.lower()
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # RUN
 # ──────────────────────────────────────────────────────────────────────────
 

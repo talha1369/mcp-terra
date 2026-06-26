@@ -9,6 +9,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **MCP resources + prompts (Seqera-style discoverability).** Read-only
+  resources `terra://health` (live posture) and `terra://posture` (safety/
+  compliance one-pager) — config only, never workspace data — plus reusable
+  prompt templates `diagnose_failed_workflow` and `run_notebook_bugfix_loop`.
+  New **`docs/auth.md`** documents the credential posture (gcloud ADC only, no
+  token minting/storage, env-snapshot per-channel secrets). (Per-tool
+  `outputSchema` deferred — the structured-error envelope + `_schema_version`
+  already give clients a contract; full output schemas across 43 tools is a
+  large change for modest gain.)
 - **`terra_get_workflow_logs`** — per-task Cromwell stderr/stdout (paths +
   return code + stderr tail for failed tasks), the real failure signal for
   diagnosing a failed WDL run that the workflow status alone doesn't give. READ

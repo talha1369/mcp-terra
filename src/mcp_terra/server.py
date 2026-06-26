@@ -3038,6 +3038,74 @@ def terra_killswitch_trip(reason: str = "manual trip by agent") -> str:
     })
 
 
+# ── MCP resources (read-only, safe — NEVER expose workspace data) ───────────
+# Seqera-style discoverability: a client can browse the server's posture as
+# resources. These expose only safety/config posture — never controlled or
+# workspace DATA — so they are safe for a client to auto-read.
+
+@server.resource("terra://health", title="MCP health & posture",
+                 mime_type="application/json",
+                 description="Live safety-posture snapshot (same as terra_health). "
+                             "No workspace data.")
+def _res_health() -> str:
+    return terra_health()
+
+
+@server.resource("terra://posture", title="Safety & compliance posture",
+                 mime_type="text/markdown",
+                 description="One-page summary of the safety invariants + the "
+                             "controlled-access mode. No workspace data.")
+def _res_posture() -> str:
+    ca = "ON" if policy.controlled_access_enabled() else "OFF (default)"
+    writes = "ON" if policy.writes_allowed() else "OFF (read-only)"
+    return (
+        "# mcp-terra — safety & compliance posture\n\n"
+        f"- writes: **{writes}**\n"
+        f"- controlled-access data-egress guard: **{ca}** "
+        f"(`MCP_TERRA_CONTROLLED_ACCESS`)\n"
+        "- **no delete / destroy / abort / overwrite** primitive at any layer\n"
+        "- no-clobber bucket I/O; HMAC-signed job specs + tamper-evident audit "
+        "hash-chain\n"
+        "- recipient-locked email; env-locked Slack; secret-scan on every egress "
+        "path; bounded retry (idempotent only)\n"
+        "- kill-switch + single-workspace lock + per-minute rate limit\n\n"
+        "Policy mapping: see `docs/compliance.md` (NIH GDS/DUC + NIST 800-171) "
+        "and `SECURITY.md`.\n")
+
+
+# ── MCP prompts (Seqera-style reusable templates) ──────────────────────────
+
+@server.prompt(title="Diagnose a failed Terra workflow",
+               description="Guided, read-only root-cause steps for a failed WDL "
+                           "submission (no mutation; no destructive tools exist).")
+def diagnose_failed_workflow(namespace: str, name: str, submission_id: str) -> str:
+    return (
+        f"Diagnose the failed workflow(s) in Terra workspace "
+        f"{namespace}/{name}, submission {submission_id}. Steps:\n"
+        f"1. `terra_get_submission` → find the failed workflow id(s).\n"
+        f"2. `terra_get_workflow_metadata` (callsSummary) → which task failed.\n"
+        f"3. `terra_get_workflow_logs(failed_only=True)` → read the failed "
+        f"task's stderr (the real error).\n"
+        f"4. If infra-related, `terra_get_batch_job_status`.\n"
+        f"5. Summarize the root cause and propose a WDL fix. Do NOT mutate or "
+        f"delete anything — the MCP has no destructive tools, by design.")
+
+
+@server.prompt(title="Run + auto-fix a Terra notebook",
+               description="Drive the provision → run → auto-fix → verified-report "
+                           "loop for a notebook in the workspace bucket.")
+def run_notebook_bugfix_loop(notebook_gcs: str) -> str:
+    return (
+        f"Run the notebook {notebook_gcs} on Terra end-to-end:\n"
+        f"`terra_health` → right-size + `terra_create_runtime` (atomic, seamless "
+        f"on-boot runner) → `terra_submit_notebook_job` → "
+        f"`terra_get_notebook_job_result(wait_for_complete=True)` → auto-fix via "
+        f"the deterministic Tier-0 triage → `terra_write_run_record` → verified "
+        f"email/Slack/desktop + audio. Cross-check every claim against "
+        f"`terra_get_run_log` before sending. Never bypass the secret-scan or "
+        f"attempt any destructive action.")
+
+
 # ── Entry point ─────────────────────────────────────────────────────────────
 
 def main() -> None:
