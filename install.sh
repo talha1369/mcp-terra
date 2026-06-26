@@ -222,11 +222,15 @@ step "Registering MCP with Claude Code"
 # Code is launched (Dock/Spotlight on macOS strip the shell PATH).
 MCP_PATH="$(dirname "$GCLOUD"):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 
+# Register the secret by FILE PATH, never by value: putting the raw HMAC key on
+# the `claude mcp add` argv would expose it via `ps` and persist it in the MCP
+# env config. The server reads MCP_TERRA_RUNNER_SECRET_FILE (a 0600 file) at
+# runtime; the secret value never appears in argv or any config.
 "$CLAUDE_BIN" mcp add terra \
   -s user \
   -e "MCP_TERRA_ALLOW_WRITES=1" \
   -e "MCP_TERRA_WORKSPACE=$WORKSPACE" \
-  -e "MCP_TERRA_RUNNER_SECRET=$RUNNER_SECRET" \
+  -e "MCP_TERRA_RUNNER_SECRET_FILE=$SECRET_FILE" \
   -e "PATH=$MCP_PATH" \
   -e "HOME=$HOME" \
   -- "$VENV_PY" -m mcp_terra.server >/dev/null \

@@ -729,6 +729,13 @@ def terra_create_runtime(
             "MCP_TERRA_RUNTIME_NAME": runtime_name,
             # Exact (content-addressed) runner object the start script fetches.
             "MCP_TERRA_RUNNER_OBJECT": runner_obj,
+            # security review: pin the EXPECTED runner sha256 via cEV (Leonardo-
+            # encrypted, NOT writable by a bucket co-member). The boot script
+            # verifies the copied runner against this before chmod/exec, so a
+            # co-member who swaps the bucket object cannot get arbitrary code to
+            # run with the runner secret. Fail-closed on mismatch.
+            "MCP_TERRA_RUNNER_SHA256": _hashlib.sha256(
+                nbr.runner_script_template().encode("utf-8")).hexdigest(),
             # Auto-install Claude Code on the VM for on-VM live coding (the
             # start script does this best-effort, backgrounded; auth per-user).
             "MCP_TERRA_INSTALL_CLAUDE": "1" if install_claude_code else "0",
@@ -1283,15 +1290,25 @@ def terra_start_runner_on_vm(google_project: str, runtime_name: str,
         raise PermissionError("gcloud instances list timed out after 30s")
 
     matches = [ln.strip().split("\t") for ln in out.stdout.splitlines() if ln.strip()]
-    if not matches:
+    # security review: select by EXACT instance name, not the substring
+    # filter. A substring match could bootstrap the WRONG VM (requesting 'foo'
+    # must never select 'foo2'), and because we set MCP_TERRA_RUNTIME_NAME on
+    # whichever VM we chose, the later heartbeat-runtime binding would still
+    # pass — installing the secret + executor on the wrong instance. Leonardo
+    # names the GCE instance after the runtime, so require an exact, unique match.
+    exact = [m for m in matches if m and m[0] == runtime_name]
+    if not exact:
         raise safety.SafetyError(
-            f"No GCE instance found in project {google_project!r} matching "
-            f"runtime name {runtime_name!r}. Confirm the runtime is in "
-            f"Running state via terra_get_runtime."
+            f"No GCE instance named exactly {runtime_name!r} in project "
+            f"{google_project!r}. Confirm the runtime exists and is Running "
+            f"(terra_get_runtime)."
         )
-    # Prefer a RUNNING instance if multiple match
-    running = [m for m in matches if len(m) >= 3 and m[2] == "RUNNING"]
-    chosen = running[0] if running else matches[0]
+    if len(exact) > 1:
+        raise safety.SafetyError(
+            f"Multiple GCE instances named {runtime_name!r} in project "
+            f"{google_project!r}; refusing to guess which one to bootstrap."
+        )
+    chosen = exact[0]
     if len(chosen) < 2:
         raise safety.SafetyError(f"Unparseable gcloud output: {matches!r}")
     instance, zone = chosen[0], chosen[1]
@@ -1306,6 +1323,9 @@ def terra_start_runner_on_vm(google_project: str, runtime_name: str,
     # is the body (this script). Idempotent: kills any previously-running
     # runner before starting a fresh one.
     bucket_clean = bucket_uri.rstrip("/")
+    import hashlib as _hashlib
+    _runner_sha = _hashlib.sha256(
+        nbr.runner_script_template().encode("utf-8")).hexdigest()
     bootstrap = f"""#!/usr/bin/env bash
 set -eu
 read -r SECRET_LINE
@@ -1317,6 +1337,16 @@ cd /home/jupyter
 # Pull latest runner script
 gsutil cp '{bucket_clean}/mcp_terra_jobs/mcp_terra_runner.sh' \
     /home/jupyter/mcp_terra_runner.sh
+# security review: verify the runner bytes against the sha256 the MCP computed
+# from its OWN copy of the template before chmod/exec. The workspace bucket is
+# co-member-writable, so an unverified fetch could exec swapped code with the
+# runner secret. Fail CLOSED on mismatch.
+_GOT_SHA="$( (sha256sum /home/jupyter/mcp_terra_runner.sh 2>/dev/null || shasum -a 256 /home/jupyter/mcp_terra_runner.sh 2>/dev/null) | awk '{{print $1}}' )"
+if [ "$_GOT_SHA" != "{_runner_sha}" ]; then
+    echo "runner sha256 mismatch (expected {_runner_sha}, got $_GOT_SHA) — refusing to exec a possibly-tampered runner." >&2
+    rm -f /home/jupyter/mcp_terra_runner.sh 2>/dev/null || true
+    exit 22
+fi
 chmod +x /home/jupyter/mcp_terra_runner.sh
 
 # Kill any prior runner (idempotent restart)

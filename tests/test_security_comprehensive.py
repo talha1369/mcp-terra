@@ -1341,6 +1341,57 @@ def _():
     assert "hb_runtime != runtime_name" in src, "heartbeat not bound to runtime"
     assert "raw_age < -120" in src, "no future-skew rejection"
 
+@case("CC-Hardening", "VM boot verifies the runner sha256 before exec (integrity)")
+def _():
+    from mcp_terra import notebook_runner as nbr
+    s = nbr.start_runner_script_template()
+    assert "MCP_TERRA_RUNNER_SHA256" in s
+    assert "runner sha256 mismatch" in s and "Refusing to exec" in s
+
+@case("CC-Hardening", "create_runtime pins the runner sha256 via cEV")
+def _():
+    import inspect
+    assert '"MCP_TERRA_RUNNER_SHA256": _hashlib.sha256(' in inspect.getsource(server)
+
+@case("CC-Hardening", "SSH bootstrap verifies the runner sha256 before exec")
+def _():
+    import inspect
+    src = inspect.getsource(server.terra_start_runner_on_vm)
+    assert "runner sha256 mismatch" in src and "_runner_sha" in src
+
+@case("CC-Hardening", "install.sh registers the secret FILE, never the value")
+def _():
+    sh = (REPO_ROOT / "install.sh").read_text()
+    assert "MCP_TERRA_RUNNER_SECRET_FILE=$SECRET_FILE" in sh
+    assert '-e "MCP_TERRA_RUNNER_SECRET=$RUNNER_SECRET"' not in sh, "raw secret still on argv"
+
+@case("CC-Hardening", "terra_client redacts the file-backed runner secret too")
+def _():
+    import inspect
+    from mcp_terra import terra_client as tc
+    assert "_active_runner_secret" in inspect.getsource(tc)
+    assert "MCP_TERRA_RUNNER_SECRET_FILE" in inspect.getsource(tc._active_runner_secret)
+
+@case("CC-Hardening", "start_runner_on_vm selects the EXACT instance (no substring)")
+def _():
+    import inspect
+    src = inspect.getsource(server.terra_start_runner_on_vm)
+    assert "m[0] == runtime_name" in src and "Multiple GCE instances named" in src
+
+@case("CC-Hardening", "papermill runs in its own group + is killed on lease loss")
+def _():
+    from mcp_terra import notebook_runner as nbr
+    s = nbr.runner_script_template()
+    assert "setsid timeout" in s, "papermill not in its own session/group"
+    assert "LEASE_ABORTED=1" in s and 'kill -KILL -- "-$PM_PGID"' in s
+    assert "aborted mid-run (lease loss" in s
+
+@case("CC-Hardening", "kill_pool terminates recorded papermill process groups")
+def _():
+    from mcp_terra import notebook_runner as nbr
+    s = nbr.runner_script_template()
+    assert '"$WORK"/*.pgid' in s and 'kill -KILL -- "-$_pg"' in s
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # U-Robustness: state-of-the-art MCP design — annotations, schema versioning,

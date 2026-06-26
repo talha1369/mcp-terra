@@ -26,6 +26,28 @@ SAM_BASE   = "https://sam.dsde-prod.broadinstitute.org"
 AGORA_BASE = "https://agora.dsde-prod.broadinstitute.org"
 
 
+def _active_runner_secret() -> str:
+    """Resolve the runner HMAC secret the SAME way the runner does — from
+    MCP_TERRA_RUNNER_SECRET, else the 0600 file at MCP_TERRA_RUNNER_SECRET_FILE.
+    Non-raising (returns '' if unresolved). Used ONLY to redact the secret from
+    error bodies — in secret-FILE mode the value isn't in the env var, so a
+    naive env-only redaction would miss it (security review)."""
+    s = os.environ.get("MCP_TERRA_RUNNER_SECRET", "").strip()
+    if s:
+        return s
+    f = os.environ.get("MCP_TERRA_RUNNER_SECRET_FILE", "").strip()
+    if not f:
+        return ""
+    try:
+        p = os.path.realpath(os.path.expanduser(f))
+        if os.path.isfile(p):
+            with open(p, encoding="utf-8") as fh:
+                return fh.read().strip()
+    except OSError:
+        return ""
+    return ""
+
+
 # ── Transient-failure retry policy ──────────────────────────────────────────
 # Bounded retry with exponential backoff + jitter, honoring Retry-After — for
 # IDEMPOTENT methods only. common Terra Python clients do not retry the Terra API at all;
@@ -196,7 +218,10 @@ def _request(service: str, method: str, base: str, path: str, token: str,
         body = resp.text
         if token and token in body:
             body = "[response body contained OAuth token — redacted for safety]"
-        _runner_secret = os.environ.get("MCP_TERRA_RUNNER_SECRET", "")
+        # Redact the runner HMAC secret resolved from env OR the secret FILE —
+        # terra_create_runtime sends it inside customEnvironmentVariables, so a
+        # service/proxy that echoes the request body could otherwise leak it.
+        _runner_secret = _active_runner_secret()
         if _runner_secret and _runner_secret in body:
             body = body.replace(_runner_secret, "[REDACTED_RUNNER_SECRET]")
         raise TerraAPIError(service, method, path, resp.status_code, body)

@@ -9,6 +9,24 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed (security hardening)
 
+- **Runner bootstrap integrity (critical).** The VM boot script + the SSH
+  bootstrap now verify the runner script against an MCP-pinned sha256 delivered
+  via Leonardo customEnvironmentVariables (not writable by a bucket co-member)
+  before chmod/exec — fail-closed on mismatch. Previously a co-member could swap
+  the bucket runner object and run code with the runner secret.
+- **Lease-loss termination (critical).** papermill now runs in its own process
+  group (setsid); the job watches the lease while it runs and kills the whole
+  group the instant the lease is lost or a halt is signalled, then writes no
+  result (the claim holder owns it) — closing the double-execute window.
+- **Process-group shutdown.** `kill_pool` terminates the recorded
+  timeout→papermill→kernel process GROUPS, not just the wrapper subshell, so a
+  spend-cap / abort halt actually stops compute.
+- **Secret never on argv.** `install.sh` registers `MCP_TERRA_RUNNER_SECRET_FILE`
+  instead of the raw secret value; terra_client error-body redaction resolves the
+  secret from env OR the file, so the file-backed secret is redacted too.
+- **Exact VM resolution.** `terra_start_runner_on_vm` requires an exact, unique
+  GCE instance-name match (a substring match could bootstrap the wrong VM).
+
 - **Lease double-execute (critical).** A single transient lease stat/CAS hiccup
   stopped the refresher outright, so the claim could age past TTL and another
   runner stale-reclaim + double-execute a still-running job. The refresher now

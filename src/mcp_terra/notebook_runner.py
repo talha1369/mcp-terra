@@ -287,6 +287,28 @@ cd /home/jupyter
 
 # Pull the runner script from the workspace bucket.
 gsutil cp "$RUNNER_SRC" "$RUNNER_LOCAL"
+
+# security review: VERIFY the runner bytes against the sha256 the MCP pinned via
+# Leonardo customEnvironmentVariables (encrypted at rest; a bucket co-member
+# CANNOT write it). The workspace bucket IS co-member-writable, so without this
+# check a co-member could swap mcp_terra_runner.sh and have arbitrary code run
+# here WITH the runner secret in the environment — a full bypass of HMAC-signed
+# specs. Fail CLOSED on mismatch; never chmod/exec unverified bytes.
+if [ -n "${MCP_TERRA_RUNNER_SHA256:-}" ]; then
+    _got="$( (sha256sum "$RUNNER_LOCAL" 2>/dev/null || shasum -a 256 "$RUNNER_LOCAL" 2>/dev/null) | awk '{print $1}' )"
+    if [ -z "$_got" ]; then
+        echo "[start_runner] FATAL: cannot compute runner sha256; refusing to exec." >&2
+        exit 20
+    fi
+    if [ "$_got" != "$MCP_TERRA_RUNNER_SHA256" ]; then
+        echo "[start_runner] FATAL: runner sha256 mismatch (expected ${MCP_TERRA_RUNNER_SHA256}, got ${_got}). The bucket object may be tampered. Refusing to exec." >&2
+        rm -f "$RUNNER_LOCAL" 2>/dev/null || true
+        exit 21
+    fi
+    echo "[start_runner] runner sha256 verified."
+else
+    echo "[start_runner] WARN: no MCP_TERRA_RUNNER_SHA256 pinned (legacy install); executing without integrity verification." >&2
+fi
 chmod +x "$RUNNER_LOCAL"
 
 # Idempotent restart: clear any prior runner, then relaunch detached. The
@@ -563,9 +585,20 @@ stop_refresher() {
 # this sentinel between launches / while draining and halts the whole VM.
 RUNNER_ABORT="$WORK/.runner_abort"
 
-# Best-effort: terminate in-flight per-spec subshells before a runner-wide halt.
+# Terminate in-flight work before a runner-wide halt. The expensive work is a
+# setsid'd timeout->papermill->kernel process GROUP (whose PGID each job records
+# in $WORK/<job>.pgid), NOT the wrapper subshell — so killing only the subshell
+# would leave compute running after the halt (and possibly after the runner
+# exits, if gcloud stop is slow). Kill every recorded group first, then the
+# wrapper subshells.
 kill_pool() {
-    local _p
+    local _p _f _pg
+    for _f in "$WORK"/*.pgid; do
+        [ -f "$_f" ] || continue
+        _pg="$(cat "$_f" 2>/dev/null || true)"
+        case "$_pg" in ''|*[!0-9]*) continue ;; esac
+        kill -KILL -- "-$_pg" 2>/dev/null || kill -KILL "$_pg" 2>/dev/null || true
+    done
     for _p in $(jobs -rp 2>/dev/null); do kill "$_p" 2>/dev/null || true; done
 }
 
@@ -1036,8 +1069,17 @@ PYVERIFY
         PER_CELL_SEC=$(( TIMEOUT_MIN * 60 ))
         [ "$PER_CELL_SEC" -gt "$JOB_BUDGET" ] && PER_CELL_SEC=$JOB_BUDGET
         RUN_STARTED_AT=$(date +%s)
+        PGID_FILE="$WORK/$JOB_ID.pgid"
+        LEASE_ABORTED=0
         set +e
-        timeout --verbose --signal=TERM --kill-after=60 "${JOB_BUDGET}s" \
+        # security review: run papermill in its OWN process group (setsid) in the
+        # BACKGROUND, then watch the lease while it runs. This closes two gaps:
+        # (1) on lease loss / runner-wide abort we kill the WHOLE group at once
+        # instead of only noticing AFTER papermill finishes — so a job another
+        # runner may have stale-reclaimed is never double-executed; (2) the PGID
+        # is recorded so kill_pool can terminate the timeout->papermill->kernel
+        # tree (not just the wrapper shell) on a VM-wide halt.
+        setsid timeout --verbose --signal=TERM --kill-after=60 "${JOB_BUDGET}s" \
             env -u MCP_TERRA_RUNNER_SECRET \
             -u MCP_TERRA_ALLOW_WRITES \
             -u MCP_TERRA_WORKSPACE \
@@ -1049,10 +1091,38 @@ PYVERIFY
                       -k python3 \
                       --parameters_yaml "$PARAMS_JSON" \
                       "$LOCAL_NB" "$LOCAL_OUT" \
-                      > "$WORK/$JOB_ID.stdout" 2> "$WORK/$JOB_ID.stderr"
-        RC=$?
+                      > "$WORK/$JOB_ID.stdout" 2> "$WORK/$JOB_ID.stderr" &
+        PM_PID=$!
+        # setsid execs in place (the caller is not a group leader), so PM_PID is
+        # the new group leader → PGID == PM_PID. Read it via ps for certainty;
+        # fall back to PM_PID.
+        sleep 1
+        PM_PGID="$(ps -o pgid= -p "$PM_PID" 2>/dev/null | tr -d ' ')"
+        [ -z "$PM_PGID" ] && PM_PGID="$PM_PID"
+        echo "$PM_PGID" > "$PGID_FILE" 2>/dev/null || true
+        while kill -0 "$PM_PID" 2>/dev/null; do
+            if [ -f "$LOST_CLAIM" ] || [ -f "$RUNNER_ABORT" ]; then
+                echo "[runner] lease lost / runner abort during $JOB_ID — terminating the papermill group (prevents double-execute)." >&2
+                LEASE_ABORTED=1
+                kill -TERM -- "-$PM_PGID" 2>/dev/null || kill -TERM "$PM_PID" 2>/dev/null || true
+                sleep 5
+                kill -KILL -- "-$PM_PGID" 2>/dev/null || kill -KILL "$PM_PID" 2>/dev/null || true
+                break
+            fi
+            sleep 3
+        done
+        wait "$PM_PID" 2>/dev/null; RC=$?
+        rm -f "$PGID_FILE" 2>/dev/null || true
         set -e
         RUN_ENDED_AT=$(date +%s)
+        # If the lease was lost / a halt was signalled mid-run, the runner that
+        # HOLDS the claim owns the job — do NOT write a result or move the spec
+        # (result.json no-clobber is the final backstop; this avoids wasted work
+        # and a confusing duplicate terminal write).
+        if [ "$LEASE_ABORTED" -eq 1 ]; then
+            echo "[runner] $JOB_ID aborted mid-run (lease loss / halt); leaving the result + spec to the claim holder." >&2
+            continue
+        fi
         # security review: CAUSAL session-limit detection, not a wall-clock heuristic.
         # RC 124 is coreutils' unambiguous "command timed out" status. For RC 137
         # (SIGKILL — which ALSO occurs on OOM or a manual kill) we ONLY count it
