@@ -4158,6 +4158,10 @@ def _():
     ack_idx = src.index('"written": True')
     full_idx = src.index('"run_record": rec')
     assert ack_idx < full_idx, "controlled ack must short-circuit before the full record"
+    # security review r11: the FAILURE paths (existing-record, md5 mismatch) must
+    # also redact the bucket path (dest) in controlled mode.
+    assert "_rr_loc" in src and 'if policy.controlled_access_enabled() else repr(dest)' in src
+    assert "{dest!r}" not in src.split("_rr_loc", 1)[1], "error paths must use the redacted _rr_loc, not dest"
 
 
 @case("CC-ControlledAccess3", "get_workflow_cost drops a numeric field whose KEY encodes an id (controlled)")
@@ -4167,13 +4171,15 @@ def _():
     _tc.rawls_get_workflow_cost = lambda *a, **k: {
         "cost": 1.23, "currency": "USD",
         "sample_NA12878_count": 5,        # numeric, but the KEY is an identifier
+        "subjectAliceCost": 7.0,          # "cost", no digits — must STILL be dropped
         "vmCostUsd": 0.99}
     server.auth.get_access_token = lambda: "tok"
     try:
         _p._CONTROLLED_ACCESS = True
         out = server.terra_get_workflow_cost("ns", "ws", "sub", "wf")
         assert "NA12878" not in out, "a numeric field with an identifier KEY leaked!"
-        assert "1.23" in out and "0.99" in out  # cost-named numeric fields kept
+        assert "Alice" not in out, "non-allowlisted cost-substring key leaked an identifier!"
+        assert "1.23" in out and "0.99" in out  # exact-allowlisted cost fields kept
     finally:
         _p._CONTROLLED_ACCESS, _tc.rawls_get_workflow_cost, server.auth.get_access_token = saved, oc, ot
 
@@ -4190,12 +4196,19 @@ def _():
     assert 'CLAIM="$JOB_DIR/.claim"' in s
     assert 'x-goog-if-generation-match:0' in s, "must use the atomic create precondition"
     assert "x-goog-if-generation-match:$CLAIM_GEN" in s, "must reclaim via compare-and-swap"
-    assert "CLAIM_TTL" in s and "claim contended" in s
+    assert "CLAIM_TTL" in s
     assert "gsutil cp -n - \"$CLAIM\"" not in s, "the racy cp -n claim must be gone"
-    # security review r10: durable terminal markers — succeeded/FAILED* + result.json, not
-    # just REFUSED — so a same-runtime restart never re-executes a completed spec.
+    # security review r11: owner + ts stored as CUSTOM METADATA so a SINGLE stat
+    # yields owner+ts+generation from the SAME version (closes the read-old-ts /
+    # CAS-new-gen double-reclaim race); same-runtime restart reclaims by owner.
+    assert "x-goog-meta-claim-owner:" in s and "x-goog-meta-claim-ts:" in s
+    assert 'CLAIM_OWNER" = "$RUNNER_INSTANCE_ID' in s, "must allow same-runtime reclaim"
+    assert "claim-owner:" in s and "claim-ts:" in s  # parsed from one stat
+    # security review r10/r11: durable terminal markers — fail-CLOSED on transient
+    # read errors (obj_state), succeeded/FAILED*/result.json, not just REFUSED.
+    assert "obj_state()" in s and "RESULT_STATE" in s and "STATUS_STATE" in s
     assert "REFUSED*|succeeded|FAILED*" in s
-    assert 'gsutil -q stat "$RESULT"' in s
+    assert "transient error checking result" in s  # fail-closed, not fail-open
 
 
 @case("CC-ControlledAccess3", "create_runtime/stop_runtime project the Leonardo response (source)")

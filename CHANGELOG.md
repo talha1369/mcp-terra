@@ -426,6 +426,15 @@ tests exercise the templates in isolation, so these were latent):
   - The structural meta-test now also catches the **local-var taint**
     (`r = tc.x(); return _ok(r)`) and forbids any `_NO_DATA` tool from calling a
     remote service unless justified in `_NO_DATA_REMOTE_OK` (fail-closed).
+- **Adversarial-review hardening — round 11** (re-review of round-10): the
+  runner lease now stores owner+timestamp as GCS custom metadata so a single
+  stat yields owner+ts+generation from the SAME object version and the
+  compare-and-swap targets that exact generation (closes a two-VM
+  double-reclaim race); durable terminal-marker checks FAIL CLOSED on transient
+  reads (an obj_state helper tells a positive 404 from an error); a same-runtime
+  restart reclaims its own job by owner; get_workflow_cost uses an EXACT cost-key
+  allowlist; terra_write_run_record error paths redact the bucket path in guard
+  mode.
 - **No delete primitive, by design** — no tool (and no `leo_delete_runtime`
   at any layer) deletes a runtime or persistent disk; teardown is the user's
   action in the Terra UI ("Keep persistent disk"). The MCP detects a

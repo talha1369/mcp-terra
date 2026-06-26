@@ -2646,15 +2646,15 @@ def terra_get_workflow_cost(namespace: str, name: str,
     # / entity ids. In guard mode keep ONLY numeric cost fields + the caller's own
     # ids (workflowId is the caller's argument).
     if policy.controlled_access_enabled() and isinstance(cost, dict):
-        # security review r9/r10: numeric-ONLY, AND filter by KEY too — a numeric field whose
-        # key encodes an identifier (e.g. "sample_NA12878_count") must NOT pass.
-        # Keep only keys that name a cost and carry no embedded digits; validate
-        # the currency against a hardcoded enum.
-        def _safe_cost_key(k):
-            return "cost" in k.lower() and not any(c.isdigit() for c in k)
+        # security review r9/r10/r11: numeric-only AND an EXACT key allowlist (not
+        # a substring heuristic — "subjectAliceCost" would have passed). Only
+        # these known, non-identifying cost keys are returned; anything else
+        # (incl. a schema-drifted or identifier-bearing key) is dropped.
+        _COST_KEYS = {"cost", "vmcost", "vmcostusd", "computecost", "storagecost",
+                      "totalcost", "egresscost", "diskcost", "petdiskcost"}
         _num = {k: v for k, v in cost.items()
                 if isinstance(v, (int, float)) and not isinstance(v, bool)
-                and _safe_cost_key(k)}
+                and k.lower() in _COST_KEYS}
         _cur = cost.get("currency")
         cost = {
             "currency": (_cur if _cur in ("USD", "EUR", "GBP", "CAD", "AUD", None)
@@ -3057,9 +3057,12 @@ def terra_write_run_record(run_id: str, record_json: str,
     # No-clobber PREFLIGHT: refuse loudly on an existing record rather than let
     # `gsutil cp -n` silently skip while we report success. Records are
     # immutable provenance. (security review finding.)
+    # security review r11: in controlled mode these failure messages must NOT
+    # echo `dest` (a bucket path) to the LLM, just like the success ack.
+    _rr_loc = "[withheld]" if policy.controlled_access_enabled() else repr(dest)
     if safety.bucket_object_exists(dest):
         raise safety.SafetyError(
-            f"run record already exists at {dest!r}. The MCP refuses to "
+            f"run record already exists at {_rr_loc}. The MCP refuses to "
             f"overwrite provenance (records are immutable). Use a fresh run_id.")
     import base64 as _b64_rr
     import hashlib as _hl_rr
@@ -3080,7 +3083,7 @@ def terra_write_run_record(run_id: str, record_json: str,
         _mm = _re_rr.search(r"Hash \(md5\):\s*(\S+)", bk.stat_object(dest))
         if not _mm or _mm.group(1) != _expected_md5:
             raise safety.SafetyError(
-                f"run record at {dest!r} does NOT match what we wrote (md5 "
+                f"run record at {_rr_loc} does NOT match what we wrote (md5 "
                 f"mismatch) — a concurrent writer likely won the no-clobber "
                 f"race. NOT reporting success; retry with a fresh run_id.")
     finally:                              # never leave the metadata blob on disk

@@ -457,6 +457,22 @@ command -v papermill >/dev/null 2>&1 || {
 
 echo "[runner] polling $BUCKET/mcp_terra_jobs/ every ${POLL_SEC}s (Ctrl-C to stop)"
 
+# security review r11: positively distinguish "object absent" (a 404, safe to
+# proceed) from a TRANSIENT gsutil/auth/network error (must NOT be read as
+# absent — that would let a terminal job be re-executed). Echoes
+# present|absent|error.
+obj_state() {
+    local _err _rc
+    _err="$(gsutil stat "$1" 2>&1 >/dev/null)"; _rc=$?
+    if [ "$_rc" -eq 0 ]; then
+        echo present
+    elif printf '%s' "$_err" | grep -qiE "no url|not found|404|does not exist|one or more"; then
+        echo absent
+    else
+        echo error
+    fi
+}
+
 # Heartbeat path — the MCP refuses to submit if this file is missing or older
 # than ~90s. UX-only (the runner secret HMAC remains the security boundary).
 HEARTBEAT_GCS="${BUCKET%/}/mcp_terra_jobs/.runner_heartbeat.txt"
@@ -502,52 +518,81 @@ while true; do
         RESULT="$JOB_DIR/result.json"
         EXECUTED="$JOB_DIR/executed.ipynb"
 
-        # security review r8/r10: DURABLE terminal markers — never (re-)execute a job that
-        # already reached a terminal state, even when our LOCAL PROCESSED_FILE is
-        # missing (a different VM, or a fresh local disk). Covers REFUSED
-        # (session-window), succeeded / FAILED* (a runner that wrote the result +
-        # status but crashed before the .consumed move), and a present result.json.
-        EXISTING_STATUS="$(gsutil cat "$STATUS" 2>/dev/null || true)"
-        case "$EXISTING_STATUS" in
-            REFUSED*|succeeded|FAILED*)
-                echo "[runner] job $JOB_ID already terminal ($EXISTING_STATUS); skipping — not re-executing." >&2
-                echo "$JOB_ID" >> "$PROCESSED_FILE"
-                continue
-                ;;
-        esac
-        if gsutil -q stat "$RESULT" 2>/dev/null; then
+        # security review r8/r10/r11: DURABLE terminal markers — never (re-)execute
+        # a job that already reached a terminal state, even when our LOCAL
+        # PROCESSED_FILE is missing (a different VM, or a fresh local disk). Covers
+        # REFUSED (session-window), succeeded / FAILED* (a runner that wrote the
+        # result + status but crashed before the .consumed move), and a present
+        # result.json. FAIL CLOSED: a TRANSIENT read error must NOT be read as
+        # "absent" (that would re-execute a terminal job) — skip this poll instead.
+        RESULT_STATE="$(obj_state "$RESULT")"
+        if [ "$RESULT_STATE" = "error" ]; then
+            echo "[runner] transient error checking result for $JOB_ID; skipping this poll." >&2
+            continue
+        fi
+        if [ "$RESULT_STATE" = "present" ]; then
             echo "[runner] job $JOB_ID already has a result.json; skipping (terminal)." >&2
             echo "$JOB_ID" >> "$PROCESSED_FILE"
             continue
         fi
+        STATUS_STATE="$(obj_state "$STATUS")"
+        if [ "$STATUS_STATE" = "error" ]; then
+            echo "[runner] transient error checking status for $JOB_ID; skipping this poll." >&2
+            continue
+        fi
+        if [ "$STATUS_STATE" = "present" ]; then
+            EXISTING_STATUS="$(gsutil cat "$STATUS" 2>/dev/null || true)"
+            case "$EXISTING_STATUS" in
+                REFUSED*|succeeded|FAILED*)
+                    echo "[runner] job $JOB_ID already terminal ($EXISTING_STATUS); skipping — not re-executing." >&2
+                    echo "$JOB_ID" >> "$PROCESSED_FILE"
+                    continue
+                    ;;
+            esac
+        fi
 
-        # security review r9/r10: ATOMIC cross-runner claim via the GCS GENERATION
-        # PRECONDITION (server-enforced create-if-absent) — NOT cp -n + read-back
-        # (which has a real two-writer race). Exactly one runner can create the
-        # marker; a concurrent create returns HTTP 412 (non-zero exit). A claim
-        # older than CLAIM_TTL means its owner is GONE (a job can never outlive the
-        # session budget), so it is reclaimed with a compare-and-swap on the
-        # current generation. Fail CLOSED: any unexpected failure → skip this pass
-        # (retried next poll; a live owner keeps us out). No double-execution; lets
-        # DIFFERENT VMs run DIFFERENT jobs in parallel.
+        # security review r9/r10/r11: ATOMIC cross-runner claim via the GCS
+        # GENERATION PRECONDITION (server-enforced create-if-absent) — NOT cp -n
+        # (which has a real two-writer race). Exactly one runner creates the
+        # marker; a concurrent create returns HTTP 412. The owner + timestamp are
+        # stored as CUSTOM METADATA so a SINGLE stat yields owner+ts+generation
+        # from the SAME object version, and we CAS that EXACT generation — closing
+        # the read-old-ts / CAS-new-gen double-reclaim race. Reclaim when (a) it is
+        # OUR OWN prior claim (same-runtime restart of an unfinished job; terminal
+        # checks above already excluded completed jobs) or (b) it is stale (owner
+        # gone: a job can never outlive the session budget). Fail CLOSED.
         CLAIM="$JOB_DIR/.claim"
-        CLAIM_BODY="$RUNNER_INSTANCE_ID $(date -u +%s)"
-        if printf '%s\n' "$CLAIM_BODY" | gsutil -h "x-goog-if-generation-match:0" cp - "$CLAIM" 2>/dev/null; then
+        NOW="$(date -u +%s)"
+        if printf '%s' "$RUNNER_INSTANCE_ID" \
+             | gsutil -h "x-goog-if-generation-match:0" \
+                      -h "x-goog-meta-claim-owner:$RUNNER_INSTANCE_ID" \
+                      -h "x-goog-meta-claim-ts:$NOW" cp - "$CLAIM" 2>/dev/null; then
             : # won a fresh claim (atomic create)
         else
-            CLAIM_TS="$(gsutil cat "$CLAIM" 2>/dev/null | awk 'NR==1{print $NF}')"
-            CLAIM_AGE=$(( $(date -u +%s) - ${CLAIM_TS:-0} ))
-            if [ -n "$CLAIM_TS" ] && [ "$CLAIM_AGE" -gt "$CLAIM_TTL" ]; then
-                CLAIM_GEN="$(gsutil stat "$CLAIM" 2>/dev/null | awk '/Generation:/{print $2}')"
-                if [ -n "$CLAIM_GEN" ] && printf '%s\n' "$CLAIM_BODY" \
-                     | gsutil -h "x-goog-if-generation-match:$CLAIM_GEN" cp - "$CLAIM" 2>/dev/null; then
-                    echo "[runner] reclaimed stale claim for $JOB_ID (age ${CLAIM_AGE}s > ${CLAIM_TTL}s; owner gone)." >&2
+            CLAIM_STAT="$(gsutil stat "$CLAIM" 2>/dev/null || true)"
+            CLAIM_GEN="$(printf '%s' "$CLAIM_STAT" | awk '/Generation:/{print $2; exit}')"
+            CLAIM_OWNER="$(printf '%s' "$CLAIM_STAT" | awk -F'[[:space:]]+' '/claim-owner:/{print $NF; exit}')"
+            CLAIM_TS="$(printf '%s' "$CLAIM_STAT" | awk -F'[[:space:]]+' '/claim-ts:/{print $NF; exit}')"
+            CLAIM_AGE=$(( NOW - ${CLAIM_TS:-$NOW} ))
+            if [ -z "$CLAIM_GEN" ]; then
+                echo "[runner] could not stat claim for $JOB_ID; skipping this poll." >&2
+                continue   # fail-closed (transient stat error)
+            fi
+            if [ "$CLAIM_OWNER" = "$RUNNER_INSTANCE_ID" ] \
+                 || { [ -n "$CLAIM_TS" ] && [ "$CLAIM_AGE" -gt "$CLAIM_TTL" ]; }; then
+                # CAS on the SAME generation we just judged — if another runner
+                # reclaimed first, the generation changed and this 412-fails.
+                if printf '%s' "$RUNNER_INSTANCE_ID" \
+                     | gsutil -h "x-goog-if-generation-match:$CLAIM_GEN" \
+                              -h "x-goog-meta-claim-owner:$RUNNER_INSTANCE_ID" \
+                              -h "x-goog-meta-claim-ts:$NOW" cp - "$CLAIM" 2>/dev/null; then
+                    echo "[runner] reclaimed claim for $JOB_ID (prev owner='$CLAIM_OWNER' age=${CLAIM_AGE}s)." >&2
                 else
-                    echo "[runner] job $JOB_ID claim contended; skipping this pass." >&2
+                    echo "[runner] claim for $JOB_ID changed under us; skipping this poll." >&2
                     continue
                 fi
             else
-                echo "[runner] job $JOB_ID already claimed by a live runner; skipping." >&2
+                echo "[runner] job $JOB_ID held by a live runner ('$CLAIM_OWNER', age ${CLAIM_AGE}s); skipping." >&2
                 continue
             fi
         fi
