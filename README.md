@@ -524,6 +524,20 @@ submission layer. Three layers of parallelism:
    never executed twice. (A single VM runs its own jobs sequentially, by design,
    to avoid OOM — for many notebooks at once, use more runtimes or the WDL path.)
 
+## Multiple compute environments
+
+The MCP is not limited to one runtime. `terra_create_runtime` takes a
+`runtime_name`, so calling it with distinct names creates **several compute
+environments** in the locked workspace's project (the lock is to the
+project/workspace, not to a single runtime); `terra_list_runtimes`,
+`terra_get_runtime`, `terra_start_runtime`, and `terra_stop_runtime` all operate
+per-name. Run several at once for parallel work: each runtime's on-VM runner
+takes an **atomic per-spec claim**, so the VMs pick up *different* notebook jobs
+and never run the same one twice. Mix sizes too — e.g. a GPU env for training
+and a high-mem env for preprocessing — and submit jobs to the shared bucket;
+the running runtimes divide them. (For one VM to run several jobs at once, see
+single-VM concurrency; for large fan-out, prefer the WDL/Cromwell scatter path.)
+
 ## Example collaboration flow
 
 ```text

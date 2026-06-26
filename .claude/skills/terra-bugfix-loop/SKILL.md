@@ -40,6 +40,12 @@ workspace, `runner_secret.strength_ok: true`, `killswitch.tripped: false`,
 
 ## Phase 1 — Right-size the runtime (no delete, ever)
 
+**Multiple compute environments:** you are NOT limited to one runtime. To run
+work in parallel, create several with distinct `runtime_name`s (e.g. a GPU env +
+a high-mem env) — `terra_create_runtime` per name, all in the locked project.
+Each runtime's runner atomically claims *different* jobs from the shared bucket,
+so they never double-run a job. Size each env to its workload.
+
 1. `terra_recommend_runtime_for_notebook(notebook_gcs)` → target spec
    (`create_runtime_args` + hourly estimate). Show it to the user.
    - **Controlled-access mode:** this tool reads the notebook bytes locally, so
