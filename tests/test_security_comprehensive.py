@@ -3136,9 +3136,9 @@ def _():
         _p._DATA_EGRESS_ALLOW = frozenset({"my-lab-open"})
         must_raise(_p.assert_data_egress_allowed, _p.PolicyError,
                    "fc-secure-7d8a16eb", "object content")
-        for b in ("gnomad-public", "broad-references",
-                  "gcp-public-data--broad-references", "my-lab-open"):
-            _p.assert_data_egress_allowed(b, "x")   # public or allowlisted → ok
+        for b in ("genomics-public-data", "gcp-public-data--broad-references",
+                  "gatk-test-data", "my-lab-open"):
+            _p.assert_data_egress_allowed(b, "x")   # EXACT public or allowlisted → ok
     finally:
         (_p._CONTROLLED_ACCESS, _p._DATA_EGRESS_ALLOW) = saved
 
@@ -3167,6 +3167,98 @@ def _():
 def _():
     import inspect
     assert '"controlled_access"' in inspect.getsource(server.terra_health)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# CC-ControlledAccess2 — round-3 fixes: close ALL controlled-access egress
+# paths + exact-name public allowlist. Tests EXECUTE the documented bypasses.
+# ──────────────────────────────────────────────────────────────────────────
+
+@case("CC-ControlledAccess2", "F3 public allowlist is EXACT — prefix-collision blocked")
+def _():
+    from mcp_terra import policy as _p
+    saved = (_p._CONTROLLED_ACCESS, _p._DATA_EGRESS_ALLOW)
+    try:
+        _p._CONTROLLED_ACCESS = True
+        _p._DATA_EGRESS_ALLOW = frozenset()
+        for evil in ("gnomad-public-impostor", "gnomad-private-controlled",
+                     "broad-public-evil", "gcp-public-data-evil"):
+            assert _p.is_egress_allowed_bucket(evil) is False, evil
+        for ok in ("genomics-public-data", "gcp-public-data--broad-references",
+                   "gatk-test-data"):
+            assert _p.is_egress_allowed_bucket(ok) is True, ok
+    finally:
+        (_p._CONTROLLED_ACCESS, _p._DATA_EGRESS_ALLOW) = saved
+
+
+@case("CC-ControlledAccess2", "F2 workflow_outputs REFUSED in controlled mode (executes bypass)")
+def _():
+    from mcp_terra import policy as _p
+    saved = _p._CONTROLLED_ACCESS
+    try:
+        _p._CONTROLLED_ACCESS = True
+        must_raise(server.terra_get_workflow_outputs, PermissionError,
+                   "ns", "ws", "sub", "wf")
+    finally:
+        _p._CONTROLLED_ACCESS = saved
+
+
+@case("CC-ControlledAccess2", "F2 workflow_metadata REDUCED to status+summary (executes bypass)")
+def _():
+    from mcp_terra import policy as _p
+    saved = _p._CONTROLLED_ACCESS
+    orig_md = _tc.rawls_get_workflow_metadata
+    orig_tok = server.auth.get_access_token
+    _tc.rawls_get_workflow_metadata = lambda *a, **k: {
+        "status": "Failed", "workflowName": "wf",
+        "inputs": {"sample": "NA12878-controlled"},
+        "outputs": {"x": "controlled-value"},
+        "failures": [{"message": "controlled detail"}],
+        "calls": {"wf.t": [{"executionStatus": "Failed"}]}}
+    server.auth.get_access_token = lambda: "tok"
+    try:
+        _p._CONTROLLED_ACCESS = True
+        out = server.terra_get_workflow_metadata("ns", "ws", "sub", "wf")
+        for leaked in ("controlled-value", "NA12878-controlled", "controlled detail"):
+            assert leaked not in out, f"leaked {leaked!r}"
+        assert "callsSummary" in out and "_controlled_access_withheld" in out
+    finally:
+        _p._CONTROLLED_ACCESS = saved
+        _tc.rawls_get_workflow_metadata = orig_md
+        server.auth.get_access_token = orig_tok
+
+
+@case("CC-ControlledAccess2", "F1 run_log content WITHHELD in controlled mode (executes bypass)")
+def _():
+    from mcp_terra import policy as _p
+    import time as _t
+    saved = _p._CONTROLLED_ACCESS
+    saved_cache = dict(safety._BUCKET_CACHE)
+    try:
+        _p._CONTROLLED_ACCESS = True
+        safety._BUCKET_CACHE["ts"] = _t.time()       # seed allowlist so safe_bucket_uri passes
+        safety._BUCKET_CACHE["set"] = {"fc-secure-test"}
+        out = server.terra_get_run_log("gs://fc-secure-test/x", "job-1")
+        assert "withheld: controlled-access" in out and "_controlled_access_withheld" in out
+    finally:
+        _p._CONTROLLED_ACCESS = saved
+        safety._BUCKET_CACHE.clear()
+        safety._BUCKET_CACHE.update(saved_cache)
+
+
+@case("CC-ControlledAccess2", "F1 job_result redacts source/traceback + gates Tier-2 ext-LLM")
+def _():
+    import inspect
+    src = inspect.getsource(server.terra_get_notebook_job_result)
+    assert "_controlled_access_withheld" in src, "must withhold cell source/traceback"
+    assert "not policy.controlled_access_enabled()" in src, "must gate the Tier-2 ext-LLM call"
+
+
+@case("CC-ControlledAccess2", "F4 audio render read-back verifies md5 after upload")
+def _():
+    import inspect
+    src = inspect.getsource(server.terra_render_audio_summary)
+    assert "does NOT match what we rendered" in src and "stat_object(audio_gcs)" in src
 
 
 # ──────────────────────────────────────────────────────────────────────────

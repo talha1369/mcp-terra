@@ -76,16 +76,21 @@ _DATA_EGRESS_ALLOW = frozenset(
     for b in os.environ.get("MCP_TERRA_DATA_EGRESS_ALLOW", "").replace(",", " ").split()
     if b.strip())
 
-# Well-known PUBLIC genomics/reference bucket-name prefixes — public databases
-# are not controlled-access, so reading them never violates GDS/DUC.
-_PUBLIC_DATA_BUCKET_PREFIXES = (
-    "gcp-public-data", "genomics-public-data",
-    "gnomad-public", "gnomad",
-    "broad-references", "broad-public",
-    "gatk-test-data", "gatk-best-practices",
-    "hail-common", "hail-datasets",
-    "1000genomes", "encode-public",
-)
+# Well-known PUBLIC genomics/reference buckets, matched by EXACT name only.
+# Prefix matching is unsafe — a controlled bucket could be NAMED to collide
+# (e.g. 'gnomad-public-impostor'), turning the guard into bucket-name trust
+# (Codex finding). Bucket names are a flat global namespace, so only exact
+# identity is trustworthy. Operators add others via MCP_TERRA_DATA_EGRESS_ALLOW.
+_PUBLIC_DATA_BUCKETS = frozenset({
+    "gcp-public-data--broad-references",
+    "gcp-public-data--gnomad",
+    "genomics-public-data",
+    "gatk-test-data",
+    "gatk-best-practices",
+    "hail-common",
+    "hail-datasets-us",
+    "hail-datasets-eu",
+})
 
 
 def controlled_access_enabled() -> bool:
@@ -95,14 +100,13 @@ def controlled_access_enabled() -> bool:
 
 def is_egress_allowed_bucket(bucket: str) -> bool:
     """True if `bucket` may have its DATA returned to the LLM even under the
-    controlled-access guard — a known PUBLIC reference bucket, or an
-    operator-certified non-controlled bucket (MCP_TERRA_DATA_EGRESS_ALLOW)."""
+    controlled-access guard — an EXACT-name match against a known PUBLIC
+    reference bucket OR an operator-certified non-controlled bucket
+    (MCP_TERRA_DATA_EGRESS_ALLOW). EXACT match only: no prefix trust."""
     b = (bucket or "").strip().lower()
     if not b:
         return False
-    if b in _DATA_EGRESS_ALLOW:
-        return True
-    return any(b == p or b.startswith(p) for p in _PUBLIC_DATA_BUCKET_PREFIXES)
+    return b in _DATA_EGRESS_ALLOW or b in _PUBLIC_DATA_BUCKETS
 
 
 def assert_data_egress_allowed(bucket: str, what: str) -> None:
@@ -121,8 +125,24 @@ def assert_data_egress_allowed(bucket: str, what: str) -> None:
         f"(a) lab-open or public data → add the bucket to "
         f"MCP_TERRA_DATA_EGRESS_ALLOW; (b) run the orchestrating agent against a "
         f"self-hosted / NIST-800-171 model; (c) disable the guard for a "
-        f"non-controlled workspace. Diagnosis tools (logs, workflow metadata, "
-        f"status, cost) and the on-VM analysis loop remain available.")
+        f"non-controlled workspace. Status/metadata-only tools remain available.")
+
+
+def assert_no_controlled_data_egress(what: str) -> None:
+    """Refuse a workspace-scoped read that would return potential controlled
+    DATA (values, outputs, free-text logs/tracebacks, sample ids/paths) to the
+    LLM when the guard is on. Unlike `assert_data_egress_allowed` there is no
+    per-bucket exception — the locked workspace itself is controlled when the
+    guard is set. No-op when the guard is off."""
+    if not _CONTROLLED_ACCESS:
+        return
+    raise PolicyError(
+        f"controlled-access mode (MCP_TERRA_CONTROLLED_ACCESS=1): refusing to "
+        f"return {what} to the LLM — it may carry controlled-access data "
+        f"(values, sample ids, object paths, or printed output). GDS/DUC "
+        f"forbids controlled data to a public generative AI. Use a self-hosted "
+        f"/ NIST-800-171 model, or disable the guard for a non-controlled "
+        f"workspace. Status/metadata-only tools remain available.")
 
 
 # ── Startup snapshots ──────────────────────────────────────────────────────

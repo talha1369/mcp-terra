@@ -1582,7 +1582,8 @@ def terra_get_notebook_job_result(bucket_uri: str, job_id: str,
             # Tier-2: only call the cheap LLM if Tier-0 returned 'unknown' AND a
             # provider key is configured. Output is a SUGGESTION Claude validates.
             if (out["triage"]["category"] == "unknown"
-                    and cheap_llm.is_configured()):
+                    and cheap_llm.is_configured()
+                    and not policy.controlled_access_enabled()):  # no ext-LLM egress
                 proposal = cheap_llm.propose_fix(
                     category=out["triage"]["category"],
                     cell_source=src_decoded,
@@ -1593,6 +1594,23 @@ def terra_get_notebook_job_result(bucket_uri: str, job_id: str,
                         **proposal,
                         "trust": "UNTRUSTED — Claude must validate before applying",
                     }
+    # Controlled-access: withhold the free-text cell source + traceback (they can
+    # contain printed/raised controlled data). Keep status, rc, failed-cell
+    # index, and the deterministic triage CATEGORY (computed in-process, not
+    # egressed) so the agent still knows what failed. (Codex finding.)
+    if policy.controlled_access_enabled():
+        for _f in ("failed_cell_source", "failed_cell_traceback",
+                   "failed_cell_source_b64", "failed_cell_traceback_b64"):
+            if out.get(_f) is not None:
+                out[_f] = None
+        if isinstance(out.get("triage"), dict):
+            out["triage"] = {"category": out["triage"].get("category"),
+                             "confidence": out["triage"].get("confidence"),
+                             "note": "details withheld (controlled-access)"}
+        out["_controlled_access_withheld"] = (
+            "failed-cell source/traceback withheld (MCP_TERRA_CONTROLLED_ACCESS) "
+            "— may contain controlled data; use a self-hosted / NIST-800-171 "
+            "model, or disable the guard for a non-controlled workspace.")
     return _ok(out)
 
 
@@ -1682,6 +1700,23 @@ def terra_get_run_log(bucket_uri: str, job_id: str,
     paths = nbr.job_gcs_paths(bucket_uri, job_id)
     _pre("terra_get_run_log", READ,
          f"job={job_id} stream={stream} max_bytes={max_bytes}")
+
+    # Controlled-access: runner stdout/stderr can contain printed controlled
+    # data. Withhold the CONTENT (don't even fetch it) in guard mode; keep the
+    # paths + status shape so the agent knows the job ran. (Codex finding.)
+    if policy.controlled_access_enabled():
+        return _ok({
+            "job_id": job_id,
+            "paths": {"stdout": paths["run_stdout"], "stderr": paths["run_stderr"]},
+            "stdout": "[withheld: controlled-access mode]",
+            "stderr": "[withheld: controlled-access mode]",
+            "stdout_status": "withheld", "stderr_status": "withheld",
+            "_controlled_access_withheld": (
+                "run-log content withheld (MCP_TERRA_CONTROLLED_ACCESS); it may "
+                "contain printed controlled data. Use a self-hosted / "
+                "NIST-800-171 model, or disable the guard for a non-controlled "
+                "workspace."),
+        })
 
     out: dict = {"job_id": job_id, "paths": {"stdout": paths["run_stdout"],
                                               "stderr": paths["run_stderr"]},
@@ -2150,10 +2185,18 @@ def terra_get_submission(namespace: str, name: str, submission_id: str) -> str:
 @server.tool(title="Get workflow outputs", annotations=ANN_READ_REMOTE)
 def terra_get_workflow_outputs(namespace: str, name: str,
                                submission_id: str, workflow_id: str) -> str:
-    """Get a finished workflow's outputs. No cost."""
+    """Get a finished workflow's outputs. No cost.
+
+    Controlled-access: refused when MCP_TERRA_CONTROLLED_ACCESS=1 — outputs are
+    data (values + controlled-data object paths).
+    """
     for _v, _n in ((namespace, "namespace"), (name, "name"),
                    (submission_id, "submission_id"), (workflow_id, "workflow_id")):
         safety.validate_freeform_string(_v, _n, allow_empty=False)
+    try:
+        policy.assert_no_controlled_data_egress("workflow outputs")
+    except policy.PolicyError as e:
+        raise PermissionError(str(e))
     _assert_workspace_allowed(namespace, name)
     _pre("terra_get_workflow_outputs", READ,
          f"{namespace}/{name} sub={submission_id} wf={workflow_id}")
@@ -2279,6 +2322,18 @@ def terra_get_workflow_metadata(namespace: str, name: str,
         md["callsSummary"] = summary
         md["_note"] = ("per-call tree omitted; pass include_calls=True for the "
                        "full Cromwell call metadata")
+    # Controlled-access: metadata can carry controlled values (inputs, outputs,
+    # failures, sample ids/paths). In guard mode return ONLY non-data status +
+    # the per-call status summary; withhold everything else. (Codex finding.)
+    if policy.controlled_access_enabled() and isinstance(md, dict):
+        md = {
+            "status": md.get("status"),
+            "workflowName": md.get("workflowName"),
+            "callsSummary": md.get("callsSummary"),
+            "_controlled_access_withheld": (
+                "inputs/outputs/failures/call-detail withheld "
+                "(MCP_TERRA_CONTROLLED_ACCESS); use a self-hosted model"),
+        }
     return _ok(md)
 
 
@@ -2796,16 +2851,32 @@ def terra_render_audio_summary(job_id: str, bucket_uri: str,
     # neither exists; cp -n is the final atomic guard.
     audio_gcs = f"{_adir}/summary.{_ext}"
     # Write bytes to a temp file then gsutil cp -n (no-clobber).
-    import tempfile as _tf
+    import base64 as _b64a
+    import hashlib as _hla
     import os as _os
+    import re as _rea
+    import tempfile as _tf
     fd, tmp = _tf.mkstemp(prefix="mcp_audio_", suffix=f".{_ext}")
     try:
         with _os.fdopen(fd, "wb") as fh:
             fh.write(audio_bytes)
         bk.upload_file(tmp, audio_gcs, recursive=False)
+        # READ-BACK VERIFY (Codex finding): cp -n silently SKIPS if a concurrent
+        # writer won the race between preflight and upload. Confirm the persisted
+        # object is OURS (md5 match) so we never report rendered audio while the
+        # bucket holds stale/attacker bytes. Fail loud on mismatch.
+        _exp_md5 = _b64a.b64encode(_hla.md5(audio_bytes).digest()).decode()
+        _mm = _rea.search(r"Hash \(md5\):\s*(\S+)", bk.stat_object(audio_gcs))
+        if not _mm or _mm.group(1) != _exp_md5:
+            raise safety.SafetyError(
+                f"audio at {audio_gcs!r} does NOT match what we rendered (md5 "
+                f"mismatch) — a concurrent writer likely won the no-clobber "
+                f"race. NOT reporting success; use a fresh job_id.")
     finally:
-        try: _os.unlink(tmp)
-        except OSError: pass
+        try:
+            _os.unlink(tmp)
+        except OSError:
+            pass
 
     return _ok({
         "audio_gcs": audio_gcs,

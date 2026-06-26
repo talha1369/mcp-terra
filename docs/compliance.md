@@ -35,12 +35,18 @@ compliance reviewer.
 
 | Tool | Guard OFF (default) | Guard ON |
 |---|---|---|
-| `terra_read_bucket_object` (object bytes) | allowed | **refused** unless the bucket is a known public reference bucket or in `MCP_TERRA_DATA_EGRESS_ALLOW` |
+| `terra_read_bucket_object` (object bytes) | allowed | **refused** unless the bucket is an EXACT-name public reference bucket or in `MCP_TERRA_DATA_EGRESS_ALLOW` |
 | `terra_get_entities` (data-table rows) | allowed | **refused** (rows can carry controlled attributes) |
+| `terra_get_workflow_outputs` (output values) | allowed | **refused** (outputs are data + controlled paths) |
+| `terra_get_workflow_metadata` | allowed | **reduced** to `status` + `callsSummary` (inputs/outputs/failures withheld) |
+| `terra_get_run_log` (stdout/stderr) | allowed | **content withheld** (paths + status kept; a notebook can print controlled data) |
+| `terra_get_notebook_job_result` | allowed | **cell source/traceback withheld**; `status`/`rc`/failed-cell-index/triage-category kept. The Tier-2 external-LLM fix proposal is **disabled** (it would egress the traceback) |
 | `terra_get_bucket_object_metadata` (size/md5/type) | allowed | allowed (metadata, not data) |
-| `terra_list_data_tables` (schema + counts) | allowed | allowed (no row values) |
-| logs / workflow metadata / status / cost / submissions | allowed | allowed (diagnosis, not data) |
-| notebook/WDL **run loop** (executes on the Terra VM) | allowed | allowed (data stays in Terra) |
+| `terra_list_data_tables` (schema + counts) · `terra_get_submission` · `terra_list_submissions` · `terra_get_workflow_cost` | allowed | allowed (status/metadata, no row/scalar values) |
+| notebook/WDL **run loop** (executes on the Terra VM) | allowed | allowed (data stays in Terra; the in-process deterministic triager still categorizes failures without egress) |
+
+All matching is by **exact bucket name** — a controlled bucket *named* to look
+public (e.g. `gnomad-public-impostor`) is **not** trusted.
 
 Refusals are **fail-loud** with a clear message and remediation — never a silent
 drop or placeholder.

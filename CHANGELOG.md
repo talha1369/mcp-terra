@@ -23,6 +23,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   Terra through the MCP). Refusals are fail-loud. `terra_health` and the startup
   banner surface the posture; see [docs/compliance.md](docs/compliance.md) for
   the policy mapping (GDS/DUC + NIST 800-171 + the self-hosted-model path).
+  - **Round-3 adversarial-review hardening** closed the egress paths the first
+    cut missed: in controlled-access mode `terra_get_run_log` withholds
+    stdout/stderr content, `terra_get_notebook_job_result` withholds the cell
+    source/traceback (and disables the Tier-2 external-LLM fix proposal),
+    `terra_get_workflow_outputs` is refused, and `terra_get_workflow_metadata`
+    is reduced to status + call-status summary. The public-bucket allowlist is
+    now **exact-name** (a controlled bucket *named* to look public is not
+    trusted). Audio render gains a read-back md5 verify. 6 regression tests
+    (CC-ControlledAccess2) that execute the bypasses.
 
 - **Consolidated run record + multi-channel completion delivery, with a
   metadata spec.** A completed run now produces ONE provenance-bearing record
