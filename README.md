@@ -20,10 +20,6 @@ audio explainer** of the results — from a single sentence, with **no
 delete/overwrite primitive anywhere** and a controlled-access guard, spend cap,
 and 24h-session awareness built in.
 
-> **5-minute pitch deck:** open [`docs/pitch/index.html`](docs/pitch/index.html)
-> in a browser; speaker script in
-> [`docs/pitch/SPEAKER_NOTES.md`](docs/pitch/SPEAKER_NOTES.md).
-
 Built for the Broad / Stanford Terra ecosystem. Wraps these Terra services:
 
 - **Rawls** — workspaces, data tables, submissions, method configs
