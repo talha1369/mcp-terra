@@ -5033,6 +5033,39 @@ def _():
             if v is None: _os.environ.pop(k, None)
             else: _os.environ[k] = v
 
+@case("CC-SpendCap", "malformed/non-object ledger lines never crash the budget")
+def _():
+    import os as _os
+    import tempfile
+    import pathlib
+    saved = {k: _os.environ.get(k) for k in ("MCP_TERRA_BUDGET_USD", "MCP_TERRA_BUDGET_WINDOW_DAYS")}
+    led, lock = policy._SPEND_LEDGER, policy._SPEND_LEDGER_LOCK
+    try:
+        _os.environ["MCP_TERRA_BUDGET_USD"] = "100"
+        _os.environ["MCP_TERRA_BUDGET_WINDOW_DAYS"] = "30"
+        base = pathlib.Path(tempfile.mkdtemp())
+        policy._SPEND_LEDGER = base / "l.jsonl"
+        policy._SPEND_LEDGER_LOCK = base / "l.lock"
+        now = 1_000_000_000.0
+        # bare scalar, array, string, garbage, and a good entry — rec.get() on a
+        # non-dict would raise AttributeError if not guarded
+        policy._SPEND_LEDGER.write_text(
+            "5\n[1,2]\n\"hi\"\nnot json at all\n"
+            '{"ts": %d, "usd": 20, "id": "keep"}\n' % int(now), encoding="utf-8")
+        # readers must not crash and must count only the valid in-window entry
+        assert policy.windowed_spend_usd(now) == 20.0
+        # reserve must not crash and must enforce against the valid total
+        t = policy.reserve_within_budget(30, "r", now)
+        assert policy.windowed_spend_usd(now) == 50.0
+        # release must not raise on the junk lines
+        policy.release_reservation(t)
+        assert policy.windowed_spend_usd(now) == 20.0
+    finally:
+        policy._SPEND_LEDGER, policy._SPEND_LEDGER_LOCK = led, lock
+        for k, v in saved.items():
+            if v is None: _os.environ.pop(k, None)
+            else: _os.environ[k] = v
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # RUN

@@ -205,6 +205,8 @@ def _read_ledger_window(now_epoch: float) -> tuple[list[str], float]:
             rec = json.loads(s)
         except (ValueError, TypeError):
             continue
+        if not isinstance(rec, dict):  # a bare scalar/array is not a reservation
+            continue
         try:
             ts = float(rec.get("ts", 0))
             usd = float(rec.get("usd", 0) or 0)
@@ -379,8 +381,8 @@ def release_reservation(token: str | None) -> None:
                 except (ValueError, TypeError):
                     kept.append(s)  # preserve anything we can't parse
                     continue
-                if rec.get("id") != token:
-                    kept.append(s)
+                if not isinstance(rec, dict) or rec.get("id") != token:
+                    kept.append(s)  # only the matching reservation is dropped
             _atomic_write_ledger(kept)
         except OSError:
             pass
