@@ -64,7 +64,7 @@ These are real but either out of scope or fundamentally hard:
 
 ## Comprehensive attack-class coverage (`tests/test_security_comprehensive.py`)
 
-**301/301 tests pass** across 43 attack classes. The table below is generated
+**306/306 tests pass** across 44 attack classes. The table below is generated
 from the suite itself; the test file is the authoritative source. Run yourself:
 
 ```bash
@@ -117,6 +117,7 @@ python tests/test_security_comprehensive.py
 | CC-CodexFixes2 | 7 | Regressions for the 2nd adversarial-review round: exact protected-dir blocklist bypass (trailing-slash) fixed, download refuses version_existing on a directory, reserved audio path (provenance) blocked from generic upload, audio fetch size-preflights before download, Slack fails loud when all targets fail, audio render preflights both extensions before the TTS side-effect, run-record read-back md5 verify |
 | CC-ControlledAccess | 5 | NIH GDS/DUC data-egress guard: off by default (lab/public unhindered), guard ON refuses the secure bucket but allows public + operator-allowlisted buckets, blocks `get_entities` rows, `read_bucket_object` enforces it while metadata-only stays available, `terra_health` surfaces the posture |
 | CC-ControlledAccess2 | 6 | Round-3 egress-path closure (executes the bypasses): exact-name public allowlist (prefix-collision blocked), `get_workflow_outputs` refused, `get_workflow_metadata` reduced to status+summary, `get_run_log` content withheld, `get_notebook_job_result` redacts source/traceback + gates the Tier-2 external LLM, audio render read-back md5 verify |
+| CC-Retry | 5 | Transient-failure retry in `terra_client._request`: Retry-After parse + bounded backoff, GET retries 429 then succeeds, POST is NOT retried (no double-submit), retries are bounded (exhaust→raise), non-retryable 4xx not retried |
 
 ## Single-workspace lock (`MCP_TERRA_WORKSPACE`)
 

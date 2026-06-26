@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import time
 import urllib.parse
 from typing import Any
 
@@ -22,6 +24,38 @@ RAWLS_BASE = "https://rawls.dsde-prod.broadinstitute.org"
 LEO_BASE   = "https://leonardo.dsde-prod.broadinstitute.org"
 SAM_BASE   = "https://sam.dsde-prod.broadinstitute.org"
 AGORA_BASE = "https://agora.dsde-prod.broadinstitute.org"
+
+
+# ── Transient-failure retry policy ──────────────────────────────────────────
+# Bounded retry with exponential backoff + jitter, honoring Retry-After — for
+# IDEMPOTENT methods only. dalmatian/nebelung do not retry the Terra API at all;
+# this makes the MCP more resilient to 429/5xx without ever auto-retrying a
+# non-idempotent POST (a Terra createSubmission is BILLABLE; a blind retry on a
+# transient error could double-submit, and Terra has no idempotency-key support).
+_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+_MAX_RETRIES = max(0, min(int(os.environ.get("MCP_TERRA_MAX_RETRIES", "3")), 8))
+_RETRY_BASE_SEC = 0.5
+_RETRY_CAP_SEC = 8.0
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """Parse a Retry-After header's delta-seconds form. Returns seconds (capped
+    at 60s so a hostile/huge value can't hang the call), or None for the
+    HTTP-date form (caller falls back to computed backoff)."""
+    if not value:
+        return None
+    try:
+        return max(0.0, min(float(value.strip()), 60.0))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _retry_delay(attempt: int, retry_after: float | None) -> float:
+    """Backoff seconds for a 1-based attempt. Honor Retry-After if present; else
+    exponential (base*2^(n-1)) capped, plus jitter to avoid thundering herd."""
+    if retry_after is not None:
+        return retry_after
+    return min(_RETRY_CAP_SEC, _RETRY_BASE_SEC * (2 ** (attempt - 1))) + random.uniform(0, 0.5)
 
 
 class TerraAPIError(RuntimeError):
@@ -60,10 +94,31 @@ def _request(service: str, method: str, base: str, path: str, token: str,
     }
     if json_body is not None:
         headers["Content-Type"] = "application/json"
+    # Retry ONLY idempotent methods. A non-idempotent POST/PUT/PATCH (e.g. a
+    # billable createSubmission) is attempted exactly once — retrying a transient
+    # error could duplicate the side effect.
+    idempotent = method.upper() in ("GET", "HEAD")
+    max_attempts = (1 + _MAX_RETRIES) if idempotent else 1
     with httpx.Client(timeout=timeout, trust_env=False,
                        follow_redirects=False) as client:
-        resp = client.request(method, url, headers=headers,
-                              json=json_body, params=params)
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = client.request(method, url, headers=headers,
+                                      json=json_body, params=params)
+            except httpx.HTTPError as e:
+                if idempotent and attempt < max_attempts:
+                    time.sleep(_retry_delay(attempt, None))
+                    continue
+                raise TerraAPIError(service, method, path, 0,
+                                    f"network error: {type(e).__name__}")
+            if 200 <= resp.status_code < 300:
+                break
+            if (idempotent and attempt < max_attempts
+                    and resp.status_code in _RETRY_STATUSES):
+                time.sleep(_retry_delay(
+                    attempt, _parse_retry_after(resp.headers.get("Retry-After"))))
+                continue
+            break   # non-retryable status or attempts exhausted → handle below
     if not (200 <= resp.status_code < 300):
         # Refuse to echo secrets even if a misbehaving Terra service echoed the
         # request back: the OAuth token, AND the runner HMAC secret (which

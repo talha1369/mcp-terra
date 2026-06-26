@@ -3262,6 +3262,113 @@ def _():
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# CC-Retry — bounded transient-failure retry (idempotent only; no POST retry)
+# ──────────────────────────────────────────────────────────────────────────
+
+class _FakeResp:
+    def __init__(self, status, text="{}", headers=None):
+        self.status_code = status
+        self.text = text
+        self.content = text.encode()
+        self.headers = headers or {}
+
+    def json(self):
+        import json as _j
+        return _j.loads(self.text)
+
+
+class _FakeClient:
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def request(self, *a, **k):
+        r = self._responses[min(self.calls, len(self._responses) - 1)]
+        self.calls += 1
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+
+@case("CC-Retry", "Retry-After parsing + bounded backoff")
+def _():
+    from mcp_terra import terra_client as _t
+    assert _t._parse_retry_after("5") == 5.0
+    assert _t._parse_retry_after("999") == 60.0          # capped at 60s
+    assert _t._parse_retry_after("Wed, 21 Oct 2026") is None  # HTTP-date → backoff
+    assert _t._parse_retry_after(None) is None
+    assert _t._retry_delay(1, 3.0) == 3.0                # honors Retry-After
+    assert _t._retry_delay(5, None) <= _t._RETRY_CAP_SEC + 0.5  # bounded + jitter
+
+
+@case("CC-Retry", "GET retries on 429 then succeeds")
+def _():
+    from mcp_terra import terra_client as _t
+    saved = (_t.httpx.Client, _t.time.sleep)
+    _t.time.sleep = lambda *a, **k: None
+    fc = _FakeClient([_FakeResp(429, headers={"Retry-After": "0"}),
+                      _FakeResp(200, '{"ok": 1}')])
+    _t.httpx.Client = lambda *a, **k: fc
+    try:
+        out = _t._request("rawls", "GET", "https://x", "/p", "tok")
+        assert out == {"ok": 1} and fc.calls == 2
+    finally:
+        (_t.httpx.Client, _t.time.sleep) = saved
+
+
+@case("CC-Retry", "POST is NOT retried (no double-submit) on 429")
+def _():
+    from mcp_terra import terra_client as _t
+    saved = (_t.httpx.Client, _t.time.sleep)
+    _t.time.sleep = lambda *a, **k: None
+    fc = _FakeClient([_FakeResp(429), _FakeResp(200)])
+    _t.httpx.Client = lambda *a, **k: fc
+    try:
+        must_raise(lambda: _t._request("rawls", "POST", "https://x", "/p", "tok",
+                                       json_body={}), _t.TerraAPIError)
+        assert fc.calls == 1, f"POST must be attempted once; got {fc.calls}"
+    finally:
+        (_t.httpx.Client, _t.time.sleep) = saved
+
+
+@case("CC-Retry", "GET retries are bounded (exhaust → raise)")
+def _():
+    from mcp_terra import terra_client as _t
+    saved = (_t.httpx.Client, _t.time.sleep, _t._MAX_RETRIES)
+    _t.time.sleep = lambda *a, **k: None
+    _t._MAX_RETRIES = 2
+    fc = _FakeClient([_FakeResp(503)])                   # always 503
+    _t.httpx.Client = lambda *a, **k: fc
+    try:
+        must_raise(lambda: _t._request("rawls", "GET", "https://x", "/p", "tok"),
+                   _t.TerraAPIError)
+        assert fc.calls == 3, f"1 + 2 retries = 3 attempts; got {fc.calls}"
+    finally:
+        (_t.httpx.Client, _t.time.sleep, _t._MAX_RETRIES) = saved
+
+
+@case("CC-Retry", "non-retryable 4xx (404) is NOT retried")
+def _():
+    from mcp_terra import terra_client as _t
+    saved = (_t.httpx.Client, _t.time.sleep)
+    _t.time.sleep = lambda *a, **k: None
+    fc = _FakeClient([_FakeResp(404, "not found")])
+    _t.httpx.Client = lambda *a, **k: fc
+    try:
+        must_raise(lambda: _t._request("rawls", "GET", "https://x", "/p", "tok"),
+                   _t.TerraAPIError)
+        assert fc.calls == 1, "a 404 is deterministic — no retry"
+    finally:
+        (_t.httpx.Client, _t.time.sleep) = saved
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # RUN
 # ──────────────────────────────────────────────────────────────────────────
 

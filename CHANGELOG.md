@@ -161,6 +161,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- **Transient-failure retry in the Terra client** — `terra_client._request` now
+  retries `429`/`5xx` with bounded exponential backoff + jitter, honoring the
+  `Retry-After` header, for **idempotent methods only** (GET/HEAD). A
+  non-idempotent POST (e.g. a billable `createSubmission`) is attempted exactly
+  once — retrying a transient error could double-submit. Tunable via
+  `MCP_TERRA_MAX_RETRIES` (default 3). Both `dalmatian` and `nebelung` do not
+  retry the Terra API at all.
 - **`terra_fetch_url` action class reconciled** — it is `WRITE_SAFE`-gated
   (a network side effect), so its annotation is now `ANN_WRITE_IDEMP`
   (`readOnlyHint=False`, idempotent) to match the `_pre` gate and docstring,
