@@ -311,8 +311,21 @@ def terra_list_runtimes(google_project: str = "") -> str:
     _pre("terra_list_runtimes", READ,
          f"project={google_project or '<all>'}")
     token = auth.get_access_token()
-    return _ok(_redact_runtime_env(
-        tc.leo_list_runtimes(token, google_project=google_project or None)))
+    runtimes = _redact_runtime_env(
+        tc.leo_list_runtimes(token, google_project=google_project or None))
+    # Codex r7: runtime NAMES/labels/URLs are user-controlled and can encode
+    # cohort/sample ids. In guard mode return count + statuses only (no names).
+    if policy.controlled_access_enabled():
+        statuses = ([(r or {}).get("status") for r in runtimes]
+                    if isinstance(runtimes, list) else [])
+        return _ok({
+            "runtime_count": len(runtimes) if isinstance(runtimes, list) else None,
+            "statuses": statuses,
+            "_controlled_access_withheld": (
+                "runtime names/labels/URLs/config withheld "
+                "(MCP_TERRA_CONTROLLED_ACCESS) — count + statuses only."),
+        })
+    return _ok(runtimes)
 
 
 @server.tool(title="Get runtime status", annotations=ANN_READ_REMOTE)
@@ -331,8 +344,20 @@ def terra_get_runtime(google_project: str, runtime_name: str) -> str:
         raise PermissionError(str(e))
     _pre("terra_get_runtime", READ, f"{google_project}/{runtime_name}")
     token = auth.get_access_token()
-    return _ok(_redact_runtime_env(
-        tc.leo_get_runtime(token, google_project, runtime_name)))
+    rt = _redact_runtime_env(tc.leo_get_runtime(token, google_project, runtime_name))
+    # Codex r7: keep only the caller-supplied name + status + machine config;
+    # withhold labels / proxy URLs / creator (auditInfo) — operator-controlled
+    # strings that can encode identifiers.
+    if policy.controlled_access_enabled() and isinstance(rt, dict):
+        rt = {
+            "runtimeName": runtime_name,   # caller-supplied echo (no new disclosure)
+            "status": rt.get("status"),
+            "runtimeConfig": rt.get("runtimeConfig"),
+            "_controlled_access_withheld": (
+                "labels / proxy URLs / creator / env withheld "
+                "(MCP_TERRA_CONTROLLED_ACCESS); status + machine config kept."),
+        }
+    return _ok(rt)
 
 
 # ── Runtime lifecycle (SPEND-RATE — agent must confirm with user) ───────────
@@ -421,6 +446,16 @@ def terra_recommend_runtime_for_notebook(notebook_gcs: str) -> str:
         raise safety.SafetyError(
             f"notebook_gcs must end in '.ipynb'; got {notebook_gcs!r}"
         )
+    # Codex r7: this `gsutil cat`s the notebook bytes into the LOCAL MCP process.
+    # A controlled notebook can contain outputs/paths/sample ids — so in guard
+    # mode refuse unless the bucket is public/allowlisted (same rule as read/
+    # download). The recommendation could otherwise pull controlled data out.
+    _nb_bucket = notebook_gcs[len("gs://"):].split("/", 1)[0]
+    try:
+        policy.assert_data_egress_allowed(
+            _nb_bucket, "notebook bytes for runtime recommendation")
+    except policy.PolicyError as e:
+        raise PermissionError(str(e)) from e
     _pre("terra_recommend_runtime_for_notebook", READ, f"analyze {notebook_gcs}")
     # Fetch + parse
     try:
@@ -2727,7 +2762,10 @@ def terra_get_bucket_object_metadata(bucket_uri: str) -> str:
         # Codex r6: match EXACT safe labels at the start of the (stripped) line
         # — NOT a substring anywhere — and STOP at the custom "Metadata:" block,
         # so a key like `x-goog-meta-Content-Type-NA12878:` can't slip through.
-        _safe_labels = ("Content-Length:", "Content-Type:", "Storage class:",
+        # Codex r7: Content-Type is operator-SETTABLE object metadata (e.g.
+        # `application/x-NA12878`) — withhold it too. Keep only fields that are
+        # numeric/enum/hash/timestamp and cannot carry a free-form identifier.
+        _safe_labels = ("Content-Length:", "Storage class:",
                         "Hash (crc32c):", "Hash (md5):", "Creation time:",
                         "Update time:", "Generation:")
         kept = []
@@ -3253,6 +3291,16 @@ def terra_refresh_workspace_allowlist() -> str:
     """
     _pre("terra_refresh_workspace_allowlist", READ, "Rawls bucket refresh")
     fresh = safety.force_refresh_bucket_allowlist()
+    # Codex r7: bucket names are workspace/operator-controlled identifiers — in
+    # guard mode without a lock return the count only (mirrors the count-only
+    # terra_list_workspaces behaviour; don't enumerate identifying buckets).
+    if policy.controlled_access_enabled() and policy.resolve_locked_workspace() is None:
+        return _ok({
+            "bucket_count": len(fresh),
+            "_controlled_access_withheld": (
+                "bucket names withheld (MCP_TERRA_CONTROLLED_ACCESS, no lock) — "
+                "workspace/operator-controlled identifiers; count only."),
+        })
     return _ok({"bucket_count": len(fresh), "buckets": sorted(fresh)[:50]})
 
 

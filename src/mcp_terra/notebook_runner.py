@@ -658,15 +658,17 @@ PYVERIFY
         SESSION_REMAINING=$(( SESSION_DEADLINE - NOW ))
         if [ "$SESSION_REMAINING" -lt "$SESSION_MIN_JOB_SEC" ]; then
             echo "[runner] only ${SESSION_REMAINING}s remain in the Terra session window (< ${SESSION_MIN_JOB_SEC}s floor); REFUSING job $JOB_ID. Restart the runtime for a fresh session, or use the WDL/Cromwell path for long compute." >&2
-            echo "REFUSED-SESSION-WINDOW" | gsutil cp - "$STATUS" 2>/dev/null || true
-            # Codex r6: only mark processed once the spec MOVE (the durable
-            # terminal marker) actually succeeded. If GCS/auth is flaky near
-            # session expiry, leave the job RETRYABLE — a fresh-session restart
-            # must be able to pick it up, not skip it forever.
-            if gsutil mv -n "$SPEC" "$SPEC.refused-session-window" 2>/dev/null; then
+            # Codex r7: the STATUS write is the poller's terminal signal
+            # (terra_get_notebook_job_result keys terminal off status.txt /
+            # result.json). It MUST land before we move the spec or mark the job
+            # processed — otherwise a poller keeps seeing the earlier 'running'
+            # and the job is stranded. Only on a successful status write do we
+            # move the spec + mark processed; otherwise leave it fully RETRYABLE.
+            if echo "REFUSED-SESSION-WINDOW" | gsutil cp - "$STATUS" 2>/dev/null; then
+                gsutil mv -n "$SPEC" "$SPEC.refused-session-window" 2>/dev/null || true
                 echo "$JOB_ID" >> "$PROCESSED_FILE"
             else
-                echo "[runner] WARN: could not move spec for refused job $JOB_ID; leaving it RETRYABLE (NOT marked processed). A runner restart with a fresh session window will pick it up." >&2
+                echo "[runner] WARN: could not write REFUSED status for job $JOB_ID; leaving it RETRYABLE (spec untouched, not processed). A fresh-session restart will pick it up." >&2
             fi
             continue
         fi
@@ -704,7 +706,10 @@ PYVERIFY
         SESSION_LIMITED=0
         if [ "$RC" -eq 124 ]; then
             SESSION_LIMITED=1
-        elif grep -q "^timeout: sending signal" "$WORK/$JOB_ID.stderr" 2>/dev/null; then
+        elif [ "$RC" -eq 137 ] && grep -q "^timeout: sending signal" "$WORK/$JOB_ID.stderr" 2>/dev/null; then
+            # Codex r7: gate the marker to RC 137 (the KILL-escalation exit) so an
+            # ordinary papermill failure (RC 1, etc.) whose stderr happens to
+            # contain that line is NOT relabelled as a session limit.
             SESSION_LIMITED=1
         fi
         if [ "$SESSION_LIMITED" -eq 1 ]; then

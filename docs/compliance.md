@@ -48,6 +48,10 @@ compliance reviewer.
 | `terra_list_workspaces` (visible workspaces) | allowed | with no lock: **count only** (namespace/name are user-controlled identifiers); with `MCP_TERRA_WORKSPACE` set: the locked workspace only |
 | `terra_list_data_tables` (entity-type schema) | allowed | **counts only** (table names, attribute names, id columns withheld) |
 | `terra_list_submissions` (submission list) | allowed | **ids + status + date + workflow-status counts** (methodConfigurationName + entity names withheld) |
+| `terra_list_runtimes` (VMs) | allowed | **count + statuses only** (runtime names/labels/URLs withheld) |
+| `terra_get_runtime` (one VM) | allowed | **status + machine config** (labels/proxy-URL/creator withheld; name is the caller's own argument) |
+| `terra_recommend_runtime_for_notebook` | allowed | **refused** for non-public/non-allowlisted buckets (it cats the notebook bytes into the MCP host) |
+| `terra_refresh_workspace_allowlist` | allowed | with no lock: **bucket count only** (bucket names withheld) |
 | `terra_get_submission` (per-workflow detail) | allowed | **reduced** to submission/workflow **ids + statuses** (entity names + failure messages withheld) |
 | `terra_get_workflow_logs` (per-task stderr) | allowed (path bound to the queried workspace bucket) | **content AND paths withheld** (per-task status kept; stderr can print controlled data) |
 | `terra_get_run_log` (stdout/stderr) | allowed | **content withheld** (paths + status kept; a notebook can print controlled data) |

@@ -376,6 +376,22 @@ tests exercise the templates in isolation, so these were latent):
     --verbose` "sending signal" marker — no longer a wall-clock heuristic, so an
     OOM SIGKILL (RC 137 without the marker) is correctly a normal `FAILED` and a
     backward clock step can't hide a real timeout.
+- **Adversarial-review hardening (Codex) — round 7** (re-review of round-6):
+  closed 6 more findings.
+  - The causal session-limit marker (`timeout --verbose` "sending signal") is now
+    **gated to RC 137** — an ordinary papermill failure can no longer be
+    relabelled `FAILED-SESSION-LIMIT`.
+  - The `REFUSED-SESSION-WINDOW` branch now writes the terminal status FIRST and
+    only then moves the spec / marks the job processed — if the status write
+    fails the job stays fully retryable (no stranding behind a stale `running`).
+  - `terra_list_runtimes` (count + statuses only), `terra_get_runtime` (status +
+    machine config; labels/URL/creator withheld), and
+    `terra_refresh_workspace_allowlist` (bucket count only, no lock) gained
+    controlled-mode projections + sentinel tests.
+  - `terra_recommend_runtime_for_notebook` now **refuses** non-public buckets in
+    guard mode (it cats the notebook bytes into the MCP host).
+  - `Content-Type` (operator-settable) dropped from the `gsutil stat`
+    controlled-mode allowlist.
 - **No delete primitive, by design** — no tool (and no `leo_delete_runtime`
   at any layer) deletes a runtime or persistent disk; teardown is the user's
   action in the Terra UI ("Keep persistent disk"). The MCP detects a

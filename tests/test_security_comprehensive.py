@@ -3482,6 +3482,10 @@ _DATA_TOOLS_REQUIRING_GUARD = {
     # Codex r6: listings whose payloads carry operator/user-controlled strings
     # (workspace names, data-table schema, methodConfigurationName) → guarded.
     "terra_list_workspaces", "terra_list_data_tables", "terra_list_submissions",
+    # Codex r7: runtime names/labels/URLs are user-controlled; recommend cats the
+    # notebook bytes locally; refresh enumerates bucket names → all guarded.
+    "terra_list_runtimes", "terra_get_runtime",
+    "terra_recommend_runtime_for_notebook", "terra_refresh_workspace_allowlist",
 }
 _NO_DATA_TOOLS = {
     # writes / control (no workspace-data return)
@@ -3489,12 +3493,11 @@ _NO_DATA_TOOLS = {
     "terra_submit_workflow", "terra_submit_notebook_job", "terra_upload_to_bucket",
     "terra_install_notebook_runner", "terra_start_runner_on_vm",
     "terra_start_runtime", "terra_stop_runtime", "terra_killswitch_trip",
-    "terra_refresh_workspace_allowlist", "terra_write_run_record",
+    "terra_write_run_record",
     # notifications / delivery (recipient-locked; not a Terra→LLM egress path)
     "terra_notify_desktop", "terra_notify_slack", "terra_send_run_report_email",
-    # identity / posture / runtime-config (not workspace data)
+    # identity / posture (not workspace data)
     "terra_whoami", "terra_health", "terra_killswitch_status",
-    "terra_get_runtime", "terra_list_runtimes", "terra_recommend_runtime_for_notebook",
     # status / cost of the user's OWN scope (no raw rows/objects, no operator
     # free-form payloads)
     "terra_get_workflow_cost",
@@ -3689,7 +3692,8 @@ def _():
         _p._CONTROLLED_ACCESS = True
         out = server.terra_get_bucket_object_metadata("gs://fc-secure-x/o")
         assert SENTINEL not in out, "custom object metadata leaked a sentinel!"
-        assert "12345" in out and "Content-Type" in out  # safe integrity fields kept
+        assert "12345" in out  # Content-Length (safe integrity field) kept
+        assert "Content-Type" not in out, "operator-settable Content-Type must be withheld"
     finally:
         _p._CONTROLLED_ACCESS, _bk2.stat_object = saved, ostat
         safety.safe_bucket_uri = osafe
@@ -3790,6 +3794,80 @@ def _():
     finally:
         _p._CONTROLLED_ACCESS, _bk2.stat_object = saved, ostat
         safety.safe_bucket_uri = osafe
+
+
+@case("CC-ControlledAccess3", "list_runtimes is count+status only (sentinel) in controlled mode")
+def _():
+    from mcp_terra import policy as _p
+    saved, ol, ot = _p._CONTROLLED_ACCESS, _tc.leo_list_runtimes, server.auth.get_access_token
+    olock = _p.resolve_locked_workspace
+    SENTINEL = "runtime-NA12878-secret"
+    _tc.leo_list_runtimes = lambda *a, **k: [
+        {"runtimeName": SENTINEL, "status": "Running",
+         "labels": {"x": SENTINEL}, "proxyUrl": f"https://x/{SENTINEL}"}]
+    server.auth.get_access_token = lambda: "tok"
+    _p.resolve_locked_workspace = lambda: None
+    try:
+        _p._CONTROLLED_ACCESS = True
+        out = server.terra_list_runtimes()
+        assert SENTINEL not in out, "runtime name/label/URL leaked!"
+        assert '"runtime_count": 1' in out and "Running" in out
+    finally:
+        _p._CONTROLLED_ACCESS, _tc.leo_list_runtimes, server.auth.get_access_token = saved, ol, ot
+        _p.resolve_locked_workspace = olock
+
+
+@case("CC-ControlledAccess3", "get_runtime withholds labels/URL/creator (sentinel) in controlled mode")
+def _():
+    from mcp_terra import policy as _p
+    saved, og, ot = _p._CONTROLLED_ACCESS, _tc.leo_get_runtime, server.auth.get_access_token
+    SENTINEL = "NA12878-secret-label"
+    _tc.leo_get_runtime = lambda *a, **k: {
+        "runtimeName": "rt1", "status": "Running",
+        "runtimeConfig": {"machineType": "n1-standard-4"},
+        "labels": {"cohort": SENTINEL}, "proxyUrl": f"https://x/{SENTINEL}",
+        "auditInfo": {"creator": "person@broad.org"}}
+    server.auth.get_access_token = lambda: "tok"
+    try:
+        _p._CONTROLLED_ACCESS = True
+        out = server.terra_get_runtime("proj", "rt1")
+        assert SENTINEL not in out and "person@broad.org" not in out, "runtime labels/creator leaked!"
+        assert "n1-standard-4" in out and "rt1" in out  # config + caller-echo kept
+    finally:
+        _p._CONTROLLED_ACCESS, _tc.leo_get_runtime, server.auth.get_access_token = saved, og, ot
+
+
+@case("CC-ControlledAccess3", "recommend_runtime_for_notebook REFUSES a controlled bucket (no local cat)")
+def _():
+    from mcp_terra import policy as _p, bucket as _bk2
+    saved, osafe, orun = _p._CONTROLLED_ACCESS, safety.safe_bucket_uri, _bk2._run_gsutil
+    safety.safe_bucket_uri = lambda u: u
+    def _boom(*a, **k):
+        raise AssertionError("must NOT cat the notebook in controlled mode")
+    _bk2._run_gsutil = _boom
+    try:
+        _p._CONTROLLED_ACCESS = True
+        must_raise(lambda: server.terra_recommend_runtime_for_notebook(
+            "gs://fc-secure-controlled/nb.ipynb"), PermissionError)
+    finally:
+        _p._CONTROLLED_ACCESS, safety.safe_bucket_uri, _bk2._run_gsutil = saved, osafe, orun
+
+
+@case("CC-ControlledAccess3", "refresh_workspace_allowlist is count-only (no bucket names) in controlled mode w/o lock")
+def _():
+    from mcp_terra import policy as _p
+    saved, oref, olock = _p._CONTROLLED_ACCESS, safety.force_refresh_bucket_allowlist, _p.resolve_locked_workspace
+    SENTINEL = "fc-secure-NA12878-secret"
+    safety.force_refresh_bucket_allowlist = lambda: {SENTINEL, "fc-other"}
+    _p.resolve_locked_workspace = lambda: None
+    try:
+        _p._CONTROLLED_ACCESS = True
+        out = server.terra_refresh_workspace_allowlist()
+        assert SENTINEL not in out, "bucket name leaked as an identifier oracle!"
+        assert '"bucket_count": 2' in out
+    finally:
+        _p._CONTROLLED_ACCESS, safety.force_refresh_bucket_allowlist = saved, oref
+        _p.resolve_locked_workspace = olock
 
 
 @case("CC-ControlledAccess3", "workflow_logs flags per-task stderr truncation (no false truncated=false)")
@@ -3947,6 +4025,7 @@ def _():
     # An OOM RC 137 without the marker must NOT be labelled a session limit.
     assert '"$RC" -eq 124' in s
     assert '"^timeout: sending signal"' in s, "must use the causal timeout marker"
+    assert '"$RC" -eq 137' in s, "the marker must be gated to RC 137 (not any non-124)"
     assert "ELAPSED" not in s, "must NOT use the wall-clock heuristic anymore"
     # A halted run is attributable + fail-loud, never silently truncated.
     assert "FAILED-SESSION-LIMIT" in s and "session_limit_note" in s
