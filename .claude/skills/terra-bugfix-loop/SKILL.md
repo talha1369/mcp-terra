@@ -42,6 +42,11 @@ workspace, `runner_secret.strength_ok: true`, `killswitch.tripped: false`,
 
 1. `terra_recommend_runtime_for_notebook(notebook_gcs)` → target spec
    (`create_runtime_args` + hourly estimate). Show it to the user.
+   - **Controlled-access mode:** this tool reads the notebook bytes locally, so
+     with `MCP_TERRA_CONTROLLED_ACCESS=1` it REFUSES a controlled bucket
+     (`PermissionError`). That's expected — skip the recommender and size the
+     runtime manually with the user (ask for cores/RAM/GPU, or reuse an existing
+     adequate runtime); the data never leaves Terra.
 2. `terra_list_runtimes(google_project)`; for the target runtime
    `terra_get_runtime` → current `runtimeConfig` + `status`.
 3. Decide:
