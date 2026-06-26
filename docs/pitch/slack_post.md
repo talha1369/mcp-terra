@@ -17,7 +17,7 @@ Built safety-first for shared workspaces:
 • Controlled-access guard (keeps data off external models; off by default)
 • Spend cap — the VM self-stops before your $ limit — and 24h-session aware
 • Parallel jobs: multiple VMs, WDL scatter, and multiple jobs per VM
-• 382 passing security tests across 52 attack classes
+• 392 passing security tests across 52 attack classes
 
 One-command install (plugin or script); works with any MCP-aware assistant.
-:point_right: Repo + 5-min demo deck: <link> · questions welcome in-thread :thread:
+:point_right: Repo + 5-min demo deck: Repo https://github.com/talha1369/mcp-terra · Deck https://talha1369.github.io/mcp-terra/pitch/ · questions welcome in-thread :thread:

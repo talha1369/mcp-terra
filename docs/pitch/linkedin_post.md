@@ -24,7 +24,7 @@ infrastructure.
 Because it acts on real research data and budgets, I built it safety-first: no
 delete or overwrite capability anywhere, a guard that keeps controlled-access
 data off external models, a spend cap that stops the VM before a budget is
-exceeded, and 382 automated security tests across 52 attack classes —
+exceeded, and 392 automated security tests across 52 attack classes —
 adversarially reviewed line by line.
 
 If you work in computational biology or cloud research platforms, I'd love your
