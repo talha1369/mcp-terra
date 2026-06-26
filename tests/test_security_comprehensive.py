@@ -1437,9 +1437,25 @@ def _():
     s = nbr.runner_script_template()
     assert "own_claim_check()" in s, "no synchronous ownership check helper"
     assert "claim-owner:" in s
-    # gated before the terminal write AND again before the spec move
+    # gated before the terminal write (and the spec-move uses it too, below)
     assert "|| ! own_claim_check; then" in s, "ownership not required before terminal write"
-    assert s.count("! own_claim_check") >= 2, "ownership not re-checked before the spec move"
+
+@case("CC-Hardening", "spec-move ownership gate does NOT skip fail-streak / auto-stop cost controls")
+def _():
+    from mcp_terra import notebook_runner as nbr
+    s = nbr.runner_script_template()
+    # the ownership gate wraps ONLY the move + processed-marking (if/then/else),
+    # so the cost controls after it still run on a transient ownership-stat blip
+    assert "if own_claim_check; then" in s, "spec-move gate not restructured"
+    assert "cost controls still run" in s
+    # the buggy early-continue (which skipped fail-streak + auto-stop) is gone:
+    # fail-streak accounting must appear AFTER the spec-move gate
+    assert s.index("if own_claim_check; then") < s.index("Fail-streak accounting")
+
+@case("CC-Hardening", "terminal-write atomicity residual is documented")
+def _():
+    sec = (REPO_ROOT / "SECURITY.md").read_text()
+    assert "Terminal-result write is not perfectly atomic with claim ownership" in sec
 
 
 # ──────────────────────────────────────────────────────────────────────────

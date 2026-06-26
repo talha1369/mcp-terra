@@ -1396,24 +1396,27 @@ PYRESULT
             echo "[runner] NOTE: the lease for $JOB_ID was lost mid-run; result.json no-clobber guarantees a single valid result (no corruption)." >&2
         fi
 
-        # security review: re-prove claim ownership before MOVING the spec. If we
-        # lost the claim during the result/artifact writes, the claim holder owns
-        # the job — do NOT hide its spec by renaming it to .consumed (that would
-        # strand the holder's pickup); leave it and let the holder finish.
-        if ! own_claim_check; then
-            echo "[runner] $JOB_ID: claim not held before spec move — leaving the spec for the claim holder." >&2
-            stop_refresher
-            continue
+        # security review: re-prove claim ownership before MOVING the spec — but
+        # this run is ALREADY terminalized (result.json + status written above),
+        # so the cost controls below (fail-streak accounting + auto-stop) MUST
+        # still run regardless of this check (a transient ownership-stat failure
+        # must NOT leave the VM running or skip the runaway-cost halt). ONLY the
+        # spec MOVE + local processed-marking are gated: if we cannot prove we
+        # still hold the claim, leave the spec for the claim holder (the durable
+        # result.json terminal marker still prevents any re-execution).
+        if own_claim_check; then
+            # Mark spec consumed via no-clobber rename. If .consumed already
+            # exists, append a timestamp suffix so previous run's data survives.
+            if ! gsutil mv -n "$SPEC" "$SPEC.consumed" 2>/dev/null; then
+                TS="$(date -u +%Y%m%dT%H%M%SZ)"
+                gsutil mv -n "$SPEC" "$SPEC.consumed.$TS" 2>/dev/null || \
+                    echo "[runner] WARN: could not move $SPEC to .consumed (already processed locally; safe)." >&2
+            fi
+            # Record locally so we never re-execute even if the bucket move failed
+            echo "$JOB_ID" >> "$PROCESSED_FILE"
+        else
+            echo "[runner] $JOB_ID: claim not held before spec move — leaving the spec for the claim holder (result already terminalized; cost controls still run)." >&2
         fi
-        # Mark spec consumed via no-clobber rename. If .consumed already
-        # exists, append a timestamp suffix so previous run's data survives.
-        if ! gsutil mv -n "$SPEC" "$SPEC.consumed" 2>/dev/null; then
-            TS="$(date -u +%Y%m%dT%H%M%SZ)"
-            gsutil mv -n "$SPEC" "$SPEC.consumed.$TS" 2>/dev/null || \
-                echo "[runner] WARN: could not move $SPEC to .consumed (already processed locally; safe)." >&2
-        fi
-        # Record locally so we never re-execute even if the bucket move failed
-        echo "$JOB_ID" >> "$PROCESSED_FILE"
         # Job is durably terminal now — stop the lease refresher (it has done its
         # job). The top-of-loop stop_refresher is the safety net for any earlier
         # exit; this stops it promptly on normal completion.

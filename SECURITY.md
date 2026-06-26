@@ -78,6 +78,8 @@ These are real but either out of scope or fundamentally hard:
 
 7. **First-stage VM start script is fetched from the workspace bucket.** Leonardo runs `start_runner.sh` from the workspace bucket on every VM boot/resume, and it receives the runner secret via Leonardo `customEnvironmentVariables`. That bucket is writable by **workspace co-members**, so a *malicious* co-member (someone you have granted workspace write access) could overwrite the first-stage script between runtime creation and the next boot and run code with the runner secret. This sits within the **co-member trust boundary** — a co-member already has full read access to your workspace data and write access to its bucket — analogous to the compromised-host limitation. Mitigations in place: the script is content-addressed and **sha256-verified at create time**; the **second-stage runner it launches is sha256-verified on the VM AND fetched from a generation-pinned (immutable) URI**; and every job spec is independently **HMAC-signed** (a swapped first stage still cannot forge accepted jobs without the secret, which it would have to exfiltrate first). Full closure of the first stage would need a Leonardo-controlled immutable bootstrap, or verified support for a generation-pinned `startUserScriptUri` (candidate future hardening).
 
+8. **Terminal-result write is not perfectly atomic with claim ownership.** The runner proves it holds the claim with a synchronous stat (`own_claim_check`) immediately before writing the canonical `result.json` (a no-clobber `gsutil cp -n`), and again before moving the spec. These are separate GCS operations, so a window exists: if the VM were suspended longer than the claim TTL (≈3× the refresh interval) in the gap between the ownership stat and the result write, another runner could stale-reclaim the job and a resuming stale runner could still win the `result.json` no-clobber create. In practice this is extremely narrow — an active VM mid-upload is not idle (so it won't autopause), so only a long (>TTL) preemption/suspension landing in the seconds-long upload window could trigger it — AND both runners execute the SAME HMAC-signed spec, so the result is a valid execution of the job either way and `cp -n` guarantees a single, uncorrupted `result.json`. The practical impact is bounded **duplicate compute**, not data integrity or a security violation. Full linearizable terminalization (tying the result write to the claim generation via a CAS, or an owner-scoped terminal object the MCP resolves against the final claim owner) is candidate future hardening.
+
 ## Terra operational robustness
 
 Real Terra behaviors the MCP is built to survive (not security holes, but
@@ -122,7 +124,7 @@ default 3000), and `MCP_TERRA_RUNNER_CONCURRENCY` (single-VM job pool, default 4
 
 ## Comprehensive attack-class coverage (`tests/test_security_comprehensive.py`)
 
-**388/388 tests pass** across 52 attack classes. The table below is generated
+**390/390 tests pass** across 52 attack classes. The table below is generated
 from the suite itself; the test file is the authoritative source. Run yourself:
 
 ```bash
