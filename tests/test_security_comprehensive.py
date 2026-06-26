@@ -1201,6 +1201,56 @@ def _():
     assert "RLIMIT_CORE" in src and "(0, 0)" in src
 
 
+# ── CC-Concurrency: single-VM bounded papermill pool (#17) ─────────────────
+
+@case("CC-Concurrency", "runner template wires a bounded concurrency pool")
+def _():
+    from mcp_terra import notebook_runner as nbr
+    src = nbr.runner_script_template()
+    # env parse + clamp
+    assert 'RUNNER_CONCURRENCY="${MCP_TERRA_RUNNER_CONCURRENCY:-4}"' in src
+    assert '[ "$RUNNER_CONCURRENCY" -gt 16 ] && RUNNER_CONCURRENCY=16' in src
+    # the throttle + background subshell + once-wrapper + batch drain
+    assert 'wait -n 2>/dev/null || true' in src, "missing pool throttle"
+    assert 'for _spec_once in 1; do' in src, "missing continue-preserving wrapper"
+    assert 'wait || true' in src, "missing batch-drain wait"
+
+@case("CC-Concurrency", "concurrency var is integer-validated in the runner")
+def _():
+    from mcp_terra import notebook_runner as nbr
+    src = nbr.runner_script_template()
+    # a non-integer must abort the runner (fail-loud), like the other tunables
+    assert "MCP_TERRA_RUNNER_CONCURRENCY must be an integer" in src
+
+@case("CC-Concurrency", "policy.runner_concurrency() defaults 4, clamps 1..16")
+def _():
+    import os as _os
+    saved = _os.environ.get("MCP_TERRA_RUNNER_CONCURRENCY")
+    try:
+        for raw, want in (("", 4), ("1", 1), ("4", 4), ("16", 16),
+                          ("0", 1), ("99", 16), ("-3", 1), ("abc", 4)):
+            if raw == "":
+                _os.environ.pop("MCP_TERRA_RUNNER_CONCURRENCY", None)
+            else:
+                _os.environ["MCP_TERRA_RUNNER_CONCURRENCY"] = raw
+            got = policy.runner_concurrency()
+            assert got == want, f"{raw!r}: expected {want}, got {got}"
+    finally:
+        if saved is None:
+            _os.environ.pop("MCP_TERRA_RUNNER_CONCURRENCY", None)
+        else:
+            _os.environ["MCP_TERRA_RUNNER_CONCURRENCY"] = saved
+
+@case("CC-Concurrency", "concurrency propagates to the VM (cEV + SSH bootstrap)")
+def _():
+    import inspect
+    src = inspect.getsource(server)
+    # create_runtime customEnvironmentVariables
+    assert '"MCP_TERRA_RUNNER_CONCURRENCY": str(policy.runner_concurrency())' in src
+    # start_runner_on_vm SSH bootstrap env line
+    assert "MCP_TERRA_RUNNER_CONCURRENCY='{policy.runner_concurrency()}'" in src
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # U-Robustness: state-of-the-art MCP design — annotations, schema versioning,
 # terra_health diagnostic, wait-for-complete option.

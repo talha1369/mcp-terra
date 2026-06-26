@@ -147,6 +147,18 @@ def vm_hourly_usd() -> float:
     return max(0.0, r)
 
 
+def runner_concurrency() -> int:
+    """How many job specs ONE on-VM runner may execute at once (single-VM
+    concurrency / bounded papermill pool). The on-VM runner reads the SAME env
+    (MCP_TERRA_RUNNER_CONCURRENCY) independently; this helper is the submit-side
+    mirror so the MCP can propagate the value to the VM. Default 4, clamp 1..16."""
+    try:
+        c = int(os.environ.get("MCP_TERRA_RUNNER_CONCURRENCY", "4") or "4")
+    except (TypeError, ValueError):
+        c = 4
+    return max(1, min(c, 16))
+
+
 def is_egress_allowed_bucket(bucket: str) -> bool:
     """True if `bucket` may have its DATA returned to the LLM even under the
     controlled-access guard — an EXACT-name match against a known PUBLIC

@@ -102,13 +102,22 @@ operational cliffs that would otherwise fail a long/parallel run):
   self-halt at the cap, warn at 80%) is a local guard; the authoritative bound is
   a GCP budget alert on the billing project.
 
+- **Single-VM concurrency.** One VM can execute several jobs at once via a
+  bounded papermill pool (`MCP_TERRA_RUNNER_CONCURRENCY`, default 4, clamp 1..16).
+  Each job runs in its own subshell with its own **atomic per-`JOB_ID` GCS claim**
+  + lease heartbeat; cross-job state (processed-ids, the fail-streak counter) is
+  file/`flock`-based — so concurrent jobs are isolated and **never double-execute**,
+  and the per-job wall-clock + the VM spend cap still bound the whole pool. Set to
+  1 for strict serial. (Parallelism is also available across multiple VMs and via
+  WDL scatter.)
+
 New tunables introduced here: `MCP_TERRA_REQUESTER_PAYS_PROJECT` (requester-pays
-billing project) and `MCP_TERRA_MAX_CALLS_PER_HOUR` (sustained rate backstop,
-default 3000).
+billing project), `MCP_TERRA_MAX_CALLS_PER_HOUR` (sustained rate backstop,
+default 3000), and `MCP_TERRA_RUNNER_CONCURRENCY` (single-VM job pool, default 4).
 
 ## Comprehensive attack-class coverage (`tests/test_security_comprehensive.py`)
 
-**360/360 tests pass** across 50 attack classes. The table below is generated
+**364/364 tests pass** across 51 attack classes. The table below is generated
 from the suite itself; the test file is the authoritative source. Run yourself:
 
 ```bash

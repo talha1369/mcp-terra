@@ -94,8 +94,11 @@ notebooks for anything that fans out. Three layers of parallelism, all supported
 3. **Notebooks in parallel** (the sibling path, for completeness): submit several
    notebook jobs and run several runtimes — the on-VM runner's **atomic per-spec
    claim** means each VM picks up a *different* job, so notebooks run in parallel
-   across VMs and the same job is never executed twice. (A single VM still runs
-   its own jobs one at a time, by design.)
+   across VMs and the same job is never executed twice. **A single VM also runs
+   multiple jobs concurrently** — the runner has a bounded papermill pool
+   (`MCP_TERRA_RUNNER_CONCURRENCY`, default 4, max 16); each job gets its own
+   atomic claim + lease, so the pool never double-executes and the per-job
+   wall-clock + spend caps still apply across it.
 
 Cost scales with parallelism — say so before a wide scatter, and prefer
 preemptible/spot `runtime` where the task tolerates retries.

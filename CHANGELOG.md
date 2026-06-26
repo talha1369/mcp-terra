@@ -9,6 +9,19 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **Single-VM concurrency (bounded papermill pool).** The on-VM runner can now
+  execute several jobs at once on ONE VM via `MCP_TERRA_RUNNER_CONCURRENCY`
+  (default 4, clamp 1..16) — previously a single VM ran jobs strictly serially.
+  Each job runs in its own subshell with its own atomic per-`JOB_ID` GCS claim +
+  lease heartbeat; processed-ids and the fail-streak counter are file/`flock`-based,
+  so concurrent jobs are isolated and never double-execute, and the per-job
+  wall-clock + VM spend cap still bound the whole pool. The runner body is
+  unchanged (wrapped in a `for _spec_once in 1` loop so every existing `continue`
+  keeps its exact serial meaning); the value propagates to the VM via
+  `customEnvironmentVariables` + the SSH bootstrap. Set to 1 for strict serial.
+  Control-flow validated in isolation; full pool behavior should be confirmed on a
+  real VM. (Parallelism is also available across multiple VMs and via WDL scatter.)
+
 - **Deterministic WDL/Cromwell failure classifier** (`terra_classify_workflow_failure`,
   tool #45). The WDL analogue of the notebook bug-triager: turns a verbose
   Cromwell/Google-Batch failure message into `{category, recommended_action}`

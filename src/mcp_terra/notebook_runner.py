@@ -407,6 +407,23 @@ if [ "$FAIL_STREAK_LIMIT" -lt 1 ] || [ "$FAIL_STREAK_LIMIT" -gt 50 ]; then
     exit 6
 fi
 
+# ── Single-VM concurrency (bounded papermill pool) ──
+# How many job specs this ONE VM may execute at once. Default 4. Each job runs
+# in its own subshell with its own atomic per-JOB_ID claim + lease heartbeat;
+# cross-job state (processed-ids, fail-streak) is file/flock-based, so concurrent
+# jobs are isolated and never double-execute. Set to 1 for strict serial
+# behavior. Clamped 1..16 (a VM has finite CPU/RAM; the per-job wall-clock +
+# spend caps still apply across the pool).
+RUNNER_CONCURRENCY="${MCP_TERRA_RUNNER_CONCURRENCY:-4}"
+case "$RUNNER_CONCURRENCY" in
+    ''|*[!0-9]*)
+        echo "[runner] MCP_TERRA_RUNNER_CONCURRENCY must be an integer; aborting." >&2
+        exit 6 ;;
+esac
+[ "$RUNNER_CONCURRENCY" -lt 1 ]  && RUNNER_CONCURRENCY=1
+[ "$RUNNER_CONCURRENCY" -gt 16 ] && RUNNER_CONCURRENCY=16
+echo "[runner] single-VM concurrency: up to ${RUNNER_CONCURRENCY} job(s) at once (MCP_TERRA_RUNNER_CONCURRENCY)"
+
 # ── Terra 24h session/credential-window guard ──
 # Terra interactive runtimes have a BOUNDED session/credential lifetime
 # (commonly ~24h). A notebook that runs past it can lose its Terra/GCS
@@ -578,6 +595,23 @@ while true; do
     fi
 
     for SPEC in "${PENDING[@]}"; do
+        # ── Single-VM concurrency pool ──
+        # Throttle to RUNNER_CONCURRENCY in-flight jobs before launching the next.
+        # `jobs -rp` in THIS (main) shell counts only the per-spec subshells below
+        # (lease refreshers are grandchildren inside those subshells, not counted).
+        while [ "$(jobs -rp | wc -l)" -ge "$RUNNER_CONCURRENCY" ]; do
+            wait -n 2>/dev/null || true
+        done
+        (
+            # Each job runs in its OWN subshell and owns its OWN lease handles.
+            # The claim is per-JOB_ID (atomic GCS precondition); processed-ids and
+            # the fail-streak counter are file/flock-based, so concurrent jobs are
+            # isolated and never double-execute. The `for _spec_once in 1` wrapper
+            # makes every existing `continue` below skip to the END of THIS job's
+            # body — byte-identical to the prior serial semantics — while the outer
+            # subshell lets the job run in the background pool.
+            REFRESHER_PID=""; REFRESH_ON=""
+            for _spec_once in 1; do
         # Stop any lease-refresher left running for the PREVIOUS spec — covers
         # every `continue` exit path so a refresher never strands a claim. (r13)
         stop_refresher
@@ -1301,7 +1335,15 @@ PYRESULT
         elif [ "$AUTO_STOP" = "True" ] && [ "$RC" != "0" ]; then
             echo "[runner] auto_stop_after_completion=True but rc=$RC; NOT halting — leaving VM alive for the Claude agent's bug-fix loop. The agent will read the failing cell, fix it, re-upload with version_method='bak', and re-submit. Auto-stop fires only on rc=0."
         fi
+            done   # end `for _spec_once in 1` (a `continue` above lands here)
+            # Guarantee this job's lease refresher is stopped on EVERY exit path.
+            stop_refresher
+        ) &
     done
+    # Drain this poll's batch before re-polling so PENDING is recomputed fresh
+    # and the pool never accumulates unbounded background jobs. (wait with no
+    # args returns 0; guarded anyway so `set -e` can't trip on it.)
+    wait || true
 done
 """
 

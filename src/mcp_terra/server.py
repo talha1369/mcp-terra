@@ -740,6 +740,8 @@ def terra_create_runtime(
             # Spend cap (the runner self-halts the VM before this estimated spend).
             "MCP_TERRA_MAX_COST_USD": str(policy.max_cost_usd()),
             "MCP_TERRA_VM_HOURLY_USD": str(policy.vm_hourly_usd()),
+            # Single-VM concurrency: how many jobs this VM runs at once.
+            "MCP_TERRA_RUNNER_CONCURRENCY": str(policy.runner_concurrency()),
         }
 
     token = auth.get_access_token()
@@ -1331,6 +1333,7 @@ MCP_TERRA_MAX_RUN_HOURS='{policy.max_run_hours()}' \
 MCP_TERRA_SESSION_MARGIN_SEC='{policy.session_margin_sec()}' \
 MCP_TERRA_MAX_COST_USD='{policy.max_cost_usd()}' \
 MCP_TERRA_VM_HOURLY_USD='{policy.vm_hourly_usd()}' \
+MCP_TERRA_RUNNER_CONCURRENCY='{policy.runner_concurrency()}' \
 nohup /home/jupyter/mcp_terra_runner.sh \
     > /home/jupyter/.mcp_terra_runner.log 2>&1 &
 PID=$!
