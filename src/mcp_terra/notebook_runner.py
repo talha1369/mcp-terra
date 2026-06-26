@@ -462,6 +462,33 @@ command -v papermill >/dev/null 2>&1 || {
 
 echo "[runner] polling $BUCKET/mcp_terra_jobs/ every ${POLL_SEC}s (Ctrl-C to stop)"
 
+# ── Spend cap (stop/pause the VM BEFORE exceeding the credit limit) ──────────
+# Honest estimate: this VM's compute spend since the runner started = uptime x
+# the operator's hourly rate. NO hardcoded GCP prices. 0/unset disables it. When
+# the estimate reaches the cap, the runner STOPS the VM (stop/pause; persistent
+# disk kept — never delete), warning at 80% first. (Cromwell/Batch workflow cost
+# is separate; the submit tools advise on it.)
+MAX_COST_USD="${MCP_TERRA_MAX_COST_USD:-0}"
+VM_HOURLY_USD="${MCP_TERRA_VM_HOURLY_USD:-0}"
+COST_WARNED=0
+
+# Stop THIS VM (stop/pause, persistent disk kept — NEVER delete). Reusable.
+halt_vm() {
+    local _reason="$1" _meta_hdr _meta_url _inst _zone
+    _meta_hdr='Metadata-Flavor: Google'
+    _meta_url='http://metadata.google.internal/computeMetadata/v1/instance'
+    _inst="$(curl -sf -H "$_meta_hdr" "$_meta_url/name" 2>/dev/null || true)"
+    _zone="$(curl -sf -H "$_meta_hdr" "$_meta_url/zone" 2>/dev/null || true)"; _zone="${_zone##*/}"
+    if [ -n "$_inst" ] && [ -n "$_zone" ]; then
+        env -u MCP_TERRA_RUNNER_SECRET gcloud compute instances stop "$_inst" \
+            --zone "$_zone" --quiet \
+            && echo "[runner] VM $_inst stop requested ($_reason)." \
+            || echo "[runner] WARN: gcloud stop failed; stop the VM manually ($_reason)." >&2
+    else
+        echo "[runner] WARN: could not read instance metadata; stop the VM manually ($_reason)." >&2
+    fi
+}
+
 # security review: positively distinguish "object absent" (a 404, safe to
 # proceed) from a TRANSIENT gsutil/auth/network error (must NOT be read as
 # absent — that would let a terminal job be re-executed). Echoes
@@ -509,6 +536,23 @@ while true; do
     printf '%s %s\n' "$(date -u +%s)" "${MCP_TERRA_RUNTIME_NAME:-}" \
         | gsutil cp - "$HEARTBEAT_GCS" 2>/dev/null \
         || echo "[runner] WARN: could not refresh heartbeat." >&2
+
+    # ── Spend cap: stop the VM BEFORE estimated spend exceeds the credit limit ──
+    if awk "BEGIN{exit !($MAX_COST_USD>0 && $VM_HOURLY_USD>0)}"; then
+        _now_c="$(date +%s)"
+        EST_COST="$(awk "BEGIN{printf \"%.2f\", ($_now_c-$RUNNER_START_EPOCH)/3600.0*$VM_HOURLY_USD}")"
+        if awk "BEGIN{exit !($EST_COST>=$MAX_COST_USD)}"; then
+            echo "[runner] estimated VM spend \$$EST_COST >= cap \$$MAX_COST_USD — STOPPING the VM (stop/pause; persistent disk kept) to avoid exceeding the credit limit." >&2
+            CAP_TS="$(date -u +%Y%m%dT%H%M%SZ)"
+            echo "est_vm_cost_usd=$EST_COST cap_usd=$MAX_COST_USD rate_usd_per_hr=$VM_HOURLY_USD" \
+                | gsutil cp -n - "${BUCKET%/}/mcp_terra_jobs/HALTED-SPEND-CAP.${CAP_TS}.txt" 2>/dev/null || true
+            halt_vm "spend cap \$$MAX_COST_USD reached"
+            exit 0
+        elif [ "$COST_WARNED" -eq 0 ] && awk "BEGIN{exit !($EST_COST>=0.8*$MAX_COST_USD)}"; then
+            echo "[runner] WARN: estimated VM spend \$$EST_COST is >=80% of the \$$MAX_COST_USD cap; the VM will auto-stop at the cap." >&2
+            COST_WARNED=1
+        fi
+    fi
     # mapfile + null-delimited list to avoid word-splitting on bad paths
     # Filter pending to safe paths only. GCS object names can contain LF;
     # mapfile then sees them as separate array elements. Strict regex match

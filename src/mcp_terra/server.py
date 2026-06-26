@@ -736,6 +736,9 @@ def terra_create_runtime(
             # (otherwise the runner silently used its built-in default).
             "MCP_TERRA_MAX_RUN_HOURS": str(policy.max_run_hours()),
             "MCP_TERRA_SESSION_MARGIN_SEC": str(policy.session_margin_sec()),
+            # Spend cap (the runner self-halts the VM before this estimated spend).
+            "MCP_TERRA_MAX_COST_USD": str(policy.max_cost_usd()),
+            "MCP_TERRA_VM_HOURLY_USD": str(policy.vm_hourly_usd()),
         }
 
     token = auth.get_access_token()
@@ -1325,6 +1328,8 @@ MCP_TERRA_RUNNER_SECRET="$SECRET" \
 MCP_TERRA_RUNTIME_NAME='{runtime_name}' \
 MCP_TERRA_MAX_RUN_HOURS='{policy.max_run_hours()}' \
 MCP_TERRA_SESSION_MARGIN_SEC='{policy.session_margin_sec()}' \
+MCP_TERRA_MAX_COST_USD='{policy.max_cost_usd()}' \
+MCP_TERRA_VM_HOURLY_USD='{policy.vm_hourly_usd()}' \
 nohup /home/jupyter/mcp_terra_runner.sh \
     > /home/jupyter/.mcp_terra_runner.log 2>&1 &
 PID=$!
@@ -1601,6 +1606,16 @@ def terra_submit_notebook_job(notebook_gcs: str, bucket_uri: str,
             f"~{max(1, policy.max_run_hours() - 1)}h, prefer the WDL/Cromwell path "
             f"(terra_submit_workflow): Batch tasks auto-refresh credentials and "
             f"are not bound by the interactive-runtime window."),
+        **({"spend_cap_advisory": (
+            f"A workspace spend cap of ${policy.max_cost_usd():.2f} is set "
+            f"(MCP_TERRA_MAX_COST_USD)" + (
+                f"; the on-VM runner self-stops the VM when its estimated compute "
+                f"spend (uptime x ${policy.vm_hourly_usd():.2f}/hr) reaches the cap "
+                f"(stop/pause; persistent disk kept)."
+                if policy.vm_hourly_usd() > 0 else
+                "; set MCP_TERRA_VM_HOURLY_USD to enable the runner's auto-stop "
+                "(otherwise the cap is advisory only)."))}
+           if policy.max_cost_usd() > 0 else {}),
     })
 
 

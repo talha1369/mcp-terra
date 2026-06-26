@@ -123,6 +123,30 @@ def session_margin_sec() -> int:
     return max(60, min(m, 3600))
 
 
+def max_cost_usd() -> float:
+    """Workspace credit cap (USD) the user opts into via MCP_TERRA_MAX_COST_USD.
+    0 / unset = no cap. When set, the on-VM runner self-HALTS the VM (stop/pause,
+    persistent disk kept — never delete) before the estimated VM spend exceeds
+    it, and the submit tools warn in advance. Clamp >= 0."""
+    try:
+        c = float(os.environ.get("MCP_TERRA_MAX_COST_USD", "0") or "0")
+    except (TypeError, ValueError):
+        c = 0.0
+    return max(0.0, c)
+
+
+def vm_hourly_usd() -> float:
+    """The operator's VM hourly rate (USD) for the spend-cap estimate, set via
+    MCP_TERRA_VM_HOURLY_USD. We do NOT hardcode GCP prices (they drift + vary by
+    machine/GPU/region) — the estimate is honest (real uptime x the user's real
+    rate). 0 / unset = the VM self-halt is disabled (cap stays advisory)."""
+    try:
+        r = float(os.environ.get("MCP_TERRA_VM_HOURLY_USD", "0") or "0")
+    except (TypeError, ValueError):
+        r = 0.0
+    return max(0.0, r)
+
+
 def is_egress_allowed_bucket(bucket: str) -> bool:
     """True if `bucket` may have its DATA returned to the LLM even under the
     controlled-access guard — an EXACT-name match against a known PUBLIC

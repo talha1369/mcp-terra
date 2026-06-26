@@ -9,6 +9,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **Workspace spend cap (`MCP_TERRA_MAX_COST_USD`)** — opt-in credit limit that
+  warns in advance and **halts before overage**. The on-VM runner estimates this
+  VM's compute spend honestly (uptime x the operator-set `MCP_TERRA_VM_HOURLY_USD`
+  — no hardcoded GCP prices) and **stops/pauses the VM** (persistent disk kept;
+  never delete) when the estimate reaches the cap, warning at 80% first. The
+  submit tools surface a `spend_cap_advisory`. The cap + rate propagate to the VM
+  via `customEnvironmentVariables` and the SSH-bootstrap path. (Cromwell/Batch
+  workflow cost is separate; the cap is advisory there.)
+
 - **`terra_summarize_submissions`** — one-call OVERVIEW of all workspace submissions (id, status, date, per-workflow status counts), newest-first, with `active_only` + `limit`. For monitoring MANY parallel runs (or a scattered workflow's sibling submissions) without paging raw JSON. READ-class, controlled-access-aware (method-config + entity names withheld in guard mode). Wired into the terra-wdl-run skill.
 
 - **MCP resources + prompts (discoverability).** Read-only

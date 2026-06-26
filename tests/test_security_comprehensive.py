@@ -4489,6 +4489,51 @@ def _():
     assert not bad, f"iteration-revealing identifiers leaked into shipped files: {bad[:10]}"
 
 
+@case("CC-SpendCap", "policy.max_cost_usd / vm_hourly_usd parse + clamp")
+def _():
+    import os as _os
+    from mcp_terra import policy as _p
+    sv = (_os.environ.get("MCP_TERRA_MAX_COST_USD"), _os.environ.get("MCP_TERRA_VM_HOURLY_USD"))
+    try:
+        _os.environ.pop("MCP_TERRA_MAX_COST_USD", None); _os.environ.pop("MCP_TERRA_VM_HOURLY_USD", None)
+        assert _p.max_cost_usd() == 0.0 and _p.vm_hourly_usd() == 0.0   # unset = no cap
+        _os.environ["MCP_TERRA_MAX_COST_USD"] = "250.5"; assert _p.max_cost_usd() == 250.5
+        _os.environ["MCP_TERRA_MAX_COST_USD"] = "-5"; assert _p.max_cost_usd() == 0.0   # clamp >=0
+        _os.environ["MCP_TERRA_MAX_COST_USD"] = "junk"; assert _p.max_cost_usd() == 0.0
+        _os.environ["MCP_TERRA_VM_HOURLY_USD"] = "0.55"; assert _p.vm_hourly_usd() == 0.55
+    finally:
+        for k, v in zip(("MCP_TERRA_MAX_COST_USD", "MCP_TERRA_VM_HOURLY_USD"), sv):
+            if v is None: _os.environ.pop(k, None)
+            else: _os.environ[k] = v
+
+
+@case("CC-SpendCap", "runner self-STOPS the VM at the cap (stop/pause, never delete)")
+def _():
+    from mcp_terra import notebook_runner as nbr
+    s = nbr.runner_script_template()
+    assert "MAX_COST_USD" in s and "VM_HOURLY_USD" in s
+    # honest estimate: uptime x rate (no hardcoded prices)
+    assert "RUNNER_START_EPOCH)/3600.0*$VM_HOURLY_USD" in s
+    # halts via STOP (not delete) when over the cap, warns at 80%
+    assert "halt_vm" in s and "gcloud compute instances stop" in s
+    assert "instances delete" not in s, "must NEVER delete the VM"
+    assert "STOPPING the VM" in s and "HALTED-SPEND-CAP" in s
+    assert ">=80% of the" in s, "must warn in advance"
+
+
+@case("CC-SpendCap", "cap + rate propagate to the VM runner env (create + SSH paths)")
+def _():
+    import inspect
+    csrc = inspect.getsource(server.terra_create_runtime)
+    assert '"MCP_TERRA_MAX_COST_USD": str(policy.max_cost_usd())' in csrc
+    assert '"MCP_TERRA_VM_HOURLY_USD": str(policy.vm_hourly_usd())' in csrc
+    ssrc = inspect.getsource(server.terra_start_runner_on_vm)
+    assert "MCP_TERRA_MAX_COST_USD=" in ssrc and "MCP_TERRA_VM_HOURLY_USD=" in ssrc
+    # submit warns in advance when a cap is set
+    sub = inspect.getsource(server.terra_submit_notebook_job)
+    assert "spend_cap_advisory" in sub
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # RUN
 # ──────────────────────────────────────────────────────────────────────────
