@@ -287,6 +287,7 @@ terra_list_submissions(namespace, name) → [{submissionId, status, …}]
 terra_get_submission(namespace, name, submission_id) → {status, workflows, …}
 terra_get_workflow_metadata(namespace, name, submission_id, workflow_id, include_calls=False)
 terra_get_workflow_outputs(namespace, name, submission_id, workflow_id)
+terra_get_workflow_logs(namespace, name, submission_id, workflow_id, max_bytes=65536, failed_only=True)  # per-task Cromwell stderr — the real failure signal
 terra_get_workflow_cost(namespace, name, submission_id, workflow_id)
 terra_list_method_configs(namespace, name) → [{namespace, name, methodRepoMethod, …}]
 terra_get_method_config(namespace, name, config_namespace, config_name)

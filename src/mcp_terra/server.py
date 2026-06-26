@@ -2356,6 +2356,78 @@ def terra_get_workflow_cost(namespace: str, name: str,
                                           submission_id, workflow_id))
 
 
+@server.tool(title="Get workflow task logs (stderr/stdout)", annotations=ANN_READ_REMOTE)
+def terra_get_workflow_logs(namespace: str, name: str,
+                            submission_id: str, workflow_id: str,
+                            max_bytes: int = 65536, failed_only: bool = True) -> str:
+    """Per-task stderr/stdout for a Cromwell workflow — the REAL failure signal
+    for diagnosing a failed WDL run (the task that died, its return code, and
+    its stderr tail). No cost.
+
+    Returns {workflow_id, status, tasks:[{call, shard, status, returnCode,
+    stderr_path, stdout_path, stderr_tail}]}. `stderr_tail` is a byte-range head
+    of the task's stderr object (default 64 KiB, ceiling 256 KiB). With
+    `failed_only=True` (default) only non-successful tasks are returned.
+
+    Controlled-access: if MCP_TERRA_CONTROLLED_ACCESS=1, the stderr CONTENT is
+    withheld (it can contain printed controlled data) — the paths + statuses are
+    still returned so you know which task failed; read content via a self-hosted
+    model. The execution dir must be in your allowlisted workspace bucket.
+
+    Args:
+        submission_id/workflow_id: from `terra_get_submission`.
+        max_bytes: per-task stderr tail cap (1024..262144).
+        failed_only: only return non-successful tasks (default True).
+    """
+    for _v, _n in ((namespace, "namespace"), (name, "name"),
+                   (submission_id, "submission_id"), (workflow_id, "workflow_id")):
+        safety.validate_freeform_string(_v, _n, allow_empty=False)
+    if not (1024 <= max_bytes <= 256 * 1024):
+        raise ValueError(f"max_bytes must be 1024..262144; got {max_bytes}")
+    _assert_workspace_allowed(namespace, name)
+    _pre("terra_get_workflow_logs", READ,
+         f"{namespace}/{name} sub={submission_id} wf={workflow_id} "
+         f"failed_only={failed_only}")
+    token = auth.get_access_token()
+    md = tc.rawls_get_workflow_metadata(token, namespace, name,
+                                        submission_id, workflow_id)
+    calls = (md or {}).get("calls") or {}
+    controlled = policy.controlled_access_enabled()
+    _ok_statuses = ("Done", "Succeeded")
+    tasks: list[dict] = []
+    for call_name, shards in calls.items():
+        for sh in (shards or []):
+            st = (sh or {}).get("executionStatus")
+            if failed_only and st in _ok_statuses:
+                continue
+            entry = {
+                "call": call_name,
+                "shard": sh.get("shardIndex"),
+                "status": st,
+                "returnCode": sh.get("returnCode"),
+                "stderr_path": sh.get("stderr"),
+                "stdout_path": sh.get("stdout"),
+            }
+            stderr_path = sh.get("stderr")
+            if controlled:
+                entry["stderr_tail"] = "[withheld: controlled-access mode]"
+            elif stderr_path:
+                try:
+                    safety.safe_bucket_uri(stderr_path)   # must be an allowlisted bucket
+                    entry["stderr_tail"] = bk.read_object(
+                        stderr_path, max_bytes=int(max_bytes)).get("text", "")
+                except (safety.SafetyError, bk.BucketError) as e:
+                    entry["stderr_tail"] = f"[could not read stderr: {type(e).__name__}]"
+            tasks.append(entry)
+    out: dict = {"workflow_id": workflow_id, "status": (md or {}).get("status"),
+                 "task_count": len(tasks), "tasks": tasks}
+    if controlled:
+        out["_controlled_access_withheld"] = (
+            "task stderr content withheld (MCP_TERRA_CONTROLLED_ACCESS) — paths "
+            "+ statuses returned; use a self-hosted / NIST-800-171 model.")
+    return _ok(out)
+
+
 @server.tool(title="Read a method config's contents", annotations=ANN_READ_REMOTE)
 def terra_get_method_config(namespace: str, name: str,
                             config_namespace: str, config_name: str) -> str:

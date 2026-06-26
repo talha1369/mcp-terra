@@ -9,6 +9,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- **`terra_get_workflow_logs`** — per-task Cromwell stderr/stdout (paths +
+  return code + stderr tail for failed tasks), the real failure signal for
+  diagnosing a failed WDL run that the workflow status alone doesn't give. READ
+  class, byte-capped, and **controlled-access-aware** (stderr content withheld
+  in guard mode; paths/statuses still returned). Inspired by the
+  dalmatian/nebelung gap analysis.
 - **Controlled-access data-egress guard (NIH GDS / DUC).** A new
   `MCP_TERRA_CONTROLLED_ACCESS=1` mode refuses to return raw workspace DATA to
   the LLM — `terra_read_bucket_object` (object bytes) and `terra_get_entities`

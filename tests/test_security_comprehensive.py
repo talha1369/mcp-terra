@@ -378,10 +378,10 @@ def _():
     bad = [t for t in tools if "delete" in t.lower() or "remove" in t.lower() or "rm" in t.lower()]
     assert not bad, f"destructive tools found: {bad}"
 
-@case("F-Tools", "42 tools registered (incl. WDL, reads, run-record + pings)")
+@case("F-Tools", "43 tools registered (incl. WDL, reads, run-record, pings, logs)")
 def _():
     tools = [t.name for t in server.server._tool_manager.list_tools()]
-    assert len(tools) == 42, f"expected 42, got {len(tools)}: {tools}"
+    assert len(tools) == 43, f"expected 43, got {len(tools)}: {tools}"
     expected = {
         "terra_whoami", "terra_list_workspaces", "terra_get_workspace",
         "terra_list_runtimes", "terra_get_runtime",
@@ -408,6 +408,7 @@ def _():
         "terra_get_bucket_object_metadata", "terra_get_batch_job_status",
         # completion record + delivery channels
         "terra_write_run_record", "terra_notify_slack", "terra_notify_desktop",
+        "terra_get_workflow_logs",
     }
     assert set(tools) == expected, f"missing={expected-set(tools)}, extra={set(tools)-expected}"
 
@@ -1222,7 +1223,7 @@ def _():
         "terra_health", "terra_killswitch_status",
         # WDL read tools
         "terra_list_method_configs", "terra_get_submission",
-        "terra_get_workflow_outputs",
+        "terra_get_workflow_outputs", "terra_get_workflow_logs",
         # fiss-mcp-superset read tools (all ANN_READ_REMOTE)
         "terra_list_data_tables", "terra_get_entities", "terra_list_submissions",
         "terra_get_workflow_metadata", "terra_get_workflow_cost",
@@ -3366,6 +3367,54 @@ def _():
         assert fc.calls == 1, "a 404 is deterministic — no retry"
     finally:
         (_t.httpx.Client, _t.time.sleep) = saved
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# CC-WorkflowLogs — per-task stderr (the Cromwell failure signal), guard-aware
+# ──────────────────────────────────────────────────────────────────────────
+
+_WF_MD = {"status": "Failed", "calls": {"wf.t": [
+    {"executionStatus": "Done", "shardIndex": 0, "stderr": "gs://x/ok-stderr"},
+    {"executionStatus": "Failed", "shardIndex": 1, "returnCode": 1,
+     "stderr": "gs://fc-secure-x/exec/stderr", "stdout": "gs://fc-secure-x/exec/stdout"}]}}
+
+
+@case("CC-WorkflowLogs", "controlled mode WITHHOLDS task stderr content")
+def _():
+    from mcp_terra import policy as _p
+    saved = _p._CONTROLLED_ACCESS
+    orig_md, orig_tok = _tc.rawls_get_workflow_metadata, server.auth.get_access_token
+    _tc.rawls_get_workflow_metadata = lambda *a, **k: _WF_MD
+    server.auth.get_access_token = lambda: "tok"
+    try:
+        _p._CONTROLLED_ACCESS = True
+        out = server.terra_get_workflow_logs("ns", "ws", "sub", "wf")
+        assert "withheld: controlled-access" in out and "_controlled_access_withheld" in out
+        assert "wf.t" in out, "task call/status/path still returned"
+    finally:
+        _p._CONTROLLED_ACCESS = saved
+        _tc.rawls_get_workflow_metadata, server.auth.get_access_token = orig_md, orig_tok
+
+
+@case("CC-WorkflowLogs", "off-mode reads the FAILED task's stderr tail (failed_only)")
+def _():
+    from mcp_terra import policy as _p, bucket as _bk2
+    saved = _p._CONTROLLED_ACCESS
+    orig_md, orig_tok = _tc.rawls_get_workflow_metadata, server.auth.get_access_token
+    orig_read, orig_safe = _bk2.read_object, safety.safe_bucket_uri
+    _tc.rawls_get_workflow_metadata = lambda *a, **k: _WF_MD
+    server.auth.get_access_token = lambda: "tok"
+    safety.safe_bucket_uri = lambda u: u
+    _bk2.read_object = lambda uri, max_bytes=0: {"text": "BOOM: real cromwell error"}
+    try:
+        _p._CONTROLLED_ACCESS = False
+        out = server.terra_get_workflow_logs("ns", "ws", "sub", "wf", failed_only=True)
+        assert "BOOM: real cromwell error" in out
+        assert '"shard": 1' in out and '"shard": 0' not in out, "failed_only must drop the Done shard"
+    finally:
+        _p._CONTROLLED_ACCESS = saved
+        _tc.rawls_get_workflow_metadata, server.auth.get_access_token = orig_md, orig_tok
+        _bk2.read_object, safety.safe_bucket_uri = orig_read, orig_safe
 
 
 # ──────────────────────────────────────────────────────────────────────────
