@@ -302,6 +302,35 @@ tests exercise the templates in isolation, so these were latent):
     fails if any lacks a controlled-access check (prevents a future tool from
     silently re-opening an egress path). Guarded by 7 new regression tests
     (`CC-ControlledAccess3`).
+- **Adversarial-review hardening (Codex) — round 4b** (re-review of the round-4
+  fixes): closed 5 more findings.
+  - **Audio in controlled mode** now feeds the summary text to `say` via
+    **stdin**, never argv — argv is world-readable (`ps` / process accounting),
+    so a controlled-data summary in argv was still an egress path.
+  - **Retry cancellation is now real**: a single deadline (first-attempt timeout
+    + retry budget), the kill-switch re-checked before **every** attempt, each
+    attempt's timeout capped to the remaining deadline, and an **interruptible**
+    backoff sleep (wakes within ~0.2 s of a kill-file appearing).
+  - `terra_get_method_config` controlled-mode projection drops the input/output
+    **key names** (now COUNTS only) — they are operator-controlled free text
+    that could encode identifiers.
+  - `terra_get_workflow_logs` propagates `read_object`'s per-task `truncated`
+    flag (`stderr_truncated`) and ORs it into the top-level `truncated`, so a
+    partial stderr is never returned as `truncated:false`.
+  - The structural meta-test is now **fail-closed + AST-based**: every
+    registered tool must be explicitly classified (data vs no-data), and every
+    data tool must contain a runtime guard CALL (a docstring mention no longer
+    satisfies it). +6 regression tests incl. a sentinel-identifier test.
+- **Terra ~24h session/credential-window guard** — the on-VM runner wraps each
+  notebook run in a TOTAL wall-clock budget (coreutils `timeout`, TERM→KILL)
+  derived from `MCP_TERRA_MAX_RUN_HOURS` (default 24, minus a safety margin),
+  because `papermill --execution-timeout` is per-cell and a multi-cell notebook
+  otherwise has no total ceiling. A run that exceeds the budget is halted as
+  `status='FAILED-SESSION-LIMIT'` (results may be partial) instead of hitting
+  the credential cliff mid-run; the result carries `elapsed_sec` +
+  `session_limit_note`. `terra_submit_notebook_job` advises the limit and points
+  long jobs to the WDL/Cromwell path (Batch tasks auto-refresh credentials).
+  Guarded by CC-SessionLimit.
 - **No delete primitive, by design** — no tool (and no `leo_delete_runtime`
   at any layer) deletes a runtime or persistent disk; teardown is the user's
   action in the Terra UI ("Keep persistent disk"). The MCP detects a

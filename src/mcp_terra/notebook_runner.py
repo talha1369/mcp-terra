@@ -394,6 +394,40 @@ if [ "$FAIL_STREAK_LIMIT" -lt 1 ] || [ "$FAIL_STREAK_LIMIT" -gt 50 ]; then
     exit 6
 fi
 
+# ── Terra 24h session/credential-window guard ──
+# Terra interactive runtimes have a BOUNDED session/credential lifetime
+# (commonly ~24h). A notebook that runs past it can lose its Terra/GCS
+# credentials MID-RUN and fail in confusing, hard-to-diagnose ways (partial
+# writes, sudden auth errors). papermill --execution-timeout is PER-CELL, so a
+# multi-cell notebook otherwise has NO total ceiling. We wrap each run in a
+# TOTAL wall-clock budget (the session window minus a safety margin) so a
+# too-long run is halted with a CLEAR, attributable status instead of silently
+# hitting the credential cliff. Genuinely long compute should use the
+# WDL/Cromwell path (Google Batch tasks auto-refresh their SA credentials and
+# are not bound by the interactive-runtime session window).
+MAX_RUN_HOURS="${MCP_TERRA_MAX_RUN_HOURS:-24}"
+case "$MAX_RUN_HOURS" in
+    ''|*[!0-9]*)
+        echo "[runner] MCP_TERRA_MAX_RUN_HOURS must be an integer; aborting." >&2
+        exit 6
+        ;;
+esac
+if [ "$MAX_RUN_HOURS" -lt 1 ] || [ "$MAX_RUN_HOURS" -gt 24 ]; then
+    echo "[runner] MCP_TERRA_MAX_RUN_HOURS must be 1..24; got $MAX_RUN_HOURS." >&2
+    exit 6
+fi
+SESSION_MARGIN_SEC="${MCP_TERRA_SESSION_MARGIN_SEC:-1800}"   # 30-min headroom
+case "$SESSION_MARGIN_SEC" in ''|*[!0-9]*) SESSION_MARGIN_SEC=1800 ;; esac
+SESSION_BUDGET_SEC=$(( MAX_RUN_HOURS * 3600 - SESSION_MARGIN_SEC ))
+[ "$SESSION_BUDGET_SEC" -lt 300 ] && SESSION_BUDGET_SEC=300   # floor 5 min
+# `timeout` (coreutils) must exist to enforce the wall-clock budget — fail loud
+# rather than silently run unbounded.
+command -v timeout >/dev/null 2>&1 || {
+    echo "[runner] coreutils 'timeout' not found; cannot enforce the session budget. Aborting." >&2
+    exit 5;
+}
+echo "[runner] per-run wall-clock budget: ${SESSION_BUDGET_SEC}s (Terra ~${MAX_RUN_HOURS}h session window minus ${SESSION_MARGIN_SEC}s margin)"
+
 # Install pinned deps ONCE at startup (not in the polling loop)
 pip install --no-input \
     --index-url https://pypi.org/simple/ \
@@ -603,21 +637,39 @@ PYVERIFY
         # env. Otherwise any notebook running under papermill can read
         # os.environ["MCP_TERRA_RUNNER_SECRET"] and exfil — that would
         # undo the entire HMAC defense.
+        #
+        # The per-cell timeout can never exceed the TOTAL session budget, and
+        # the whole papermill invocation is wrapped in `timeout` so the run is
+        # halted at the session budget (TERM, then KILL after 60s grace) rather
+        # than hitting the Terra credential cliff. `timeout` exits 124 when it
+        # has to stop the job — we surface that as a clear session-limit result.
+        PER_CELL_SEC=$(( TIMEOUT_MIN * 60 ))
+        [ "$PER_CELL_SEC" -gt "$SESSION_BUDGET_SEC" ] && PER_CELL_SEC=$SESSION_BUDGET_SEC
+        RUN_STARTED_AT=$(date +%s)
         set +e
-        env -u MCP_TERRA_RUNNER_SECRET \
+        timeout --signal=TERM --kill-after=60 "${SESSION_BUDGET_SEC}s" \
+            env -u MCP_TERRA_RUNNER_SECRET \
             -u MCP_TERRA_ALLOW_WRITES \
             -u MCP_TERRA_WORKSPACE \
             -u MCP_TERRA_KILL_REFUSAL_THRESHOLD \
             -u MCP_TERRA_KILL_REFUSAL_WINDOW_SEC \
             -u MCP_TERRA_MAX_CALLS_PER_MIN \
             -u MCP_TERRA_SPEC_MAX_AGE_SEC \
-            papermill --execution-timeout $((TIMEOUT_MIN * 60)) \
+            papermill --execution-timeout $PER_CELL_SEC \
                       -k python3 \
                       --parameters_yaml "$PARAMS_JSON" \
                       "$LOCAL_NB" "$LOCAL_OUT" \
                       > "$WORK/$JOB_ID.stdout" 2> "$WORK/$JOB_ID.stderr"
         RC=$?
         set -e
+        RUN_ENDED_AT=$(date +%s)
+        # coreutils `timeout` returns 124 on TERM-timeout (or 137 if the KILL
+        # grace was needed). Either means we stopped the run at the budget.
+        SESSION_LIMITED=0
+        if [ "$RC" -eq 124 ] || [ "$RC" -eq 137 ]; then
+            SESSION_LIMITED=1
+            echo "[runner] job $JOB_ID exceeded the ${SESSION_BUDGET_SEC}s session wall-clock budget; halted before the Terra session/credential window. Use the WDL/Cromwell path for runs this long." >&2
+        fi
 
         # Synthesize result.json via env-passing python (no shell→python source).
         RESULT_LOCAL="$WORK/$JOB_ID.result.json"
@@ -626,6 +678,10 @@ PYVERIFY
         LOCAL_NB_VAR="$LOCAL_NB" \
         LOCAL_OUT_VAR="$LOCAL_OUT" \
         RESULT_LOCAL_VAR="$RESULT_LOCAL" \
+        RUN_STARTED_AT_VAR="$RUN_STARTED_AT" \
+        RUN_ENDED_AT_VAR="$RUN_ENDED_AT" \
+        SESSION_BUDGET_SEC_VAR="$SESSION_BUDGET_SEC" \
+        SESSION_LIMITED_VAR="$SESSION_LIMITED" \
         MCP_TERRA_RUNNER_SECRET="$MCP_TERRA_RUNNER_SECRET" \
         python3 - <<'PYRESULT'
 import base64
@@ -641,6 +697,20 @@ local_nb  = os.environ["LOCAL_NB_VAR"]
 local_out = os.environ["LOCAL_OUT_VAR"]
 out_path  = os.environ["RESULT_LOCAL_VAR"]
 secret    = os.environ["MCP_TERRA_RUNNER_SECRET"]
+
+
+def _int_env(name):
+    try:
+        return int(os.environ.get(name, "") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+run_started_at    = _int_env("RUN_STARTED_AT_VAR")
+run_ended_at      = _int_env("RUN_ENDED_AT_VAR")
+session_budget    = _int_env("SESSION_BUDGET_SEC_VAR")
+session_limited   = os.environ.get("SESSION_LIMITED_VAR", "0") == "1"
+elapsed_sec       = (run_ended_at - run_started_at) if (run_started_at and run_ended_at) else None
 
 import re
 
@@ -732,7 +802,20 @@ for i, c in enumerate(nb.cells):
 payload = {
     "job_id": job_id,
     "rc": rc,
-    "status": "succeeded" if rc == 0 else "FAILED",
+    "status": ("succeeded" if rc == 0
+               else ("FAILED-SESSION-LIMIT" if session_limited else "FAILED")),
+    "elapsed_sec": elapsed_sec,
+    "session_budget_sec": session_budget or None,
+    "session_limited": session_limited,
+    # Set only when the run was halted at the Terra session/credential window.
+    "session_limit_note": (
+        "This run was halted at the per-run wall-clock budget "
+        f"({session_budget}s) to stay inside Terra's ~24h interactive "
+        "session/credential window — it did NOT finish. Results may be "
+        "partial. For compute this long, use the WDL/Cromwell path "
+        "(terra_submit_workflow): Google Batch tasks auto-refresh their "
+        "service-account credentials and are not bound by the interactive "
+        "runtime session window." if session_limited else None),
     "cell_count": len(nb.cells),
     "failed_cell_index": failed_cell_index,
     # Bare strings deliberately set to None — the agent must base64-decode

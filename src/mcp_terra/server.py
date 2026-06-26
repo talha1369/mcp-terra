@@ -1263,7 +1263,16 @@ def terra_submit_notebook_job(notebook_gcs: str, bucket_uri: str,
         bucket_uri:   workspace bucket root (gs://...).
         parameters_json: JSON string of papermill parameters to inject.
                          Default '{}' for no parameters.
-        timeout_minutes: per-cell execution timeout (default 360).
+        timeout_minutes: PER-CELL execution timeout (default 360, max 1440).
+                         This is NOT the total run time — the whole run is
+                         additionally bounded by a per-run wall-clock budget
+                         derived from Terra's ~24h interactive session/
+                         credential window (MCP_TERRA_MAX_RUN_HOURS, default
+                         24, minus a safety margin). A run that exceeds that
+                         budget is halted with status='FAILED-SESSION-LIMIT'
+                         (results may be partial) rather than hitting the
+                         credential cliff mid-run. For jobs that may run that
+                         long, use the WDL/Cromwell path (terra_submit_workflow).
         auto_stop_after_completion: if True, the on-VM runner halts the VM
                          (via `gcloud compute instances stop`) AFTER a
                          SUCCESSFUL run (rc=0) — saves compute cost when
@@ -1435,6 +1444,16 @@ def terra_submit_notebook_job(notebook_gcs: str, bucket_uri: str,
         "executed_notebook_gcs": paths["executed_notebook"],
         "hint": ("Poll terra_get_notebook_job_result(bucket_uri, job_id) "
                  "every ~30s. The runner picks up jobs within 15s."),
+        "session_limit_advisory": (
+            f"Each on-VM run is capped to a per-run wall-clock budget derived "
+            f"from Terra's ~{policy.max_run_hours()}h interactive session/"
+            f"credential window (minus a safety margin). `timeout_minutes` "
+            f"({timeout_minutes}) is PER-CELL, not total. A run that exceeds the "
+            f"budget is HALTED with status='FAILED-SESSION-LIMIT' (results may be "
+            f"partial) — never silently truncated. For compute likely to exceed "
+            f"~{max(1, policy.max_run_hours() - 1)}h, prefer the WDL/Cromwell path "
+            f"(terra_submit_workflow): Batch tasks auto-refresh credentials and "
+            f"are not bound by the interactive-runtime window."),
     })
 
 
@@ -2474,9 +2493,17 @@ def terra_get_workflow_logs(namespace: str, name: str,
                     try:
                         safety.safe_bucket_uri(stderr_path)
                         cap = min(int(max_bytes), _TOTAL_BYTE_BUDGET - bytes_used)
-                        txt = bk.read_object(stderr_path, max_bytes=cap).get("text", "")
+                        _r = bk.read_object(stderr_path, max_bytes=cap)
+                        txt = _r.get("text", "")
                         bytes_used += len(txt.encode("utf-8", "replace"))
                         entry["stderr_tail"] = txt
+                        # Codex: read_object reports whether the object had MORE
+                        # bytes past the window. Surface it per-task AND roll it
+                        # into the top-level flag, so a partial stderr is never
+                        # returned with truncated=false (hiding the real error).
+                        entry["stderr_truncated"] = bool(_r.get("truncated"))
+                        if entry["stderr_truncated"]:
+                            truncated = True
                     except (safety.SafetyError, bk.BucketError) as e:
                         entry["stderr_tail"] = f"[could not read stderr: {type(e).__name__}]"
             tasks.append(entry)
@@ -2510,18 +2537,31 @@ def terra_get_method_config(namespace: str, name: str,
     mc = tc.rawls_get_method_config(token, namespace, name,
                                     config_namespace, config_name)
     # Controlled-access: direct-input configs embed literal VALUES (sample ids,
-    # gs:// paths). Project to the method ref + param KEY NAMES only. (Codex.)
+    # gs:// paths). Codex round-4 also flagged that the input/output KEY NAMES
+    # are operator-controlled free text that could themselves encode identifiers
+    # (sample/DUO/consent ids, object-prefix hints). So in guard mode we drop the
+    # key-name lists entirely and return only param COUNTS plus the method
+    # reference + root entity type (method-registry schema, not workspace data),
+    # which is enough to select/verify a config. (config_namespace/config_name
+    # are echoes of the caller's OWN arguments — no new disclosure.)
     if policy.controlled_access_enabled() and isinstance(mc, dict):
+        mrm = mc.get("methodRepoMethod") or {}
         mc = {
-            "namespace": mc.get("namespace"),
-            "name": mc.get("name"),
-            "methodRepoMethod": mc.get("methodRepoMethod"),
+            "namespace": config_namespace,
+            "name": config_name,
+            "methodRepoMethod": ({
+                "methodNamespace": mrm.get("methodNamespace"),
+                "methodName": mrm.get("methodName"),
+                "methodVersion": mrm.get("methodVersion"),
+            } if isinstance(mrm, dict) else None),
             "rootEntityType": mc.get("rootEntityType"),
-            "input_keys": sorted((mc.get("inputs") or {}).keys()),
-            "output_keys": sorted((mc.get("outputs") or {}).keys()),
+            "input_count": len(mc.get("inputs") or {}),
+            "output_count": len(mc.get("outputs") or {}),
             "_controlled_access_withheld": (
-                "input/output VALUES withheld (MCP_TERRA_CONTROLLED_ACCESS); "
-                "key names only"),
+                "input/output VALUES AND key names withheld "
+                "(MCP_TERRA_CONTROLLED_ACCESS) — counts only; key names are "
+                "operator-controlled free text that could encode identifiers. "
+                "Disable the guard for a non-controlled workspace to see them."),
         }
     return _ok(mc)
 

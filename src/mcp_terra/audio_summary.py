@@ -233,12 +233,18 @@ def synthesize_say(text: str, *, voice: str = "") -> bytes:
     fd, tmp = tempfile.mkstemp(prefix="mcp_say_", suffix=".m4a")
     os.close(fd)
     try:
+        # SECURITY (Codex): never put the summary TEXT in argv — argv is
+        # world-readable via `ps`/process accounting on a multi-user host, so a
+        # controlled-data summary in argv would be an egress path even with the
+        # local backend. `say` reads the text to speak from STDIN when no string
+        # operand is given, so we feed it via stdin and keep argv to flags only
+        # (output path + voice name — neither is sensitive).
         args = [say_bin, "-o", tmp]
         if voice:
             args += ["-v", voice]
-        args.append(safe_text)          # ARGV — no shell, no injection
         try:
-            r = subprocess.run(args, capture_output=True, timeout=120, check=False)
+            r = subprocess.run(args, input=safe_text.encode("utf-8"),
+                               capture_output=True, timeout=120, check=False)
         except subprocess.TimeoutExpired:
             raise AudioSummaryError("`say` timed out")
         if r.returncode != 0:

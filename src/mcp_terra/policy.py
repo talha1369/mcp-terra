@@ -98,6 +98,19 @@ def controlled_access_enabled() -> bool:
     return _CONTROLLED_ACCESS
 
 
+def max_run_hours() -> int:
+    """The Terra interactive-session/credential window (hours) used to bound a
+    single on-VM notebook run, so a long run is halted with a clear status
+    instead of hitting the ~24h credential cliff mid-execution. The on-VM
+    runner reads the SAME env (MCP_TERRA_MAX_RUN_HOURS) independently; this
+    helper is the submit-side mirror for the user-facing advisory. Clamp 1..24."""
+    try:
+        h = int(os.environ.get("MCP_TERRA_MAX_RUN_HOURS", "24") or "24")
+    except (TypeError, ValueError):
+        h = 24
+    return max(1, min(h, 24))
+
+
 def is_egress_allowed_bucket(bucket: str) -> bool:
     """True if `bucket` may have its DATA returned to the LLM even under the
     controlled-access guard — an EXACT-name match against a known PUBLIC

@@ -3311,8 +3311,8 @@ def _():
 @case("CC-Retry", "GET retries on 429 then succeeds")
 def _():
     from mcp_terra import terra_client as _t
-    saved = (_t.httpx.Client, _t.time.sleep)
-    _t.time.sleep = lambda *a, **k: None
+    saved = (_t.httpx.Client, _t._interruptible_sleep)
+    _t._interruptible_sleep = lambda s: True   # skip real backoff
     fc = _FakeClient([_FakeResp(429, headers={"Retry-After": "0"}),
                       _FakeResp(200, '{"ok": 1}')])
     _t.httpx.Client = lambda *a, **k: fc
@@ -3320,14 +3320,14 @@ def _():
         out = _t._request("rawls", "GET", "https://x", "/p", "tok")
         assert out == {"ok": 1} and fc.calls == 2
     finally:
-        (_t.httpx.Client, _t.time.sleep) = saved
+        (_t.httpx.Client, _t._interruptible_sleep) = saved
 
 
 @case("CC-Retry", "POST is NOT retried (no double-submit) on 429")
 def _():
     from mcp_terra import terra_client as _t
-    saved = (_t.httpx.Client, _t.time.sleep)
-    _t.time.sleep = lambda *a, **k: None
+    saved = (_t.httpx.Client, _t._interruptible_sleep)
+    _t._interruptible_sleep = lambda s: True
     fc = _FakeClient([_FakeResp(429), _FakeResp(200)])
     _t.httpx.Client = lambda *a, **k: fc
     try:
@@ -3335,14 +3335,14 @@ def _():
                                        json_body={}), _t.TerraAPIError)
         assert fc.calls == 1, f"POST must be attempted once; got {fc.calls}"
     finally:
-        (_t.httpx.Client, _t.time.sleep) = saved
+        (_t.httpx.Client, _t._interruptible_sleep) = saved
 
 
 @case("CC-Retry", "GET retries are bounded (exhaust → raise)")
 def _():
     from mcp_terra import terra_client as _t
-    saved = (_t.httpx.Client, _t.time.sleep, _t._MAX_RETRIES)
-    _t.time.sleep = lambda *a, **k: None
+    saved = (_t.httpx.Client, _t._interruptible_sleep, _t._MAX_RETRIES)
+    _t._interruptible_sleep = lambda s: True
     _t._MAX_RETRIES = 2
     fc = _FakeClient([_FakeResp(503)])                   # always 503
     _t.httpx.Client = lambda *a, **k: fc
@@ -3351,14 +3351,14 @@ def _():
                    _t.TerraAPIError)
         assert fc.calls == 3, f"1 + 2 retries = 3 attempts; got {fc.calls}"
     finally:
-        (_t.httpx.Client, _t.time.sleep, _t._MAX_RETRIES) = saved
+        (_t.httpx.Client, _t._interruptible_sleep, _t._MAX_RETRIES) = saved
 
 
 @case("CC-Retry", "non-retryable 4xx (404) is NOT retried")
 def _():
     from mcp_terra import terra_client as _t
-    saved = (_t.httpx.Client, _t.time.sleep)
-    _t.time.sleep = lambda *a, **k: None
+    saved = (_t.httpx.Client, _t._interruptible_sleep)
+    _t._interruptible_sleep = lambda s: True
     fc = _FakeClient([_FakeResp(404, "not found")])
     _t.httpx.Client = lambda *a, **k: fc
     try:
@@ -3366,7 +3366,7 @@ def _():
                    _t.TerraAPIError)
         assert fc.calls == 1, "a 404 is deterministic — no retry"
     finally:
-        (_t.httpx.Client, _t.time.sleep) = saved
+        (_t.httpx.Client, _t._interruptible_sleep) = saved
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -3461,36 +3461,125 @@ def _():
 # CC-ControlledAccess3 — round-4 egress closure across ALL data-returning tools
 # ──────────────────────────────────────────────────────────────────────────
 
-@case("CC-ControlledAccess3", "META: every data-returning tool carries a controlled-access check")
-def _():
+# Every registered tool MUST be explicitly classified into exactly one of these
+# two sets. Tools that return raw workspace DATA to the LLM must carry a runtime
+# controlled-access guard (verified by AST, NOT substring — a docstring mention
+# can't satisfy it). NO_DATA tools are writes/control/notifications/metadata/
+# schema/status/cost that do not egress workspace data rows/objects to the model.
+# A NEW tool that is not added to either set FAILS the meta-test (fail-closed):
+# the author must classify it, and if it returns data, guard it. (Codex round-4.)
+_DATA_TOOLS_REQUIRING_GUARD = {
+    "terra_read_bucket_object", "terra_list_bucket", "terra_get_entities",
+    "terra_get_method_config", "terra_get_submission", "terra_get_workflow_outputs",
+    "terra_get_workflow_metadata", "terra_get_workflow_logs", "terra_get_run_log",
+    "terra_get_notebook_job_result", "terra_get_batch_job_status",
+    "terra_render_audio_summary",
+}
+_NO_DATA_TOOLS = {
+    # writes / control (no workspace-data return)
+    "terra_create_method_config", "terra_create_runtime", "terra_register_method",
+    "terra_submit_workflow", "terra_submit_notebook_job", "terra_upload_to_bucket",
+    "terra_install_notebook_runner", "terra_start_runner_on_vm",
+    "terra_start_runtime", "terra_stop_runtime", "terra_killswitch_trip",
+    "terra_refresh_workspace_allowlist", "terra_write_run_record",
+    # notifications / delivery (recipient-locked; not a Terra→LLM egress path)
+    "terra_notify_desktop", "terra_notify_slack", "terra_send_run_report_email",
+    # identity / posture / runtime-config (not workspace data)
+    "terra_whoami", "terra_health", "terra_killswitch_status",
+    "terra_get_runtime", "terra_list_runtimes", "terra_recommend_runtime_for_notebook",
+    # metadata / schema / status / cost / listings (no raw data rows/objects)
+    "terra_get_workspace", "terra_list_workspaces", "terra_list_method_configs",
+    "terra_list_data_tables", "terra_list_submissions", "terra_get_workflow_cost",
+    "terra_get_bucket_object_metadata",
+    # downloads to LOCAL disk (content never returned to the LLM; the host's
+    # compliance — not the LLM-egress guard — governs local copies) + external
+    # doc fetch (ingest, not egress)
+    "terra_download_from_bucket", "terra_fetch_url",
+}
+
+
+def _tool_has_ast_guard(fn) -> bool:
+    """True iff the function BODY contains a CALL to a controlled-access guard —
+    parsed via AST so a docstring/comment mention cannot satisfy it."""
+    import ast
     import inspect
-    DATA_TOOLS = [
-        "terra_read_bucket_object", "terra_get_entities", "terra_list_bucket",
-        "terra_get_method_config", "terra_get_submission", "terra_get_workflow_outputs",
-        "terra_get_workflow_metadata", "terra_get_workflow_logs", "terra_get_run_log",
-        "terra_get_notebook_job_result", "terra_get_batch_job_status",
-        "terra_render_audio_summary"]
-    markers = ("controlled_access_enabled", "assert_data_egress_allowed",
-               "assert_no_controlled_data_egress")
-    missing = [nm for nm in DATA_TOOLS
-               if not any(m in inspect.getsource(getattr(server, nm)) for m in markers)]
-    assert not missing, f"data-returning tools missing a controlled-access check: {missing}"
+    guards = {"controlled_access_enabled", "assert_data_egress_allowed",
+              "assert_no_controlled_data_egress"}
+    try:
+        tree = ast.parse(inspect.getsource(fn))
+    except (OSError, SyntaxError):
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            f = node.func
+            nm = (f.attr if isinstance(f, ast.Attribute)
+                  else f.id if isinstance(f, ast.Name) else "")
+            if nm in guards:
+                return True
+    return False
 
 
-@case("CC-ControlledAccess3", "method_config projects to KEY NAMES in controlled mode")
+@case("CC-ControlledAccess3", "META(fail-closed): every tool classified + every data tool AST-guarded")
+def _():
+    registered = set(server.server._tool_manager._tools.keys())
+    classified = _DATA_TOOLS_REQUIRING_GUARD | _NO_DATA_TOOLS
+    # (1) no overlap between the two sets
+    overlap = _DATA_TOOLS_REQUIRING_GUARD & _NO_DATA_TOOLS
+    assert not overlap, f"tools classified BOTH data + no-data: {sorted(overlap)}"
+    # (2) classification sets reference only real tools (no stale entries)
+    stale = classified - registered
+    assert not stale, f"classified tools that are not registered: {sorted(stale)}"
+    # (3) FAIL-CLOSED: every registered tool must be explicitly classified.
+    unclassified = registered - classified
+    assert not unclassified, (
+        f"unclassified tool(s) — add to _DATA_TOOLS_REQUIRING_GUARD (and guard "
+        f"them) or _NO_DATA_TOOLS: {sorted(unclassified)}")
+    # (4) every data-returning tool actually has a runtime guard CALL (AST).
+    unguarded = [t for t in _DATA_TOOLS_REQUIRING_GUARD
+                 if not _tool_has_ast_guard(getattr(server, t))]
+    assert not unguarded, f"data tools missing a runtime controlled-access guard: {unguarded}"
+
+
+@case("CC-ControlledAccess3", "method_config: a sentinel identifier in an input KEY never egresses (controlled)")
+def _():
+    from mcp_terra import policy as _p
+    saved, om, ot = _p._CONTROLLED_ACCESS, _tc.rawls_get_method_config, server.auth.get_access_token
+    SENTINEL = "DUO-0000042-CONSENT-NA12878"
+    _tc.rawls_get_method_config = lambda *a, **k: {
+        "namespace": "cns", "name": "cn",
+        "methodRepoMethod": {"methodNamespace": "m", "methodName": "wf", "methodVersion": 3},
+        "rootEntityType": "sample",
+        # the identifier is encoded in the KEY NAME, not just the value
+        "inputs": {f"wf.{SENTINEL}": "gs://x/y", "wf.normal": "z"},
+        "outputs": {f"wf.out_{SENTINEL}": "o"}}
+    server.auth.get_access_token = lambda: "tok"
+    try:
+        _p._CONTROLLED_ACCESS = True
+        out = server.terra_get_method_config("ns", "ws", "cns", "cn")
+        assert SENTINEL not in out, "sentinel identifier leaked via a key name!"
+        assert '"input_count": 2' in out and '"output_count": 1' in out
+    finally:
+        _p._CONTROLLED_ACCESS, _tc.rawls_get_method_config, server.auth.get_access_token = saved, om, ot
+
+
+@case("CC-ControlledAccess3", "method_config projects to COUNTS (no values, no key names) in controlled mode")
 def _():
     from mcp_terra import policy as _p
     saved, om, ot = _p._CONTROLLED_ACCESS, _tc.rawls_get_method_config, server.auth.get_access_token
     _tc.rawls_get_method_config = lambda *a, **k: {
-        "namespace": "cns", "name": "cn", "methodRepoMethod": {"methodVersion": 3},
+        "namespace": "cns", "name": "cn",
+        "methodRepoMethod": {"methodNamespace": "m", "methodName": "wf", "methodVersion": 3},
         "rootEntityType": "sample",
         "inputs": {"wf.x": "gs://controlled/secret.vcf"}, "outputs": {"wf.y": "controlled-out"}}
     server.auth.get_access_token = lambda: "tok"
     try:
         _p._CONTROLLED_ACCESS = True
         out = server.terra_get_method_config("ns", "ws", "cns", "cn")
+        # neither VALUES nor KEY NAMES leak; only counts + method ref + entity type
         assert "secret.vcf" not in out and "controlled-out" not in out
-        assert "input_keys" in out and "wf.x" in out
+        assert "wf.x" not in out and "wf.y" not in out
+        assert '"input_count": 1' in out and '"output_count": 1' in out
+        assert '"rootEntityType": "sample"' in out and '"methodVersion": 3' in out
     finally:
         _p._CONTROLLED_ACCESS, _tc.rawls_get_method_config, server.auth.get_access_token = saved, om, ot
 
@@ -3537,6 +3626,31 @@ def _():
         _bk2.read_object, safety.safe_bucket_uri = oread, osafe
 
 
+@case("CC-ControlledAccess3", "workflow_logs flags per-task stderr truncation (no false truncated=false)")
+def _():
+    from mcp_terra import policy as _p, bucket as _bk2
+    saved = _p._CONTROLLED_ACCESS
+    ows, omd, ot = _tc.rawls_get_workspace, _tc.rawls_get_workflow_metadata, server.auth.get_access_token
+    oread, osafe = _bk2.read_object, safety.safe_bucket_uri
+    _tc.rawls_get_workspace = lambda *a, **k: {"workspace": {"bucketName": "fc-secure-x"}}
+    _tc.rawls_get_workflow_metadata = lambda *a, **k: {"status": "Failed", "calls": {
+        "wf.t": [{"executionStatus": "Failed", "shardIndex": 0,
+                  "stderr": "gs://fc-secure-x/exec/stderr"}]}}
+    server.auth.get_access_token = lambda: "tok"
+    safety.safe_bucket_uri = lambda u: u
+    # read_object reports there is MORE past the window → truncated must surface
+    _bk2.read_object = lambda uri, max_bytes=0: {"text": "head...", "truncated": True}
+    try:
+        _p._CONTROLLED_ACCESS = False
+        out = server.terra_get_workflow_logs("ns", "ws", "sub", "wf")
+        assert '"stderr_truncated": true' in out, "per-task truncation must be reported"
+        assert '"truncated": true' in out, "top-level truncated must reflect a partial stderr"
+    finally:
+        _p._CONTROLLED_ACCESS = saved
+        _tc.rawls_get_workspace, _tc.rawls_get_workflow_metadata, server.auth.get_access_token = ows, omd, ot
+        _bk2.read_object, safety.safe_bucket_uri = oread, osafe
+
+
 @case("CC-ControlledAccess3", "list_bucket / batch / audio enforce controlled-access (source)")
 def _():
     import inspect
@@ -3554,11 +3668,53 @@ def _():
     saved = _t.abort_check
     _t.abort_check = lambda: True
     try:
-        assert _t._retry_ok(_t.time.monotonic(), 1, None) is False, "kill-switch must abort retries"
+        # _retry_ok returns the backoff delay, or None to STOP. Kill-switch → None.
+        assert _t._retry_ok(_t.time.monotonic(), 1, None) is None, "kill-switch must abort retries"
+        # interruptible sleep wakes immediately when the kill-switch is tripped.
+        assert _t._interruptible_sleep(5.0) is False, "kill-switch must wake the backoff sleep"
+        assert _t._aborted() is True
     finally:
         _t.abort_check = saved
     import inspect
     assert "_RETRY_TOTAL_BUDGET_SEC" in inspect.getsource(_t._retry_ok)
+    # the request loop re-checks the kill-switch BEFORE each attempt + caps each
+    # attempt's timeout to the remaining deadline (no blow-past on a hung retry)
+    rsrc = inspect.getsource(_t._request)
+    assert "_aborted()" in rsrc and "_deadline" in rsrc and "_req_timeout" in rsrc
+
+
+@case("CC-ControlledAccess3", "audio `say` feeds text via STDIN, never argv (no process-table egress)")
+def _():
+    import subprocess as _sp
+    import sys
+    if sys.platform != "darwin":
+        return  # the `say` backend is macOS-only
+    from mcp_terra import audio_summary as _a
+    cap = {}
+    real = _sp.run
+
+    class _R:
+        returncode = 0
+        stderr = b""
+
+    def _fake(args, *a, **k):
+        cap["args"] = list(args)
+        cap["input"] = k.get("input")
+        outp = args[args.index("-o") + 1]   # write a plausible audio file
+        with open(outp, "wb") as fh:
+            fh.write(b"\x00" * 4096)
+        return _R()
+
+    _sp.run = _fake
+    try:
+        sentinel = ("The validation run succeeded; result sentinel "
+                    "NA12878zzz r squared zero point nine nine six.")
+        assert 50 <= len(sentinel) <= 4000
+        _a.synthesize_say(sentinel, voice="Samantha")
+        assert "NA12878zzz" not in " ".join(cap["args"]), "summary text must NOT be in say argv"
+        assert cap["input"] == sentinel.encode("utf-8"), "text must be fed via stdin"
+    finally:
+        _sp.run = real
 
 
 @case("CC-ControlledAccess3", "terra://health resource is minimal + data-free")
@@ -3569,6 +3725,59 @@ def _():
                  "code_integrity_sha256", "runner_heartbeat"):
         assert leak not in h, f"health resource leaks {leak}"
     assert "tools_count" in h and "controlled_access" in h
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# CC-SessionLimit — Terra ~24h session/credential-window guard (no abrupt kills)
+# ──────────────────────────────────────────────────────────────────────────
+
+@case("CC-SessionLimit", "policy.max_run_hours clamps to 1..24 with safe defaults")
+def _():
+    import os as _os
+    from mcp_terra import policy as _p
+    saved = _os.environ.get("MCP_TERRA_MAX_RUN_HOURS")
+    try:
+        _os.environ.pop("MCP_TERRA_MAX_RUN_HOURS", None)
+        assert _p.max_run_hours() == 24, "default must be 24"
+        _os.environ["MCP_TERRA_MAX_RUN_HOURS"] = "6"
+        assert _p.max_run_hours() == 6
+        _os.environ["MCP_TERRA_MAX_RUN_HOURS"] = "999"
+        assert _p.max_run_hours() == 24, "must clamp above 24"
+        _os.environ["MCP_TERRA_MAX_RUN_HOURS"] = "0"
+        assert _p.max_run_hours() == 1, "must clamp below 1"
+        _os.environ["MCP_TERRA_MAX_RUN_HOURS"] = "garbage"
+        assert _p.max_run_hours() == 24, "non-int must fall back to 24"
+    finally:
+        if saved is None:
+            _os.environ.pop("MCP_TERRA_MAX_RUN_HOURS", None)
+        else:
+            _os.environ["MCP_TERRA_MAX_RUN_HOURS"] = saved
+
+
+@case("CC-SessionLimit", "runner enforces a TOTAL wall-clock budget (timeout wrapper)")
+def _():
+    from mcp_terra import notebook_runner as nbr
+    s = nbr.runner_script_template()
+    # Total budget computed from the session window (hours), minus a margin.
+    assert "MCP_TERRA_MAX_RUN_HOURS" in s and "SESSION_BUDGET_SEC" in s
+    assert "SESSION_MARGIN_SEC" in s
+    # The WHOLE papermill run is wrapped in coreutils `timeout` (TERM→KILL).
+    assert "timeout --signal=TERM --kill-after=60" in s
+    assert "command -v timeout" in s, "must fail loud if timeout(1) is missing"
+    # Per-cell timeout can never exceed the total budget.
+    assert "PER_CELL_SEC" in s and "PER_CELL_SEC=$SESSION_BUDGET_SEC" in s
+    # A halted run is attributable + fail-loud, never silently truncated.
+    assert "FAILED-SESSION-LIMIT" in s and "session_limit_note" in s
+    assert "elapsed_sec" in s
+
+
+@case("CC-SessionLimit", "submit tool advises the 24h limit + WDL path for long runs")
+def _():
+    import inspect
+    src = inspect.getsource(server.terra_submit_notebook_job)
+    assert "session_limit_advisory" in src
+    assert "policy.max_run_hours()" in src
+    assert "FAILED-SESSION-LIMIT" in src and "terra_submit_workflow" in src
 
 
 # ──────────────────────────────────────────────────────────────────────────

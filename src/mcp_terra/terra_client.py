@@ -46,17 +46,45 @@ _RETRY_TOTAL_BUDGET_SEC = max(
 abort_check = None  # type: ignore[var-annotated]
 
 
-def _retry_ok(start_monotonic: float, attempt: int, retry_after: float | None) -> bool:
-    """Whether to perform another retry: not cancelled, and the NEXT backoff
-    won't push total retry time past the budget."""
-    if abort_check is not None:
-        try:
-            if abort_check():
-                return False
-        except Exception:
-            pass
+def _aborted() -> bool:
+    """True if the kill-switch hook says stop. Fail-SAFE: never raises (a broken
+    hook must not wedge a request)."""
+    if abort_check is None:
+        return False
+    try:
+        return bool(abort_check())
+    except Exception:
+        return False
+
+
+def _interruptible_sleep(seconds: float) -> bool:
+    """Sleep up to `seconds`, waking early if the kill-switch trips. Sleeps in
+    short slices so a kill-file created mid-backoff is noticed within ~0.2s
+    instead of after the whole delay. Returns True if it slept the full time,
+    False if it was aborted partway."""
+    end = time.monotonic() + max(0.0, seconds)
+    while True:
+        if _aborted():
+            return False
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            return True
+        time.sleep(min(0.2, remaining))
+
+
+def _retry_ok(start_monotonic: float, attempt: int,
+              retry_after: float | None) -> float | None:
+    """Decide whether to perform another retry, returning the backoff delay to
+    use (or None to STOP). Computing the jittered delay HERE — once — guarantees
+    the budget check and the actual sleep use the SAME value (no recompute
+    drift). Returns None if the kill-switch tripped, or if the next backoff
+    would push total retry time past `_RETRY_TOTAL_BUDGET_SEC`."""
+    if _aborted():
+        return None
     delay = _retry_delay(attempt, retry_after)
-    return (time.monotonic() - start_monotonic) + delay <= _RETRY_TOTAL_BUDGET_SEC
+    if (time.monotonic() - start_monotonic) + delay > _RETRY_TOTAL_BUDGET_SEC:
+        return None
+    return delay
 
 
 def _parse_retry_after(value: str | None) -> float | None:
@@ -121,28 +149,46 @@ def _request(service: str, method: str, base: str, path: str, token: str,
     idempotent = method.upper() in ("GET", "HEAD")
     max_attempts = (1 + _MAX_RETRIES) if idempotent else 1
     _start = time.monotonic()
-    with httpx.Client(timeout=timeout, trust_env=False,
-                       follow_redirects=False) as client:
+    # Total wall-clock is bounded: the first attempt's own timeout PLUS the retry
+    # budget. Each attempt's timeout is then capped to whatever remains, so a
+    # hung retry can never blow far past the budget — and the kill-switch is
+    # re-checked before every attempt and during every backoff. (Codex.)
+    _deadline = _start + float(timeout) + _RETRY_TOTAL_BUDGET_SEC
+    resp = None
+    with httpx.Client(trust_env=False, follow_redirects=False) as client:
         for attempt in range(1, max_attempts + 1):
+            if _aborted():
+                raise TerraAPIError(service, method, path, 0,
+                                    "aborted by kill-switch before request")
+            _remaining = _deadline - time.monotonic()
+            if _remaining <= 0:
+                raise TerraAPIError(service, method, path, 0,
+                                    "retry deadline exhausted")
+            _req_timeout = max(1.0, min(float(timeout), _remaining))
             try:
                 resp = client.request(method, url, headers=headers,
-                                      json=json_body, params=params)
+                                      json=json_body, params=params,
+                                      timeout=_req_timeout)
             except httpx.HTTPError as e:
-                if (idempotent and attempt < max_attempts
-                        and _retry_ok(_start, attempt, None)):
-                    time.sleep(_retry_delay(attempt, None))
-                    continue
+                if idempotent and attempt < max_attempts:
+                    _d = _retry_ok(_start, attempt, None)
+                    if _d is not None and _interruptible_sleep(_d):
+                        continue
                 raise TerraAPIError(service, method, path, 0,
                                     f"network error: {type(e).__name__}")
             if 200 <= resp.status_code < 300:
                 break
             if (idempotent and attempt < max_attempts
                     and resp.status_code in _RETRY_STATUSES):
-                _ra = _parse_retry_after(resp.headers.get("Retry-After"))
-                if _retry_ok(_start, attempt, _ra):   # within budget + not cancelled
-                    time.sleep(_retry_delay(attempt, _ra))
+                _d = _retry_ok(_start, attempt,
+                               _parse_retry_after(resp.headers.get("Retry-After")))
+                # _interruptible_sleep returns False if the kill-switch tripped
+                # mid-backoff → fall through to the non-2xx handler (fail loud).
+                if _d is not None and _interruptible_sleep(_d):
                     continue
             break   # non-retryable, exhausted, cancelled, or over budget → handle below
+    if resp is None:   # never assigned (all attempts aborted before a response)
+        raise TerraAPIError(service, method, path, 0, "no response (aborted)")
     if not (200 <= resp.status_code < 300):
         # Refuse to echo secrets even if a misbehaving Terra service echoed the
         # request back: the OAuth token, AND the runner HMAC secret (which

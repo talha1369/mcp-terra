@@ -40,7 +40,7 @@ compliance reviewer.
 | `terra_get_entities` (data-table rows) | allowed | **refused** (rows can carry controlled attributes) |
 | `terra_get_workflow_outputs` (output values) | allowed | **refused** (outputs are data + controlled paths) |
 | `terra_get_workflow_metadata` | allowed | **reduced** to `status` + `callsSummary` (inputs/outputs/failures withheld) |
-| `terra_get_method_config` (config contents) | allowed | **reduced** to method ref + param **key names** (direct-input values — sample ids, gs:// paths — withheld) |
+| `terra_get_method_config` (config contents) | allowed | **reduced** to method ref + entity type + param **counts** (direct-input values AND key names withheld — key names are operator-controlled free text that could encode identifiers) |
 | `terra_get_submission` (per-workflow detail) | allowed | **reduced** to submission/workflow **ids + statuses** (entity names + failure messages withheld) |
 | `terra_get_workflow_logs` (per-task stderr) | allowed (path bound to the queried workspace bucket) | **content AND paths withheld** (per-task status kept; stderr can print controlled data) |
 | `terra_get_run_log` (stdout/stderr) | allowed | **content withheld** (paths + status kept; a notebook can print controlled data) |
