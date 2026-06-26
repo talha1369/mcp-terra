@@ -214,6 +214,25 @@ tests exercise the templates in isolation, so these were latent):
     `terra_write_run_record` does a no-clobber **preflight** so it can't report
     success while `gsutil cp -n` silently skipped.
   - Guarded by 10 new regression tests (`CC-CodexFixes`).
+- **Adversarial-review hardening (Codex) — round 2** — 6 more findings on the
+  attachment/delivery work:
+  - **CRITICAL** — `assert_local_write_policy` matched blocklist prefixes with a
+    trailing slash, so EXACT protected directories (`/usr/bin`, `/bin`,
+    `/sbin`, `/System`, `/var/db`, `/var/root`, …) slipped past and
+    `version_existing` could rename them. Fixed: exact-or-under path matching;
+    the download tool also refuses `version_existing` on a directory.
+  - **HIGH** — the audio email/Slack attachment had no provenance (a caller
+    could stage bytes at `mcp_terra_jobs/<job>/summary.{mp3,m4a}` via a generic
+    upload). Fixed: that path is now RESERVED — `terra_upload_to_bucket` refuses
+    it, so only `terra_render_audio_summary` can produce it. The attachment size
+    cap now runs as a `gsutil stat` **preflight before download** (no
+    unbounded download/read).
+  - **MEDIUM** — Slack upload now **fails loud** when all targets fail (raises;
+    `partial_failure` flag when mixed); audio render preflights BOTH
+    `summary.{mp3,m4a}` before sending text to the backend; the run record is
+    **read back (md5)** after upload so a `cp -n` skip/race can't report a
+    write that didn't persist.
+  - Guarded by 7 new regression tests (`CC-CodexFixes2`).
 - **No delete primitive, by design** — no tool (and no `leo_delete_runtime`
   at any layer) deletes a runtime or persistent disk; teardown is the user's
   action in the Terra UI ("Keep persistent disk"). The MCP detects a

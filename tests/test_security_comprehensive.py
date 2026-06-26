@@ -2936,8 +2936,8 @@ def _():
     assert 'validate_identifier(job_id' in src, "job_id must be path-validated"
     assert "unlink(_tmp)" in src and "finally:" in src, "temp blob must be cleaned up"
     # both delivery channels go through the shared helper (no inline arbitrary path)
-    assert "_fetch_run_audio_bytes(job_id)" in inspect.getsource(server.terra_send_run_report_email)
-    assert "_fetch_run_audio_bytes(audio_job_id)" in inspect.getsource(server.terra_notify_slack)
+    assert "_fetch_run_audio_bytes(job_id," in inspect.getsource(server.terra_send_run_report_email)
+    assert "_fetch_run_audio_bytes(audio_job_id," in inspect.getsource(server.terra_notify_slack)
 
 
 # ── CC-SlackUpload — true Slack file attachment via the bot Web API ─────────
@@ -3020,11 +3020,95 @@ def _():
 def _():
     import inspect
     src = inspect.getsource(server.terra_notify_slack)
-    assert "slack_bot_configured()" in src and "_fetch_run_audio_bytes(audio_job_id)" in src
+    assert "slack_bot_configured()" in src and "_fetch_run_audio_bytes(audio_job_id," in src
     assert "slack_upload_file" in src and "send_slack(text)" in src
     params = set(inspect.signature(server.terra_notify_slack).parameters)
     assert not (params & {"url", "webhook", "token", "channel"}), \
         f"no destination/credential params allowed (env-locked): {params}"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# CC-CodexFixes2 — regressions for the 2nd adversarial-review round (6 findings)
+# ──────────────────────────────────────────────────────────────────────────
+
+@case("CC-CodexFixes2", "F1[critical] exact protected DIRS are blocked (trailing-slash fix)")
+def _():
+    for p in ("/usr/bin", "/usr/sbin", "/bin", "/sbin", "/System",
+              "/var/db", "/var/root"):
+        must_raise(safety.assert_local_write_policy, safety.SafetyError, p)
+    # still blocks files UNDER them, and still allows a normal temp path
+    must_raise(safety.assert_local_write_policy, safety.SafetyError, "/usr/bin/x")
+    import os as _o
+    import tempfile as _t
+    safety.assert_local_write_policy(_o.path.join(_t.mkdtemp(), "ok.txt"))
+
+
+@case("CC-CodexFixes2", "F1[critical] download refuses version_existing on a directory")
+def _():
+    import inspect
+    src = inspect.getsource(server.terra_download_from_bucket)
+    assert "target.is_dir()" in src and "versions single files only" in src
+
+
+@case("CC-CodexFixes2", "F2[high] reserved audio path: helper + upload refusal")
+def _():
+    assert safety.is_reserved_bucket_path("gs://b/mcp_terra_jobs/J1/summary.m4a")
+    assert safety.is_reserved_bucket_path("gs://b/mcp_terra_jobs/J1/summary.mp3")
+    assert not safety.is_reserved_bucket_path("gs://b/mcp_terra_jobs/J1/result.json")
+    assert not safety.is_reserved_bucket_path("gs://b/notebooks/x.ipynb")
+    import inspect
+    src = inspect.getsource(server.terra_upload_to_bucket)
+    assert "is_reserved_bucket_path" in src, "upload must refuse the reserved audio path"
+
+
+@case("CC-CodexFixes2", "F3[high] audio fetch size-preflights BEFORE download")
+def _():
+    import inspect
+    sig = inspect.signature(server._fetch_run_audio_bytes)
+    assert "max_bytes" in sig.parameters, "fetch must take a size cap"
+    src = inspect.getsource(server._fetch_run_audio_bytes)
+    assert "Content-Length" in src and "before download" in src.lower()
+    # the size check precedes the download call
+    assert src.index("max_bytes") < src.index("download_file"), \
+        "size cap must be enforced before the download"
+
+
+@case("CC-CodexFixes2", "F4[med] Slack fails LOUD when ALL targets fail")
+def _():
+    from mcp_terra import notify as _n
+    saved = (_n._SLACK_BOT_TOKEN, _n._SLACK_CHANNEL, _n._slack_upload_one)
+    try:
+        _n._SLACK_BOT_TOKEN, _n._SLACK_CHANNEL = "xoxb-fake", "C111, C222"
+
+        def _boom(*a, **k):
+            raise _n.NotifyError("simulated target failure")
+        _n._slack_upload_one = _boom          # channel targets resolve w/o network
+        must_raise(lambda: _n.slack_upload_file(b"audio" * 30,
+                   filename="summary.m4a"), _n.NotifyError)
+    finally:
+        (_n._SLACK_BOT_TOKEN, _n._SLACK_CHANNEL, _n._slack_upload_one) = saved
+    import inspect
+    assert "partial_failure" in inspect.getsource(_n.slack_upload_file)
+
+
+@case("CC-CodexFixes2", "F5[med] audio render preflights both ext BEFORE the TTS side-effect")
+def _():
+    import inspect
+    src = inspect.getsource(server.terra_render_audio_summary)
+    # the both-extension existence check must precede the render() call
+    assert 'for _e in ("mp3", "m4a")' in src
+    assert src.index('for _e in ("mp3", "m4a")') < src.index("audio_summary.render"), \
+        "no-clobber preflight must run before sending text to the backend"
+
+
+@case("CC-CodexFixes2", "F6[med] run-record read-back verifies md5 after upload")
+def _():
+    import inspect
+    src = inspect.getsource(server.terra_write_run_record)
+    assert "Hash \\(md5\\)" in src or "Hash (md5)" in src
+    assert "does NOT match" in src and "md5" in src
+    # verification happens after the upload, before returning success
+    assert src.index("bk.upload_file(tmp, dest") < src.index("does NOT match")
 
 
 # ──────────────────────────────────────────────────────────────────────────

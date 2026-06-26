@@ -348,9 +348,10 @@ def safe_local_write_path(p: str) -> Path:
     s = str(target)
     s_norm = _norm(s)
     for prefix in _LOCAL_BLOCKLIST_PREFIXES:
-        if s_norm.startswith(_norm(prefix)):
+        pfx = _norm(prefix).rstrip("/")   # match exact dir AND anything under it
+        if s_norm == pfx or s_norm.startswith(pfx + "/"):
             raise SafetyError(
-                f"destination {s!r} is under blocked system prefix {prefix!r}."
+                f"destination {s!r} is at/under blocked system prefix {prefix!r}."
             )
     home = str(Path.home())
     for name in _HOME_BLOCKLIST_NAMES:
@@ -396,10 +397,16 @@ def assert_local_write_policy(p: str) -> Path:
     for candidate in {str(expanded), str(resolved)}:
         c_norm = _norm(candidate)
         for prefix in _LOCAL_BLOCKLIST_PREFIXES:
-            if c_norm.startswith(_norm(prefix)):
+            # Match the EXACT directory as well as anything under it. The
+            # prefixes carry a trailing slash, so a naive startswith lets the
+            # exact dir (e.g. '/usr/bin') slip past '/usr/bin/'. Compare against
+            # the slash-stripped prefix with exact-equality OR a path-boundary
+            # ('/usr/bin' or '/usr/bin/...'), never a bare string prefix.
+            pfx = _norm(prefix).rstrip("/")
+            if c_norm == pfx or c_norm.startswith(pfx + "/"):
                 raise SafetyError(
-                    f"destination {candidate!r} is under blocked system prefix "
-                    f"{prefix!r}. version_existing is NOT an override.")
+                    f"destination {candidate!r} is at/under blocked system "
+                    f"prefix {prefix!r}. version_existing is NOT an override.")
         for name in _HOME_BLOCKLIST_NAMES:
             forbidden = str(Path(home) / name)
             f_norm = _norm(forbidden)
@@ -420,6 +427,22 @@ def assert_local_write_policy(p: str) -> Path:
                 f"destination {expanded!r} is a symlink or non-regular node "
                 f"(mode {oct(lst.st_mode)}); the MCP refuses to write/rename it.")
     return resolved
+
+
+# ── Reserved MCP-managed bucket objects (generic uploads must not write) ────
+
+_RESERVED_BUCKET_RE = re.compile(r"/mcp_terra_jobs/[^/]+/summary\.(mp3|m4a)\Z")
+
+
+def is_reserved_bucket_path(gs_uri: str) -> bool:
+    """True if `gs_uri` targets a RESERVED MCP-managed object that generic
+    uploads must NOT write — currently the per-job audio explainer
+    (`mcp_terra_jobs/<job>/summary.{mp3,m4a}`), produced only by
+    terra_render_audio_summary. Reserving the path gives the audio DELIVERY
+    path provenance: the email/Slack attachment fetched from there could only
+    have been rendered by the MCP, not staged by a caller via a generic upload.
+    """
+    return bool(_RESERVED_BUCKET_RE.search(gs_uri or ""))
 
 
 # ── Workspace-bucket allowlist ──────────────────────────────────────────────

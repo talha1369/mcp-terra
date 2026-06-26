@@ -230,8 +230,15 @@ def slack_upload_file(data: bytes, *, filename: str, title: str = "",
                     results.append({"target": tgt, "ok": False, "error": str(e)})
     except httpx.HTTPError as e:
         raise NotifyError(f"Slack upload network error: {type(e).__name__}")
-    return {"uploaded": any(r["ok"] for r in results),
-            "transport": "slack-bot-files", "targets": results}
+    ok_count = sum(1 for r in results if r["ok"])
+    if ok_count == 0:
+        # FAIL LOUD: not a single target received the file. Surface every error
+        # rather than returning a success envelope with uploaded=False.
+        errs = "; ".join(f"{r['target']}: {r.get('error', '?')}" for r in results)
+        raise NotifyError(
+            f"Slack upload failed for ALL {len(results)} target(s): {errs}")
+    return {"uploaded": True, "transport": "slack-bot-files",
+            "partial_failure": ok_count < len(results), "targets": results}
 
 
 # ── macOS Notification Center (local, no network) ───────────────────────────

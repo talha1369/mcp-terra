@@ -833,6 +833,15 @@ def terra_upload_to_bucket(local_path: str, bucket_uri: str,
                     f"dir-style destination {bucket_uri!r}."
                 )
             effective_dest = bucket_uri + basename
+    # Provenance (Codex high): refuse generic uploads to RESERVED MCP objects
+    # (the per-job audio explainer summary.{mp3,m4a}). Only
+    # terra_render_audio_summary may produce them, so the audio that email/Slack
+    # later attach can't be arbitrary bytes a caller staged here.
+    if safety.is_reserved_bucket_path(effective_dest):
+        raise safety.SafetyError(
+            f"{effective_dest!r} is a RESERVED MCP object (per-job audio "
+            f"explainer). Generic uploads cannot write it — it is produced only "
+            f"by terra_render_audio_summary (so audio delivery has provenance).")
     dest_exists = safety.bucket_object_exists(effective_dest)
     if dest_exists and (not version_existing or recursive):
         raise safety.SafetyError(
@@ -851,6 +860,10 @@ def terra_upload_to_bucket(local_path: str, bucket_uri: str,
                 for fname in files:
                     rel_path = fname if rel == "." else f"{rel}/{fname}"
                     derived = f"{bucket_uri.rstrip('/')}/{rel_path}"
+                    if safety.is_reserved_bucket_path(derived):
+                        raise safety.SafetyError(
+                            f"recursive upload would write RESERVED MCP object "
+                            f"{derived!r} (per-job audio explainer). Refused.")
                     if safety.bucket_object_exists(derived):
                         raise safety.SafetyError(
                             f"recursive upload would clobber existing bucket "
@@ -911,6 +924,15 @@ def terra_download_from_bucket(bucket_uri: str, local_path: str,
     # symlink/device. This runs BEFORE any side effect and before the _pre gate.
     safety.assert_local_write_policy(local_path)
     target_exists = target.exists()
+    # version_existing versions a single FILE. Refuse to rename a DIRECTORY —
+    # otherwise version_existing could move a whole tree (Codex critical). The
+    # is_dir() check also closes the gap where an exact protected directory
+    # slipped policy.
+    if target_exists and target.is_dir():
+        raise safety.SafetyError(
+            f"local destination {target!r} is a directory; version_existing "
+            f"versions single files only. The MCP refuses to rename a directory."
+        )
     if target_exists and (not version_existing or recursive):
         raise safety.SafetyError(
             f"local destination {target!r} already exists. "
@@ -1692,38 +1714,60 @@ def terra_get_run_log(bucket_uri: str, job_id: str,
 
 # ── End-of-run email report (hard-locked recipient) ─────────────────────────
 
-def _fetch_run_audio_bytes(job_id: str) -> tuple[bytes, str]:
+def _fetch_run_audio_bytes(job_id: str, max_bytes: int) -> tuple[bytes, str]:
     """Download the run's OWN audio explainer (summary.{m4a,mp3}) for `job_id`.
 
     The path is DERIVED from job_id + the locked bucket and fixed to
     summary.{m4a,mp3} — never an arbitrary path — so neither the email nor the
-    Slack attachment can be coerced into shipping some other object. Returns
-    (bytes, ext). Raises ValueError if no lock or no audio exists.
+    Slack attachment can be coerced into shipping some other object. (Generic
+    uploads to that reserved path are also refused — see terra_upload_to_bucket
+    — so the object can only have been written by terra_render_audio_summary.)
+
+    SIZE PREFLIGHT (Codex high): the object's size is read via `gsutil stat`
+    and rejected if it exceeds `max_bytes` BEFORE any download, so a huge or
+    malicious object can't exhaust disk/memory before a downstream cap runs.
+
+    Returns (bytes, ext). Raises ValueError if no lock, no audio, or oversize.
     """
     safety.validate_identifier(job_id, "job_id")   # path component — no traversal
     _lk = policy.resolve_locked_workspace()
     if not _lk or not _lk.get("bucketName"):
         raise ValueError("a workspace lock is required to locate the audio")
     _adir = f"gs://{_lk['bucketName']}/{nbr.JOBS_PREFIX}/{job_id}"
+    import os as _os_a
+    import re as _re_a
+    import tempfile as _tf_a
     for _ext in ("m4a", "mp3"):
         _cand = f"{_adir}/summary.{_ext}"
-        if safety.bucket_object_exists(_cand):
-            import os as _os_a
-            import tempfile as _tf_a
-            fd, _tmp = _tf_a.mkstemp(prefix="mcp_audio_", suffix=f".{_ext}")
-            _os_a.close(fd)
-            _os_a.unlink(_tmp)             # free the name so gsutil cp -n can write it
+        if not safety.bucket_object_exists(_cand):
+            continue
+        # Reject oversize BEFORE download (gsutil stat → Content-Length).
+        _m = _re_a.search(r"Content-Length:\s*(\d+)", bk.stat_object(_cand))
+        if not _m:
+            raise ValueError(f"could not determine size of {_cand} before download")
+        _size = int(_m.group(1))
+        if _size > max_bytes:
+            raise ValueError(
+                f"audio object {_cand} is {_size} bytes (> cap {max_bytes}); "
+                f"refusing to download.")
+        fd, _tmp = _tf_a.mkstemp(prefix="mcp_audio_", suffix=f".{_ext}")
+        _os_a.close(fd)
+        _os_a.unlink(_tmp)                 # free the name so gsutil cp -n can write it
+        try:
+            bk.download_file(_cand, _tmp)
+            with open(_tmp, "rb") as _fh:
+                _data = _fh.read()
+        finally:
             try:
-                bk.download_file(_cand, _tmp)
-                with open(_tmp, "rb") as _fh:
-                    return _fh.read(), _ext
-            finally:
-                try:
-                    _os_a.unlink(_tmp)     # never leave the audio blob on disk
-                except OSError:
-                    pass
+                _os_a.unlink(_tmp)         # never leave the audio blob on disk
+            except OSError:
+                pass
+        if len(_data) > max_bytes:         # belt + suspenders: size changed post-stat
+            raise ValueError(
+                f"audio object grew beyond cap after stat ({len(_data)} bytes)")
+        return _data, _ext
     raise ValueError(
-        f"no audio explainer (summary.m4a/.mp3) found for job {job_id}; "
+        f"no audio explainer (summary.m4a/.mp3) found for job {job_id};"
         f"render it first with terra_render_audio_summary.")
 
 
@@ -1780,7 +1824,7 @@ def terra_send_run_report_email(subject: str, body: str, job_id: str,
     # hard-locked to the data owner).
     audio_attachment = None
     if attach_audio:
-        _audio_bytes, _ext = _fetch_run_audio_bytes(job_id)
+        _audio_bytes, _ext = _fetch_run_audio_bytes(job_id, 15 * 1024 * 1024)
         audio_attachment = (_audio_bytes, f"summary.{_ext}")
 
     try:
@@ -2431,13 +2475,28 @@ def terra_write_run_record(run_id: str, record_json: str,
         raise safety.SafetyError(
             f"run record already exists at {dest!r}. The MCP refuses to "
             f"overwrite provenance (records are immutable). Use a fresh run_id.")
+    import base64 as _b64_rr
+    import hashlib as _hl_rr
     import os as _os_rr
+    import re as _re_rr
     import tempfile
     fd, tmp = tempfile.mkstemp(prefix="mcp_runrec_", suffix=".json")
     try:
         with _os_rr.fdopen(fd, "w") as fh:
             fh.write(blob)
         bk.upload_file(tmp, dest, recursive=False)
+        # READ-BACK VERIFY (Codex finding): cp -n SILENTLY SKIPS if a concurrent
+        # writer created dest after our preflight. Confirm the persisted object
+        # actually holds OUR bytes (md5 match) — otherwise we'd report 'written'
+        # for a record we did not persist. Fail loud on mismatch.
+        _expected_md5 = _b64_rr.b64encode(
+            _hl_rr.md5(blob.encode("utf-8")).digest()).decode()
+        _mm = _re_rr.search(r"Hash \(md5\):\s*(\S+)", bk.stat_object(dest))
+        if not _mm or _mm.group(1) != _expected_md5:
+            raise safety.SafetyError(
+                f"run record at {dest!r} does NOT match what we wrote (md5 "
+                f"mismatch) — a concurrent writer likely won the no-clobber "
+                f"race. NOT reporting success; retry with a fresh run_id.")
     finally:                              # never leave the metadata blob on disk
         try:
             _os_rr.unlink(tmp)
@@ -2484,7 +2543,7 @@ def terra_notify_slack(text: str, run_id: str = "", audio_job_id: str = "") -> s
         if audio_job_id and nt.slack_bot_configured():
             # TRUE file attachment via the bot Web API. Path derived from the
             # job (exfil-safe); `text` becomes the file's initial comment.
-            _audio_bytes, _ext = _fetch_run_audio_bytes(audio_job_id)
+            _audio_bytes, _ext = _fetch_run_audio_bytes(audio_job_id, 50 * 1024 * 1024)
             result = nt.slack_upload_file(
                 _audio_bytes, filename=f"summary.{_ext}",
                 title=f"Terra run audio explainer ({audio_job_id})",
@@ -2669,6 +2728,18 @@ def terra_render_audio_summary(job_id: str, bucket_uri: str,
          f"job={job_id} text_len={len(summary_text)} "
          f"voice={voice_name or 'default'}")
 
+    # No-clobber + correctness PREFLIGHT (Codex finding): refuse BEFORE the TTS
+    # side-effect if EITHER audio artifact already exists — so we never ship the
+    # text to the backend for a run that already has audio, and never leave a
+    # stale summary.m4a that delivery would later prefer over a new summary.mp3.
+    paths = nbr.job_gcs_paths(bucket_uri, job_id)
+    _adir = paths["spec"].rsplit("/", 1)[0]
+    for _e in ("mp3", "m4a"):
+        if safety.bucket_object_exists(f"{_adir}/summary.{_e}"):
+            raise safety.SafetyError(
+                f"audio already exists at {_adir}/summary.{_e}. The MCP refuses "
+                f"to overwrite — use a fresh job_id to regenerate.")
+
     # Render — raises AudioSummaryError on any failure (caller sees clean msg).
     try:
         # Cloud TTS (user creds) needs a quota project — default to the locked
@@ -2684,15 +2755,10 @@ def terra_render_audio_summary(job_id: str, bucket_uri: str,
     except audio_summary.AudioSummaryError as e:
         raise PermissionError(safety.sanitize_output(str(e)))
 
-    # Upload to GCS with no-clobber (file path includes job_id; UUID-collision ~0).
-    # Extension tracks the backend: .mp3 (Cloud TTS) or .m4a (macOS say).
-    paths = nbr.job_gcs_paths(bucket_uri, job_id)
-    audio_gcs = f"{paths['spec'].rsplit('/', 1)[0]}/summary.{_ext}"
-    if safety.bucket_object_exists(audio_gcs):
-        raise safety.SafetyError(
-            f"audio already exists at {audio_gcs!r}. The MCP refuses to "
-            f"overwrite — use a fresh job_id to regenerate."
-        )
+    # Upload to GCS with no-clobber (cp -n). Extension tracks the backend:
+    # .mp3 (Cloud TTS) or .m4a (macOS say). Both were preflighted above, so
+    # neither exists; cp -n is the final atomic guard.
+    audio_gcs = f"{_adir}/summary.{_ext}"
     # Write bytes to a temp file then gsutil cp -n (no-clobber).
     import tempfile as _tf
     import os as _os
