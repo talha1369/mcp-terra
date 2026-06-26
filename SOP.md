@@ -1,7 +1,11 @@
 # mcp-terra — Standard Operating Procedure
 
-**For lab members and collaborators who want to run notebooks on Terra
-through Claude (or another MCP client) with strong safety guarantees.**
+**For anyone who wants to run notebooks on Terra through an MCP-aware AI
+assistant with strong safety guarantees.**
+
+> New here? The 1-minute "why" is in [`README.md`](README.md); a 5-minute pitch
+> deck is at [`docs/pitch/index.html`](docs/pitch/index.html). This SOP is the
+> operational detail.
 
 This SOP covers the full workflow end-to-end: first-time setup, daily use,
 the auto-bug-fix loop, the end-of-run email report, sharing with a

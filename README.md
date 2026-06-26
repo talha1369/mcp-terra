@@ -8,9 +8,21 @@
 <!-- After publishing, add the live CI badge:
 ![CI](https://github.com/your-org/mcp-terra/actions/workflows/ci.yml/badge.svg) -->
 
-An MCP (Model Context Protocol) server that lets Claude — or any MCP-aware
+An MCP (Model Context Protocol) server that lets an AI assistant — any MCP-aware
 agent — manage Terra (terra.bio) workspaces, runtime VMs, workspace buckets,
 and WDL/Cromwell workflows on your behalf.
+
+**The gap it closes:** on your laptop an AI coding assistant runs your code and
+fixes the bugs; on Terra it could only copy a notebook into your bucket. mcp-terra
+lets the assistant drive the *whole loop* — provision the right-sized VM, run the
+notebook, **auto-fix** failures and re-run, then **email a verified report + an
+audio explainer** of the results — from a single sentence, with **no
+delete/overwrite primitive anywhere** and a controlled-access guard, spend cap,
+and 24h-session awareness built in.
+
+> **5-minute pitch deck:** open [`docs/pitch/index.html`](docs/pitch/index.html)
+> in a browser; speaker script in
+> [`docs/pitch/SPEAKER_NOTES.md`](docs/pitch/SPEAKER_NOTES.md).
 
 Built for the Broad / Stanford Terra ecosystem. Wraps these Terra services:
 
