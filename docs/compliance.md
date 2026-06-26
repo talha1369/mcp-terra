@@ -45,6 +45,9 @@ compliance reviewer.
 | `terra_list_method_configs` (config list) | allowed | **count only** (config names + method refs are operator-controlled strings) |
 | `terra_get_bucket_object_metadata` (gsutil stat) | allowed | **custom object metadata withheld**; size/hash/content-type/times kept |
 | `terra_download_from_bucket` (object → local disk) | allowed | **refused** for non-public/non-allowlisted buckets (pulling controlled bytes onto a possibly non-compliant host is the largest egress of all) |
+| `terra_list_workspaces` (visible workspaces) | allowed | with no lock: **count only** (namespace/name are user-controlled identifiers); with `MCP_TERRA_WORKSPACE` set: the locked workspace only |
+| `terra_list_data_tables` (entity-type schema) | allowed | **counts only** (table names, attribute names, id columns withheld) |
+| `terra_list_submissions` (submission list) | allowed | **ids + status + date + workflow-status counts** (methodConfigurationName + entity names withheld) |
 | `terra_get_submission` (per-workflow detail) | allowed | **reduced** to submission/workflow **ids + statuses** (entity names + failure messages withheld) |
 | `terra_get_workflow_logs` (per-task stderr) | allowed (path bound to the queried workspace bucket) | **content AND paths withheld** (per-task status kept; stderr can print controlled data) |
 | `terra_get_run_log` (stdout/stderr) | allowed | **content withheld** (paths + status kept; a notebook can print controlled data) |

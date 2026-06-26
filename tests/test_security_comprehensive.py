@@ -3479,6 +3479,9 @@ _DATA_TOOLS_REQUIRING_GUARD = {
     # custom object metadata) or pull the bytes to local disk → guarded + tested.
     "terra_get_workspace", "terra_list_method_configs",
     "terra_get_bucket_object_metadata", "terra_download_from_bucket",
+    # Codex r6: listings whose payloads carry operator/user-controlled strings
+    # (workspace names, data-table schema, methodConfigurationName) → guarded.
+    "terra_list_workspaces", "terra_list_data_tables", "terra_list_submissions",
 }
 _NO_DATA_TOOLS = {
     # writes / control (no workspace-data return)
@@ -3492,9 +3495,8 @@ _NO_DATA_TOOLS = {
     # identity / posture / runtime-config (not workspace data)
     "terra_whoami", "terra_health", "terra_killswitch_status",
     "terra_get_runtime", "terra_list_runtimes", "terra_recommend_runtime_for_notebook",
-    # metadata / status / cost / listings of the user's OWN scope (no raw rows/
-    # objects, no operator free-form payloads)
-    "terra_list_workspaces", "terra_list_data_tables", "terra_list_submissions",
+    # status / cost of the user's OWN scope (no raw rows/objects, no operator
+    # free-form payloads)
     "terra_get_workflow_cost",
     # external doc fetch (ingest from an allowlisted host, not Terra egress)
     "terra_fetch_url",
@@ -3710,6 +3712,86 @@ def _():
         safety.safe_bucket_uri = osafe
 
 
+@case("CC-ControlledAccess3", "list_workspaces is count-only (sentinel) in controlled mode w/o lock")
+def _():
+    from mcp_terra import policy as _p
+    saved, ol, ot = _p._CONTROLLED_ACCESS, _tc.rawls_list_workspaces, server.auth.get_access_token
+    olock = _p.resolve_locked_workspace
+    SENTINEL = "cohort-NA12878-secret-ws"
+    _tc.rawls_list_workspaces = lambda *a, **k: [{"workspace": {
+        "namespace": SENTINEL, "name": SENTINEL, "bucketName": "fc-x",
+        "googleProject": "p"}, "accessLevel": "OWNER"}]
+    server.auth.get_access_token = lambda: "tok"
+    _p.resolve_locked_workspace = lambda: None
+    try:
+        _p._CONTROLLED_ACCESS = True
+        out = server.terra_list_workspaces()
+        assert SENTINEL not in out, "workspace namespace/name leaked as an identifier oracle!"
+        assert '"workspace_count": 1' in out
+    finally:
+        _p._CONTROLLED_ACCESS, _tc.rawls_list_workspaces, server.auth.get_access_token = saved, ol, ot
+        _p.resolve_locked_workspace = olock
+
+
+@case("CC-ControlledAccess3", "list_data_tables is counts-only (sentinel) in controlled mode")
+def _():
+    from mcp_terra import policy as _p
+    saved, ol, ot = _p._CONTROLLED_ACCESS, _tc.rawls_list_data_tables, server.auth.get_access_token
+    SENTINEL = "table-NA12878-secret"
+    _tc.rawls_list_data_tables = lambda *a, **k: {
+        SENTINEL: {"count": 42, "attributeNames": [SENTINEL], "idName": SENTINEL}}
+    server.auth.get_access_token = lambda: "tok"
+    try:
+        _p._CONTROLLED_ACCESS = True
+        out = server.terra_list_data_tables("ns", "ws")
+        assert SENTINEL not in out, "data-table schema (names) leaked a sentinel!"
+        assert '"data_table_count": 1' in out and "42" in out
+    finally:
+        _p._CONTROLLED_ACCESS, _tc.rawls_list_data_tables, server.auth.get_access_token = saved, ol, ot
+
+
+@case("CC-ControlledAccess3", "list_submissions withholds method-config/entity names (sentinel) in controlled mode")
+def _():
+    from mcp_terra import policy as _p
+    saved, ol, ot = _p._CONTROLLED_ACCESS, _tc.rawls_list_submissions, server.auth.get_access_token
+    SENTINEL = "methodcfg-NA12878-secret"
+    _tc.rawls_list_submissions = lambda *a, **k: [{
+        "submissionId": "s1", "status": "Done", "submissionDate": "2026-01-01",
+        "methodConfigurationName": SENTINEL,
+        "submissionEntity": {"entityName": SENTINEL},
+        "workflowStatuses": {"Succeeded": 3}}]
+    server.auth.get_access_token = lambda: "tok"
+    try:
+        _p._CONTROLLED_ACCESS = True
+        out = server.terra_list_submissions("ns", "ws")
+        assert SENTINEL not in out, "methodConfigurationName / entity name leaked!"
+        assert '"submissionId": "s1"' in out and '"Succeeded": 3' in out
+    finally:
+        _p._CONTROLLED_ACCESS, _tc.rawls_list_submissions, server.auth.get_access_token = saved, ol, ot
+
+
+@case("CC-ControlledAccess3", "stat: a custom key CONTAINING a safe-label substring is still withheld")
+def _():
+    from mcp_terra import policy as _p, bucket as _bk2
+    saved, ostat, osafe = _p._CONTROLLED_ACCESS, _bk2.stat_object, safety.safe_bucket_uri
+    SENTINEL = "NA12878-secret"
+    _bk2.stat_object = lambda uri: (
+        "gs://fc-secure-x/o:\n"
+        "    Content-Length:   100\n"
+        "    Metadata:\n"
+        f"        x-goog-meta-Content-Type-{SENTINEL}:  evil\n"
+        f"        x-goog-meta-Hash (md5)-{SENTINEL}:  evil\n")
+    safety.safe_bucket_uri = lambda u: u
+    try:
+        _p._CONTROLLED_ACCESS = True
+        out = server.terra_get_bucket_object_metadata("gs://fc-secure-x/o")
+        assert SENTINEL not in out, "custom key with a safe-label SUBSTRING bypassed the projection!"
+        assert "100" in out, "the real Content-Length must be kept"
+    finally:
+        _p._CONTROLLED_ACCESS, _bk2.stat_object = saved, ostat
+        safety.safe_bucket_uri = osafe
+
+
 @case("CC-ControlledAccess3", "workflow_logs flags per-task stderr truncation (no false truncated=false)")
 def _():
     from mcp_terra import policy as _p, bucket as _bk2
@@ -3853,13 +3935,19 @@ def _():
     assert "RUNNER_START_EPOCH" in s and "SESSION_DEADLINE" in s
     assert "SESSION_REMAINING" in s and "JOB_BUDGET" in s
     assert "REFUSED-SESSION-WINDOW" in s and "SESSION_MIN_JOB_SEC" in s
+    # Codex r6: a refused job is only marked processed once the spec MOVE
+    # (durable terminal marker) succeeds — else it stays RETRYABLE.
+    assert "leaving it RETRYABLE" in s
     # The WHOLE papermill run is wrapped in coreutils `timeout` (TERM→KILL) at
     # the per-job remaining budget.
-    assert 'timeout --signal=TERM --kill-after=60 "${JOB_BUDGET}s"' in s
+    assert 'timeout --verbose --signal=TERM --kill-after=60 "${JOB_BUDGET}s"' in s
     assert "command -v timeout" in s, "must fail loud if timeout(1) is missing"
     assert "PER_CELL_SEC=$JOB_BUDGET" in s, "per-cell timeout capped to remaining budget"
-    # Codex r5: RC 124 -> session limit; RC 137 only if ELAPSED >= budget (else OOM)
-    assert '"$RC" -eq 124' in s and '"$RC" -eq 137' in s and "ELAPSED" in s
+    # Codex r6: CAUSAL detection — RC 124, or the `timeout --verbose` marker.
+    # An OOM RC 137 without the marker must NOT be labelled a session limit.
+    assert '"$RC" -eq 124' in s
+    assert '"^timeout: sending signal"' in s, "must use the causal timeout marker"
+    assert "ELAPSED" not in s, "must NOT use the wall-clock heuristic anymore"
     # A halted run is attributable + fail-loud, never silently truncated.
     assert "FAILED-SESSION-LIMIT" in s and "session_limit_note" in s
     assert "elapsed_sec" in s

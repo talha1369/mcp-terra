@@ -355,6 +355,27 @@ tests exercise the templates in isolation, so these were latent):
   - `terra_get_workflow_logs` splits per-object `content_truncated` from the
     break-driving `truncated`, so one long stderr no longer drops later failed
     tasks from diagnostics.
+- **Adversarial-review hardening (Codex) — round 6** (re-review of round-5):
+  closed 6 more findings.
+  - `terra_get_bucket_object_metadata` controlled projection now matches EXACT
+    safe labels at line start and **drops the whole custom-Metadata block** — a
+    key like `x-goog-meta-Content-Type-NA12878:` no longer slips through a
+    substring match.
+  - `terra_list_data_tables`, `terra_list_submissions`, and
+    `terra_list_workspaces` moved into the guarded set with controlled-mode
+    projections (counts/ids/status only; table/attribute/method-config/entity/
+    workspace **names withheld**) + sentinel tests. `list_workspaces` with no
+    lock returns a count only (namespace/name are an identifier oracle).
+  - The existing-VM `terra_start_runner_on_vm` SSH bootstrap now propagates
+    `MCP_TERRA_MAX_RUN_HOURS` + `MCP_TERRA_SESSION_MARGIN_SEC` (previously only
+    `terra_create_runtime` did).
+  - The `REFUSED-SESSION-WINDOW` branch only marks a job processed once the spec
+    MOVE (durable terminal marker) succeeds — a flaky GCS write near session
+    expiry no longer strands the job forever; it stays retryable.
+  - Session-limit detection is now **causal**: RC 124, or the `timeout
+    --verbose` "sending signal" marker — no longer a wall-clock heuristic, so an
+    OOM SIGKILL (RC 137 without the marker) is correctly a normal `FAILED` and a
+    backward clock step can't hide a real timeout.
 - **No delete primitive, by design** — no tool (and no `leo_delete_runtime`
   at any layer) deletes a runtime or persistent disk; teardown is the user's
   action in the Terra UI ("Keep persistent disk"). The MCP detects a

@@ -659,8 +659,15 @@ PYVERIFY
         if [ "$SESSION_REMAINING" -lt "$SESSION_MIN_JOB_SEC" ]; then
             echo "[runner] only ${SESSION_REMAINING}s remain in the Terra session window (< ${SESSION_MIN_JOB_SEC}s floor); REFUSING job $JOB_ID. Restart the runtime for a fresh session, or use the WDL/Cromwell path for long compute." >&2
             echo "REFUSED-SESSION-WINDOW" | gsutil cp - "$STATUS" 2>/dev/null || true
-            gsutil mv -n "$SPEC" "$SPEC.refused-session-window" 2>/dev/null || true
-            echo "$JOB_ID" >> "$PROCESSED_FILE"
+            # Codex r6: only mark processed once the spec MOVE (the durable
+            # terminal marker) actually succeeded. If GCS/auth is flaky near
+            # session expiry, leave the job RETRYABLE — a fresh-session restart
+            # must be able to pick it up, not skip it forever.
+            if gsutil mv -n "$SPEC" "$SPEC.refused-session-window" 2>/dev/null; then
+                echo "$JOB_ID" >> "$PROCESSED_FILE"
+            else
+                echo "[runner] WARN: could not move spec for refused job $JOB_ID; leaving it RETRYABLE (NOT marked processed). A runner restart with a fresh session window will pick it up." >&2
+            fi
             continue
         fi
         JOB_BUDGET=$SESSION_REMAINING
@@ -669,7 +676,7 @@ PYVERIFY
         [ "$PER_CELL_SEC" -gt "$JOB_BUDGET" ] && PER_CELL_SEC=$JOB_BUDGET
         RUN_STARTED_AT=$(date +%s)
         set +e
-        timeout --signal=TERM --kill-after=60 "${JOB_BUDGET}s" \
+        timeout --verbose --signal=TERM --kill-after=60 "${JOB_BUDGET}s" \
             env -u MCP_TERRA_RUNNER_SECRET \
             -u MCP_TERRA_ALLOW_WRITES \
             -u MCP_TERRA_WORKSPACE \
@@ -685,17 +692,19 @@ PYVERIFY
         RC=$?
         set -e
         RUN_ENDED_AT=$(date +%s)
-        ELAPSED=$(( RUN_ENDED_AT - RUN_STARTED_AT ))
-        # Codex r5: distinguish a session-budget halt from an OOM/external kill.
-        # coreutils `timeout` exits 124 on a clean TERM-timeout, or 137 if it had
-        # to escalate to SIGKILL ~60s LATER — so a timeout-137 has ELAPSED >= the
-        # budget. RC 137 with ELAPSED well under budget is an OOM/manual SIGKILL,
-        # NOT a session limit — labelling it FAILED-SESSION-LIMIT would be a fake
-        # status and send the user to the wrong fix.
+        # Codex r6: CAUSAL session-limit detection, not a wall-clock heuristic.
+        # RC 124 is coreutils' unambiguous "command timed out" status. For RC 137
+        # (SIGKILL — which ALSO occurs on OOM or a manual kill) we ONLY count it
+        # as a session limit when `timeout --verbose` actually logged that IT sent
+        # the signal. That line is written by the timeout PROCESS to its stderr
+        # (the same redirected file); notebook CELL stderr is captured into the
+        # .ipynb, not here, so it cannot be spoofed. An OOM kill never produces
+        # this line → correctly stays a normal FAILED (right remediation). A
+        # backward clock step is irrelevant — we no longer compare wall-clock.
         SESSION_LIMITED=0
         if [ "$RC" -eq 124 ]; then
             SESSION_LIMITED=1
-        elif [ "$RC" -eq 137 ] && [ "$ELAPSED" -ge "$JOB_BUDGET" ]; then
+        elif grep -q "^timeout: sending signal" "$WORK/$JOB_ID.stderr" 2>/dev/null; then
             SESSION_LIMITED=1
         fi
         if [ "$SESSION_LIMITED" -eq 1 ]; then

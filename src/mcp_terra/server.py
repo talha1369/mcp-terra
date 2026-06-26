@@ -227,6 +227,18 @@ def terra_list_workspaces() -> str:
     if lock is not None:
         rows = [r for r in rows
                 if r["namespace"] == lock["namespace"] and r["name"] == lock["name"]]
+    # Codex r6: workspace namespace/name are user-controlled identifiers that
+    # could encode subject/cohort/consent ids. In controlled mode, only the
+    # LOCKED workspace is disclosed; with no lock, return a count only.
+    if policy.controlled_access_enabled() and lock is None:
+        return _ok({
+            "workspace_count": len(rows),
+            "_controlled_access_withheld": (
+                "workspace namespace/name/bucket/project withheld "
+                "(MCP_TERRA_CONTROLLED_ACCESS, no workspace lock) — these are "
+                "user-controlled identifiers; count only. Set MCP_TERRA_WORKSPACE "
+                "to scope, or disable the guard for a non-controlled deployment."),
+        })
     return _ok(rows)
 
 
@@ -1215,6 +1227,8 @@ sleep 1
 BUCKET='{bucket_clean}' \
 MCP_TERRA_RUNNER_SECRET="$SECRET" \
 MCP_TERRA_RUNTIME_NAME='{runtime_name}' \
+MCP_TERRA_MAX_RUN_HOURS='{policy.max_run_hours()}' \
+MCP_TERRA_SESSION_MARGIN_SEC='{policy.session_margin_sec()}' \
 nohup /home/jupyter/mcp_terra_runner.sh \
     > /home/jupyter/.mcp_terra_runner.log 2>&1 &
 PID=$!
@@ -2325,7 +2339,33 @@ def terra_list_data_tables(namespace: str, name: str) -> str:
     _assert_workspace_allowed(namespace, name)
     _pre("terra_list_data_tables", READ, f"{namespace}/{name}")
     token = auth.get_access_token()
-    return _ok(tc.rawls_list_data_tables(token, namespace, name))
+    dts = tc.rawls_list_data_tables(token, namespace, name)
+    # Codex r6: data-table SCHEMA (entity-type names, attribute names, id-column)
+    # is operator-controlled and can encode identifiers. In guard mode return
+    # table COUNT + the (anonymous, sorted) row counts only — no names.
+    if policy.controlled_access_enabled():
+        row_counts = []
+        if isinstance(dts, dict):
+            for v in dts.values():
+                if isinstance(v, dict) and isinstance(v.get("count"), int):
+                    row_counts.append(v["count"])
+            n = len(dts)
+        elif isinstance(dts, list):
+            for v in dts:
+                if isinstance(v, dict) and isinstance(v.get("count"), int):
+                    row_counts.append(v["count"])
+            n = len(dts)
+        else:
+            n = None
+        dts = {
+            "data_table_count": n,
+            "row_counts": sorted(row_counts),
+            "_controlled_access_withheld": (
+                "table names, attribute names, and id columns withheld "
+                "(MCP_TERRA_CONTROLLED_ACCESS) — operator-controlled strings; "
+                "counts only. Disable the guard for a non-controlled workspace."),
+        }
+    return _ok(dts)
 
 
 @server.tool(title="Read rows of a data table (paged)", annotations=ANN_READ_REMOTE)
@@ -2381,7 +2421,20 @@ def terra_list_submissions(namespace: str, name: str) -> str:
     _assert_workspace_allowed(namespace, name)
     _pre("terra_list_submissions", READ, f"{namespace}/{name}")
     token = auth.get_access_token()
-    return _ok(tc.rawls_list_submissions(token, namespace, name))
+    subs = tc.rawls_list_submissions(token, namespace, name)
+    # Codex r6: submission listings carry methodConfigurationName/Namespace +
+    # submissionEntity names (operator/user-controlled, can encode identifiers).
+    # In guard mode project each to non-identifying ids/status/date + workflow
+    # status COUNTS only.
+    if policy.controlled_access_enabled() and isinstance(subs, list):
+        subs = [{
+            "submissionId": (s or {}).get("submissionId"),
+            "status": (s or {}).get("status"),
+            "submissionDate": (s or {}).get("submissionDate"),
+            "workflowStatuses": (s or {}).get("workflowStatuses"),
+            "_controlled_access_withheld": "method config + entity names withheld",
+        } for s in subs]
+    return _ok(subs)
 
 
 @server.tool(title="Get workflow metadata (Cromwell)", annotations=ANN_READ_REMOTE)
@@ -2671,10 +2724,21 @@ def terra_get_bucket_object_metadata(bucket_uri: str) -> str:
     # carry operator-set identifiers. In guard mode keep ONLY the non-identifying
     # integrity fields (size / hash / type / times / class) and drop the rest.
     if policy.controlled_access_enabled() and isinstance(stat_text, str):
-        _safe = ("Content-Length", "Content-Type", "Storage class",
-                 "Hash (crc32c)", "Hash (md5)", "Creation time", "Update time",
-                 "Generation")
-        kept = [ln for ln in stat_text.splitlines() if any(p in ln for p in _safe)]
+        # Codex r6: match EXACT safe labels at the start of the (stripped) line
+        # — NOT a substring anywhere — and STOP at the custom "Metadata:" block,
+        # so a key like `x-goog-meta-Content-Type-NA12878:` can't slip through.
+        _safe_labels = ("Content-Length:", "Content-Type:", "Storage class:",
+                        "Hash (crc32c):", "Hash (md5):", "Creation time:",
+                        "Update time:", "Generation:")
+        kept = []
+        in_metadata = False
+        for ln in stat_text.splitlines():
+            s = ln.strip()
+            if s == "Metadata:" or in_metadata:
+                in_metadata = True   # drop the custom-metadata block entirely
+                continue
+            if any(s.startswith(lbl) for lbl in _safe_labels):
+                kept.append(ln)
         stat_text = "\n".join(kept) + "\n[custom metadata withheld: controlled-access]"
         return _ok({"uri": bucket_uri, "stat": stat_text,
                     "_controlled_access_withheld": (
