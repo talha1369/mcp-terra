@@ -1178,6 +1178,13 @@ PYVERIFY
         fi
 
         # Synthesize result.json via env-passing python (no shell→python source).
+        # security review: papermill already ran (billable) — result synthesis must
+        # NOT be a pre-cost-control exit. Under `set -e`, an unguarded failure here
+        # (e.g. a corrupt/empty executed notebook) would kill the subshell before
+        # terminalization + fail-streak/auto-stop. So the synthesis is made
+        # non-fatal (`|| SYNTH_OK=0`); on failure we write a durable terminal
+        # status below instead of result.json and STILL run the cost controls.
+        SYNTH_OK=1
         RESULT_LOCAL="$WORK/$JOB_ID.result.json"
         RC="$RC" \
         JOB_ID_VAR="$JOB_ID" \
@@ -1189,7 +1196,7 @@ PYVERIFY
         SESSION_BUDGET_SEC_VAR="$JOB_BUDGET" \
         SESSION_LIMITED_VAR="$SESSION_LIMITED" \
         MCP_TERRA_RUNNER_SECRET="$MCP_TERRA_RUNNER_SECRET" \
-        python3 - <<'PYRESULT'
+        python3 - <<'PYRESULT' || SYNTH_OK=0
 import base64
 import hashlib
 import hmac
@@ -1371,15 +1378,18 @@ PYRESULT
         else
             # Write the DURABLE terminal markers FIRST (the MCP and other runners
             # key terminal state on result.json + status.txt), TIMEOUT-bounded,
-            # BEFORE the larger best-effort artifact uploads. Retry result.json.
+            # BEFORE the larger best-effort artifact uploads. Retry result.json —
+            # but ONLY if synthesis produced a valid result.json (SYNTH_OK).
             _result_ok=0
-            for _try in 1 2 3; do
-                if timeout --signal=TERM --kill-after=15 120 gsutil cp -n "$RESULT_LOCAL" "$RESULT" 2>/dev/null; then
-                    _result_ok=1; break
-                fi
-                echo "[runner] WARN: result.json upload attempt $_try for $JOB_ID failed; retrying." >&2
-                sleep 3
-            done
+            if [ "$SYNTH_OK" -eq 1 ]; then
+                for _try in 1 2 3; do
+                    if timeout --signal=TERM --kill-after=15 120 gsutil cp -n "$RESULT_LOCAL" "$RESULT" 2>/dev/null; then
+                        _result_ok=1; break
+                    fi
+                    echo "[runner] WARN: result.json upload attempt $_try for $JOB_ID failed; retrying." >&2
+                    sleep 3
+                done
+            fi
             if [ "$_result_ok" -eq 1 ]; then
                 if [ "$RC" = "0" ]; then
                     echo "succeeded" | timeout 60 gsutil cp - "$STATUS" 2>/dev/null || true
@@ -1407,15 +1417,23 @@ PYRESULT
                     echo "[runner] $JOB_ID: claim not held before spec move — leaving the spec for the claim holder (result already terminalized; cost controls still run)." >&2
                 fi
             else
-                # result.json upload failed after retries (notebook DID run =
-                # billable). Write a TERMINAL status marker so neither this runner
-                # nor another VM re-executes. security review: mark processed ONLY
-                # if that status write SUCCEEDED — otherwise there is NO durable
-                # terminal marker, so leave the job UNPROCESSED (do not strand it
-                # locally) so the stale claim ages out for a later retry. Either
-                # way, FALL THROUGH to the shared cost controls.
-                if echo "REFUSED-RESULT-UPLOAD-FAILED" | timeout 60 gsutil cp - "$STATUS" 2>/dev/null; then
-                    echo "[runner] CRITICAL: result.json upload failed for $JOB_ID after retries (notebook already executed); wrote a REFUSED terminal status." >&2
+                # No durable result.json — either synthesis FAILED (corrupt/empty
+                # executed notebook) or the upload failed after retries. The
+                # notebook DID run (billable). Write a TERMINAL status marker so
+                # neither this runner nor another VM re-executes. security review:
+                # mark processed ONLY if that status write SUCCEEDED — otherwise
+                # there is NO durable terminal marker, so leave the job UNPROCESSED
+                # (do not strand it locally) so the stale claim ages out for a
+                # later retry. Either way, FALL THROUGH to the shared cost controls.
+                if [ "$SYNTH_OK" -eq 1 ]; then
+                    _FAIL_STATUS="REFUSED-RESULT-UPLOAD-FAILED"
+                    _FAIL_WHY="result.json upload failed after retries"
+                else
+                    _FAIL_STATUS="REFUSED-RESULT-SYNTH-FAILED"
+                    _FAIL_WHY="result.json synthesis failed (corrupt/empty executed notebook)"
+                fi
+                if echo "$_FAIL_STATUS" | timeout 60 gsutil cp - "$STATUS" 2>/dev/null; then
+                    echo "[runner] CRITICAL: $_FAIL_WHY for $JOB_ID (notebook already executed); wrote $_FAIL_STATUS terminal status." >&2
                     echo "$JOB_ID" >> "$PROCESSED_FILE"
                 else
                     echo "[runner] CRITICAL: could NOT upload result.json OR a terminal status for $JOB_ID; leaving it UNPROCESSED so the claim ages out for a later retry." >&2

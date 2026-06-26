@@ -2,7 +2,7 @@
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)
-![Tests](https://img.shields.io/badge/tests-391%20passing-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-392%20passing-brightgreen.svg)
 ![Lint](https://img.shields.io/badge/lint-ruff-black.svg)
 ![Security](https://img.shields.io/badge/security-detect--secrets%20%2B%20pip--audit-success.svg)
 <!-- After publishing, add the live CI badge:

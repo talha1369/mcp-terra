@@ -124,7 +124,7 @@ default 3000), and `MCP_TERRA_RUNNER_CONCURRENCY` (single-VM job pool, default 4
 
 ## Comprehensive attack-class coverage (`tests/test_security_comprehensive.py`)
 
-**391/391 tests pass** across 52 attack classes. The table below is generated
+**392/392 tests pass** across 52 attack classes. The table below is generated
 from the suite itself; the test file is the authoritative source. Run yourself:
 
 ```bash

@@ -1472,6 +1472,19 @@ def _():
     # finding #1: processed-marking only after a SUCCESSFUL terminal status write
     assert "leaving it UNPROCESSED so the claim ages out" in s
 
+@case("CC-Hardening", "result synthesis is non-fatal (set -e cannot skip cost controls)")
+def _():
+    from mcp_terra import notebook_runner as nbr
+    s = nbr.runner_script_template()
+    # synthesis failure under set -e must NOT exit the subshell before cost controls
+    assert "|| SYNTH_OK=0" in s, "synthesis is not guarded against set -e exit"
+    assert 'if [ "$SYNTH_OK" -eq 1 ]; then' in s, "upload not gated on successful synthesis"
+    assert "REFUSED-RESULT-SYNTH-FAILED" in s, "synthesis failure not terminalized"
+    # no shell exit between the synthesis call and the fail-streak block
+    seg = s[s.index("|| SYNTH_OK=0"):s.index("Fail-streak accounting")]
+    assert "\n        exit " not in seg and "\n            exit " not in seg, \
+        "an exit between synthesis and cost controls can bypass fail-streak"
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # U-Robustness: state-of-the-art MCP design — annotations, schema versioning,
@@ -2529,18 +2542,18 @@ def _():
 
 @case("CC-SeamlessRunner", "runner records PROCESSED on result-upload failure (no infinite re-exec)")
 def _():
-    # A permanent result.json upload failure must NOT loop forever re-executing
-    # a succeeding notebook (rc=0 never trips the fail-streak guard), AND must not
-    # let another VM re-run it. The branch writes a TERMINAL cross-VM status
-    # marker, records PROCESSED locally, and stops the lease refresher.
+    # A permanent result.json upload OR synthesis failure must NOT loop forever
+    # re-executing a succeeding notebook, AND must not let another VM re-run it.
+    # The branch writes a TERMINAL cross-VM status marker and records PROCESSED
+    # ONLY when that status write succeeds (otherwise it leaves the job for retry
+    # rather than stranding it locally), then FALLS THROUGH to the shared
+    # cost-control block (no early continue).
     t = _nbr.runner_script_template()
-    assert "result.json upload failed for $JOB_ID after retries" in t
     assert "REFUSED-RESULT-UPLOAD-FAILED" in t, "must write a cross-VM terminal marker"
-    blk = t[t.index("result.json upload failed for $JOB_ID after retries"):]
-    nxt = blk[:blk.index("continue")]
-    assert 'echo "$JOB_ID" >> "$PROCESSED_FILE"' in nxt, \
-        "result-upload failure must record PROCESSED_FILE before continue"
-    assert "stop_refresher" in nxt, "must stop the lease refresher on this exit path"
+    assert "REFUSED-RESULT-SYNTH-FAILED" in t, "synthesis failure must also be terminalized"
+    assert 'echo "$JOB_ID" >> "$PROCESSED_FILE"' in t, "must record PROCESSED on a durable marker"
+    assert "leaving it UNPROCESSED so the claim ages out" in t, \
+        "must NOT mark processed when no durable terminal marker was written"
 
 
 @case("CC-SeamlessRunner", "start_runner.sh auto-installs Claude Code (after runner, backgrounded, gated)")
