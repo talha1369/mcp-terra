@@ -3492,6 +3492,9 @@ _DATA_TOOLS_REQUIRING_GUARD = {
     "terra_submit_workflow", "terra_register_method", "terra_create_method_config",
     "terra_create_runtime", "terra_start_runtime", "terra_stop_runtime",
     "terra_get_workflow_cost", "terra_upload_to_bucket",
+    # Codex r9: terra_health returns workspace_lock + bucket/heartbeat paths + IAM
+    # writer principals — projected to booleans/counts/status in guard mode.
+    "terra_health",
 }
 _NO_DATA_TOOLS = {
     # writes / control whose RETURN is a caller-echo / local ack / status (NOT a
@@ -3502,9 +3505,21 @@ _NO_DATA_TOOLS = {
     # notifications / delivery (recipient-locked; not a Terra→LLM egress path)
     "terra_notify_desktop", "terra_notify_slack", "terra_send_run_report_email",
     # identity / posture (not workspace data)
-    "terra_whoami", "terra_health", "terra_killswitch_status",
+    "terra_whoami", "terra_killswitch_status",
     # external doc fetch (ingest from an allowlisted host, not Terra egress)
     "terra_fetch_url",
+}
+
+# _NO_DATA tools that DO call a remote service (tc.*/bk.*) but provably return
+# only an ack / caller-echo / the caller's OWN identity — NOT workspace data.
+# A new _NO_DATA tool that calls a remote service must be added here deliberately
+# (fail-closed), which forces a human to confirm it doesn't leak. (Codex r9.)
+_NO_DATA_REMOTE_OK = {
+    "terra_whoami",                  # caller's own Sam/gcloud identity
+    "terra_submit_notebook_job",     # job_id + gcs paths under the caller's OWN bucket_uri arg
+    "terra_install_notebook_runner", # install status + caller's bucket path
+    "terra_start_runner_on_vm",      # runtime name (caller arg) + zone (enum) + status
+    "terra_write_run_record",        # record path (derived from job_id) + digest
 }
 
 
@@ -3529,35 +3544,66 @@ def _tool_has_ast_guard(fn) -> bool:
     return False
 
 
+def _is_remote_call_node(a):
+    import ast
+    if not isinstance(a, ast.Call):
+        return False
+    f = a.func
+    if (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name)
+            and f.value.id in ("tc", "bk")):
+        return True
+    # unwrap _redact_runtime_env(tc.x(...))
+    if isinstance(f, ast.Name) and f.id == "_redact_runtime_env" and a.args:
+        return _is_remote_call_node(a.args[0])
+    return False
+
+
 def _raw_returns_remote_service(fn) -> bool:
-    """True if the tool has a `return _ok(<direct call to tc.*/bk.*>)` — a raw
-    remote-service pass-through that could echo operator-controlled strings to
-    the LLM. Catches the write/lifecycle leak class (Codex r8). AST-based."""
+    """True if the tool returns a raw remote-service (tc.*/bk.*) payload to _ok —
+    either directly (`return _ok(tc.x())`) OR via a local var tainted by a remote
+    call (`r = tc.x(); return _ok(r)`). Catches the write/lifecycle leak class
+    (Codex r8) + the local-var shape (Codex r9). AST-based, ignores docstrings."""
     import ast
     import inspect
-
-    def _is_remote_call(a):
-        if not isinstance(a, ast.Call):
-            return False
-        f = a.func
-        if (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name)
-                and f.value.id in ("tc", "bk")):
-            return True
-        # unwrap _redact_runtime_env(tc.x(...))
-        if isinstance(f, ast.Name) and f.id == "_redact_runtime_env" and a.args:
-            return _is_remote_call(a.args[0])
+    try:
+        tree = ast.parse(inspect.getsource(fn))
+    except (OSError, SyntaxError):
         return False
+    # names assigned directly from a remote call: `x = tc.foo(...)`
+    tainted = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and _is_remote_call_node(node.value):
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    tainted.add(t.id)
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Return) and isinstance(node.value, ast.Call)):
+            continue
+        v = node.value
+        if isinstance(v.func, ast.Name) and v.func.id == "_ok" and v.args:
+            arg = v.args[0]
+            if _is_remote_call_node(arg):
+                return True
+            if isinstance(arg, ast.Name) and arg.id in tainted:
+                return True
+    return False
 
+
+def _calls_remote_service(fn) -> bool:
+    """True if the tool makes ANY tc.*/bk.* remote-service call (Codex r9). Used
+    to keep the _NO_DATA set fail-closed: a no-data tool that touches a remote
+    service must be explicitly justified in _NO_DATA_REMOTE_OK."""
+    import ast
+    import inspect
     try:
         tree = ast.parse(inspect.getsource(fn))
     except (OSError, SyntaxError):
         return False
     for node in ast.walk(tree):
-        if not (isinstance(node, ast.Return) and isinstance(node.value, ast.Call)):
-            continue
-        ofn = node.value.func
-        if isinstance(ofn, ast.Name) and ofn.id == "_ok" and node.value.args:
-            if _is_remote_call(node.value.args[0]):
+        if isinstance(node, ast.Call):
+            f = node.func
+            if (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name)
+                    and f.value.id in ("tc", "bk")):
                 return True
     return False
 
@@ -3574,8 +3620,27 @@ def _():
                  if t not in _RAW_RETURN_OK
                  and _raw_returns_remote_service(getattr(server, t))]
     assert not offenders, (
-        f"_NO_DATA tools raw-returning a remote payload — project them + move to "
-        f"_DATA_TOOLS_REQUIRING_GUARD: {offenders}")
+        f"_NO_DATA tools raw-returning a remote payload (incl. via a local var) "
+        f"— project them + move to _DATA_TOOLS_REQUIRING_GUARD: {offenders}")
+
+
+@case("CC-ControlledAccess3", "META(fail-closed): _NO_DATA tools make no UNjustified remote call")
+def _():
+    # Codex r9: the raw-return check missed remote-derived data reaching _ok via
+    # dicts/helpers/subprocess. Stronger rule: a _NO_DATA tool may call a remote
+    # service ONLY if explicitly justified in _NO_DATA_REMOTE_OK (each returns an
+    # ack / caller-echo / own identity). A new no-data tool that touches tc.*/bk.*
+    # fails until a human classifies it.
+    assert _NO_DATA_REMOTE_OK <= _NO_DATA_TOOLS, (
+        f"_NO_DATA_REMOTE_OK has entries not in _NO_DATA_TOOLS: "
+        f"{sorted(_NO_DATA_REMOTE_OK - _NO_DATA_TOOLS)}")
+    offenders = [t for t in _NO_DATA_TOOLS
+                 if t not in _NO_DATA_REMOTE_OK
+                 and _calls_remote_service(getattr(server, t))]
+    assert not offenders, (
+        f"_NO_DATA tools calling a remote service without justification — add a "
+        f"controlled-mode projection + move to the guarded set, or justify in "
+        f"_NO_DATA_REMOTE_OK: {offenders}")
 
 
 @case("CC-ControlledAccess3", "META(fail-closed): every tool classified + every data tool AST-guarded")
@@ -4056,11 +4121,46 @@ def _():
         _os.unlink(tmp)
 
 
+@case("CC-ControlledAccess3", "terra_health withholds lock/bucket/IAM principals (sentinel) in controlled mode")
+def _():
+    from mcp_terra import policy as _p
+    saved, olock = _p._CONTROLLED_ACCESS, _p.resolve_locked_workspace
+    SENTINEL = "fc-secure-NA12878-secret"
+    _p.resolve_locked_workspace = lambda: {
+        "namespace": "ns", "name": "ws", "googleProject": "proj",
+        "bucketName": SENTINEL}
+    try:
+        _p._CONTROLLED_ACCESS = True
+        out = server.terra_health()
+        assert SENTINEL not in out, "terra_health leaked the locked bucket name!"
+        assert "proj" not in out, "terra_health leaked the google project!"
+        # booleans/status still present
+        assert "writes_allowed" in out and "tools_count" in out
+    finally:
+        _p._CONTROLLED_ACCESS, _p.resolve_locked_workspace = saved, olock
+
+
+@case("CC-SessionLimit", "runner atomically CLAIMS each spec (parallel-safe, no double-execution)")
+def _():
+    from mcp_terra import notebook_runner as nbr
+    s = nbr.runner_script_template()
+    # Codex r9: a stable per-runtime claim id + a no-clobber .claim marker with a
+    # read-back decides ownership, so two VMs on the same bucket run DIFFERENT
+    # jobs in parallel but never the SAME job twice.
+    assert "RUNNER_INSTANCE_ID" in s and "MCP_TERRA_RUNTIME_NAME:-legacy-runner" in s
+    assert 'CLAIM="$JOB_DIR/.claim"' in s
+    assert "gsutil cp -n - \"$CLAIM\"" in s and "CLAIM_OWNER" in s
+    assert "claimed by another runner" in s
+
+
 @case("CC-ControlledAccess3", "create_runtime/stop_runtime project the Leonardo response (source)")
 def _():
     import inspect
     csrc = inspect.getsource(server.terra_create_runtime)
     assert 'create_resp = {' in csrc and "controlled_access_enabled()" in csrc
+    # Codex r9: the auto-start "ready" block must ALSO drop the (lock-derived)
+    # bucket_uri in controlled mode, not just leo_create_response.
+    assert 'ready.pop("bucket_uri"' in csrc
     ssrc = inspect.getsource(server.terra_stop_runtime)
     assert '"action": "stop"' in ssrc and "controlled_access_enabled()" in ssrc
 

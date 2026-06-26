@@ -834,10 +834,10 @@ def terra_create_runtime(
             f"to start.\n--- on-VM runner log tail ---\n{tail}"
         )
 
-    return _ok({
+    ready = {
         "status": "ready",
         "runtime_name": runtime_name,
-        "google_project": google_project,
+        "google_project": google_project,   # caller-supplied positional arg
         "bucket_uri": bucket_clean,
         "leo_status": leo_status,
         "heartbeat_age_sec": hb_age,
@@ -847,7 +847,16 @@ def terra_create_runtime(
                     "heartbeat). Submit jobs with terra_submit_notebook_job — "
                     "no manual runner startup needed."),
         "leo_create_response": create_resp,
-    })
+    }
+    # Codex r9: bucket_uri may be DERIVED from the locked workspace, so it can
+    # disclose the locked bucket in guard mode — withhold it here too (the
+    # round-8 projection only covered leo_create_response, not this ready block).
+    if policy.controlled_access_enabled():
+        ready.pop("bucket_uri", None)
+        ready["_controlled_access_withheld"] = (
+            "bucket_uri (may be lock-derived) withheld "
+            "(MCP_TERRA_CONTROLLED_ACCESS).")
+    return _ok(ready)
 
 
 # ── Workspace bucket I/O — read + write with hard safety guards ─────────────
@@ -2245,6 +2254,23 @@ def terra_health() -> str:
         "tools_count": len(tools_index),
         "tools_index": tools_index,
     }
+    # Codex r9: terra_health is directly callable by the LLM. In guard mode it
+    # must NOT disclose the workspace lock identifiers, the heartbeat/bucket
+    # PATHS, or the IAM writer principals it samples — reduce those to
+    # booleans/counts/status. (Everything else is version/flag/hash/count.)
+    if policy.controlled_access_enabled():
+        info["workspace_lock"] = {"locked": lock is not None}
+        _hb = info.get("runner_heartbeat") or {}
+        info["runner_heartbeat"] = {"status": _hb.get("status"),
+                                    "age_sec": _hb.get("age_sec")}
+        _bw = info.get("bucket_jobs_writability") or {}
+        info["bucket_jobs_writability"] = {
+            "ok": _bw.get("ok"),
+            "writer_principal_count": _bw.get("writer_principal_count")}
+        info["_controlled_access_withheld"] = (
+            "workspace-lock identifiers, bucket/heartbeat paths, and IAM writer "
+            "principals withheld (MCP_TERRA_CONTROLLED_ACCESS); "
+            "booleans/counts/status only.")
     return _ok(info)
 
 
@@ -2593,14 +2619,17 @@ def terra_get_workflow_cost(namespace: str, name: str,
     # / entity ids. In guard mode keep ONLY numeric cost fields + the caller's own
     # ids (workflowId is the caller's argument).
     if policy.controlled_access_enabled() and isinstance(cost, dict):
+        # Codex r9: numeric-ONLY — drop the stringly workflowId, and validate
+        # currency against a hardcoded enum (it comes from the remote payload).
         _num = {k: v for k, v in cost.items()
                 if isinstance(v, (int, float)) and not isinstance(v, bool)}
+        _cur = cost.get("currency")
         cost = {
-            "workflowId": workflow_id,            # caller-supplied echo
-            "currency": cost.get("currency"),     # enum-like
+            "currency": (_cur if _cur in ("USD", "EUR", "GBP", "CAD", "AUD", None)
+                         else "[withheld: non-enum currency]"),
             **_num,
             "_controlled_access_withheld": (
-                "workflow/method/entity names withheld "
+                "workflow/method/entity names AND ids withheld "
                 "(MCP_TERRA_CONTROLLED_ACCESS); numeric cost fields only."),
         }
     return _ok(cost)

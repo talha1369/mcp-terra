@@ -427,6 +427,13 @@ SESSION_BUDGET_SEC=$(( MAX_RUN_HOURS * 3600 - SESSION_MARGIN_SEC ))
 RUNNER_START_EPOCH=$(date +%s)
 SESSION_DEADLINE=$(( RUNNER_START_EPOCH + SESSION_BUDGET_SEC ))
 SESSION_MIN_JOB_SEC=300   # refuse a new job if less than this remains
+# Stable id for THIS runner (the runtime name) — used to win an atomic per-spec
+# claim so two DIFFERENT VMs polling the same bucket can't execute/refuse the
+# same job twice. (Codex r9.) Stable (not pid/epoch) on purpose: a same-VM
+# restart reclaims its own in-flight jobs (preserving existing retry behaviour);
+# only a DIFFERENT runtime is serialized out. flock already prevents two runners
+# per VM, and runtime names are unique per VM.
+RUNNER_INSTANCE_ID="${MCP_TERRA_RUNTIME_NAME:-legacy-runner}"
 # `timeout` (coreutils) must exist to enforce the wall-clock budget — fail loud
 # rather than silently run unbounded.
 command -v timeout >/dev/null 2>&1 || {
@@ -506,6 +513,23 @@ while true; do
                 continue
                 ;;
         esac
+
+        # Codex r9: ATOMIC per-spec claim BEFORE any verify/execute/refuse, so two
+        # different VMs polling this bucket cannot both act on the same pending
+        # spec (double-execute or one-runs-while-other-refuses). Write a
+        # no-clobber .claim marker, then READ IT BACK: gsutil cp -n exits 0
+        # whether it wrote or skipped, so the read-back is what decides ownership.
+        # GCS is read-after-write consistent, so every runner reads the SAME
+        # owner; exactly the one whose id matches proceeds. Same-runtime restarts
+        # reclaim (id is the stable runtime name) — preserving existing retry
+        # behaviour for a crashed-mid-run job on the same VM.
+        CLAIM="$JOB_DIR/.claim"
+        printf '%s\n' "$RUNNER_INSTANCE_ID" | gsutil cp -n - "$CLAIM" 2>/dev/null || true
+        CLAIM_OWNER="$(gsutil cat "$CLAIM" 2>/dev/null | head -n1 || true)"
+        if [ "$CLAIM_OWNER" != "$RUNNER_INSTANCE_ID" ]; then
+            echo "[runner] job $JOB_ID claimed by another runner ('$CLAIM_OWNER'); skipping." >&2
+            continue
+        fi
 
         echo "[runner] picking up $JOB_ID"
 

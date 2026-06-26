@@ -410,6 +410,24 @@ tests exercise the templates in isolation, so these were latent):
     raw-returns a `tc.*`/`bk.*` payload** (the root cause that let the
     write-side leaks pass), with `terra_whoami` (caller's own identity) the only
     allowlisted exception. 31/43 tools now carry controlled-mode projections.
+- **Adversarial-review hardening (Codex) — round 9** (re-review of round-8):
+  closed 5 more findings.
+  - **Atomic per-spec runner claim** — the round-8 `REFUSED` status-skip wasn't
+    atomic; two runners (two VMs on one bucket) could both pick up the same
+    pending spec. The runner now wins an atomic claim (stable per-runtime id +
+    no-clobber `.claim` marker with read-back) BEFORE any verify/execute/refuse.
+    This is also the foundation for **parallel jobs**: different VMs claim and
+    run DIFFERENT specs concurrently, never the same one twice.
+  - `terra_create_runtime` auto-start "ready" block now drops the (lock-derived)
+    `bucket_uri` in guard mode (round-8 only projected `leo_create_response`).
+  - `terra_health` is projected in guard mode to booleans/counts/status —
+    `workspace_lock` identifiers, bucket/heartbeat paths, and sampled IAM writer
+    principals are withheld (it's directly LLM-callable).
+  - `get_workflow_cost` is numeric-only (drops `workflowId`; validates
+    `currency` against an enum).
+  - The structural meta-test now also catches the **local-var taint**
+    (`r = tc.x(); return _ok(r)`) and forbids any `_NO_DATA` tool from calling a
+    remote service unless justified in `_NO_DATA_REMOTE_OK` (fail-closed).
 - **No delete primitive, by design** — no tool (and no `leo_delete_runtime`
   at any layer) deletes a runtime or persistent disk; teardown is the user's
   action in the Terra UI ("Keep persistent disk"). The MCP detects a

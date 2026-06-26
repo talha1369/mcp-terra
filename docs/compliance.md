@@ -58,6 +58,7 @@ compliance reviewer.
 | `terra_create_runtime` / `terra_start_runtime` / `terra_stop_runtime` (return value) | allowed | **minimal ack** (runtime name = caller arg; labels/proxy-URL/creator withheld) |
 | `terra_get_workflow_cost` (return value) | allowed | **numeric cost fields only** (workflow/method/entity names withheld) |
 | `terra_upload_to_bucket` (return value) | allowed (raw gsutil output) | **upload ack only** (raw gsutil output / object paths withheld) |
+| `terra_health` (diagnostic tool) | full snapshot | **booleans/counts/status only** — workspace-lock identifiers, bucket/heartbeat paths, and IAM writer principals withheld |
 | `terra_get_submission` (per-workflow detail) | allowed | **reduced** to submission/workflow **ids + statuses** (entity names + failure messages withheld) |
 | `terra_get_workflow_logs` (per-task stderr) | allowed (path bound to the queried workspace bucket) | **content AND paths withheld** (per-task status kept; stderr can print controlled data) |
 | `terra_get_run_log` (stdout/stderr) | allowed | **content withheld** (paths + status kept; a notebook can print controlled data) |
