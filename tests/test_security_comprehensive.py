@@ -1402,7 +1402,7 @@ def _():
     # at least two post-run lease re-checks (after wait, and right before result.json)
     assert s.count('[ -f "$LOST_CLAIM" ] || [ -f "$RUNNER_ABORT" ]') >= 3, \
         "missing post-exit / pre-write lease re-checks"
-    assert "just before terminal write" in s
+    assert "skipping the terminal write" in s
 
 @case("CC-Hardening", "runner object fetched from a generation-pinned (immutable) URI")
 def _():
@@ -1465,7 +1465,9 @@ def _():
     # shared cost-control block (fail-streak accounting / auto-stop)
     seg = s[s.index("REFUSED-RESULT-UPLOAD-FAILED"):s.index("Fail-streak accounting")]
     assert "continue" not in seg, "upload-failure path still continues before cost controls"
-    assert "every post-papermill path" in s.lower() or "EVERY post-papermill path" in s
+    assert "EVERY path below MUST reach" in s, "missing every-path-reaches-cost-controls invariant"
+    # finding #1: processed-marking only after a SUCCESSFUL terminal status write
+    assert "leaving it UNPROCESSED so the claim ages out" in s
 
 
 # ──────────────────────────────────────────────────────────────────────────
