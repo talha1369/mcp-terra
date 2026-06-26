@@ -48,7 +48,7 @@ rc), and restart Claude Code:
 ```bash
 # Locate the bootstrap the plugin installed, then run it once with your workspace:
 BOOTSTRAP="$(find ~/.claude/plugins -name terra-bootstrap.sh -path '*mcp-terra*' 2>/dev/null | head -1)"
-bash "$BOOTSTRAP" claussnitzer-fdp/your-workspace
+bash "$BOOTSTRAP" your-namespace/your-workspace
 ```
 
 The plugin's MCP server launches via `scripts/terra-mcp-launch.sh`, which loads
@@ -60,7 +60,7 @@ to change workspace; it's idempotent.
 ```bash
 git clone https://github.com/talha1369/mcp-terra ~/projects/mcp-terra
 cd ~/projects/mcp-terra
-./install.sh claussnitzer-fdp/your-workspace     # deps, secret, `claude mcp add`
+./install.sh your-namespace/your-workspace     # deps, secret, `claude mcp add`
 claude
 ```
 

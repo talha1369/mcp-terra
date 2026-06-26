@@ -95,9 +95,9 @@ RO-Crate / PROV-O document; v1 keeps a single self-describing JSON.
 
   // ── workspace context ──────────────────────────────────────────────────
   "workspace": {
-    "namespace": "claussnitzer-fdp",
-    "name": "talha_notebooks",
-    "google_project": "terra-5264cde8",
+    "namespace": "your-namespace",
+    "name": "your-workspace",
+    "google_project": "terra-00000000",
     "bucket": "gs://fc-secure-…"
   },
 

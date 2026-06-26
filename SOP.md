@@ -53,7 +53,7 @@ gcloud config get-value account         # must be your Terra-registered email
 
 ```bash
 cd ~/projects/mcp-terra
-./install.sh claussnitzer-fdp/your-workspace
+./install.sh your-namespace/your-workspace
 ```
 
 That single command:
@@ -92,7 +92,7 @@ configured + strength_ok, and 41 tools registered:
 ```jsonc
 {
   "writes_allowed": true,
-  "workspace_lock": {"namespace":"claussnitzer-fdp","name":"...","bucketName":"fc-secure-..."},
+  "workspace_lock": {"namespace":"your-namespace","name":"...","bucketName":"fc-secure-..."},
   "runner_secret": {"configured": true, "strength_ok": true},
   "audit_chain": {"ok": true, "reason": "chain intact"},
   "tools_count": 41
@@ -329,12 +329,12 @@ you):
 1. **A copy of the repo** (or the share-pack tarball). The `requirements.lock`
    file contains pinned hashes for reproducible installs.
 2. **This SOP file (`SOP.md`)**.
-3. **Their Terra workspace name** (e.g. `claussnitzer-fdp/some-workspace`).
+3. **Their Terra workspace name** (e.g. `your-namespace/some-workspace`).
 
 Their install is **one command**:
 
 ```bash
-cd ~/projects/mcp-terra && ./install.sh claussnitzer-fdp/their-workspace
+cd ~/projects/mcp-terra && ./install.sh your-namespace/their-workspace
 ```
 
 `install.sh` will:

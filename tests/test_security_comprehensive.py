@@ -309,7 +309,7 @@ def _():
 @case("D-Bucket", "newline injection in bucket URI refused")
 def _():
     must_raise(safety.safe_bucket_uri, safety.SafetyError,
-               "gs://fc-secure-7d8a16eb-dee4-4839-95ea-800739f71952\nGET /evil HTTP/1.1")
+               "gs://fc-secure-00000000-0000-0000-0000-000000000000\nGET /evil HTTP/1.1")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -449,9 +449,9 @@ def _():
 
 @case("G-Edge", "validate_identifier accepts valid names")
 def _():
-    safety.validate_identifier("claussnitzer-fdp", "x")
-    safety.validate_identifier("talha_notebooks", "x")
-    safety.validate_identifier("terra-5264cde8", "x")
+    safety.validate_identifier("your-namespace", "x")
+    safety.validate_identifier("your-workspace", "x")
+    safety.validate_identifier("terra-00000000", "x")
     safety.validate_identifier("a.b.c.d.e", "x")
 
 @case("G-Edge", "validate_identifier refuses empty / leading non-alphanum")
@@ -638,10 +638,10 @@ def _():
 
 @case("M-Lock", "valid lock parses correctly (snapshot)")
 def _():
-    os.environ["MCP_TERRA_WORKSPACE"] = "claussnitzer-fdp/talha_notebooks"
+    os.environ["MCP_TERRA_WORKSPACE"] = "your-namespace/your-workspace"
     _reset_writes_snapshot()
     parsed = policy.get_locked_workspace_id()
-    assert parsed == ("claussnitzer-fdp", "talha_notebooks")
+    assert parsed == ("your-namespace", "your-workspace")
     os.environ.pop("MCP_TERRA_WORKSPACE", None)
     _reset_writes_snapshot()
 
@@ -882,16 +882,16 @@ def _():
 @case("R-Hardening", "_SAFE_GS_RE rejects whitespace in bucket URI")
 def _():
     must_raise(safety.safe_bucket_uri, safety.SafetyError,
-               "gs://fc-secure-7d8a16eb-dee4-4839-95ea-800739f71952/dir with space")
+               "gs://fc-secure-00000000-0000-0000-0000-000000000000/dir with space")
 
 @case("R-Hardening", "_SAFE_GS_RE rejects shell metachars in bucket URI")
 def _():
     must_raise(safety.safe_bucket_uri, safety.SafetyError,
-               "gs://fc-secure-7d8a16eb-dee4-4839-95ea-800739f71952/x`whoami`")
+               "gs://fc-secure-00000000-0000-0000-0000-000000000000/x`whoami`")
     must_raise(safety.safe_bucket_uri, safety.SafetyError,
-               "gs://fc-secure-7d8a16eb-dee4-4839-95ea-800739f71952/x;rm")
+               "gs://fc-secure-00000000-0000-0000-0000-000000000000/x;rm")
     must_raise(safety.safe_bucket_uri, safety.SafetyError,
-               "gs://fc-secure-7d8a16eb-dee4-4839-95ea-800739f71952/x$(id)")
+               "gs://fc-secure-00000000-0000-0000-0000-000000000000/x$(id)")
 
 @case("R-Hardening", "writes_allowed is snapshotted at startup, immune to env-flip")
 def _():
@@ -3340,7 +3340,7 @@ def _():
         _p._CONTROLLED_ACCESS = True
         _p._DATA_EGRESS_ALLOW = frozenset({"my-lab-open"})
         must_raise(_p.assert_data_egress_allowed, _p.PolicyError,
-                   "fc-secure-7d8a16eb", "object content")
+                   "fc-secure-00000000", "object content")
         for b in ("genomics-public-data", "gcp-public-data--broad-references",
                   "gatk-test-data", "my-lab-open"):
             _p.assert_data_egress_allowed(b, "x")   # EXACT public or allowlisted → ok

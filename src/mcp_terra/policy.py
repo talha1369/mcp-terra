@@ -286,7 +286,7 @@ def load_workspace_allowlist() -> set[str] | None:
 # strongest containment: even if a prompt-injection attacker hijacks the
 # agent, the blast radius is at most one workspace.
 #
-# Format: MCP_TERRA_WORKSPACE="claussnitzer-fdp/talha_notebooks"
+# Format: MCP_TERRA_WORKSPACE="your-namespace/your-workspace"
 # When unset: MCP operates in "open" mode (any workspace the user can see).
 
 import re as _re

@@ -248,8 +248,8 @@ def terra_get_workspace(namespace: str, name: str) -> str:
     """Get a workspace's bucket, googleProject, and other metadata. No cost.
 
     Args:
-        namespace: workspace billing project (e.g. 'claussnitzer-fdp')
-        name: workspace name (e.g. 'talha_notebooks')
+        namespace: workspace billing project (e.g. 'your-namespace')
+        name: workspace name (e.g. 'your-workspace')
 
     If MCP_TERRA_WORKSPACE is set, refuses if (namespace, name) doesn't match.
     """
@@ -2371,8 +2371,8 @@ def terra_list_method_configs(namespace: str, name: str) -> str:
     `terra_submit_workflow`.
 
     Args:
-        namespace: workspace billing project (e.g. 'claussnitzer-fdp')
-        name: workspace name (e.g. 'talha_notebooks')
+        namespace: workspace billing project (e.g. 'your-namespace')
+        name: workspace name (e.g. 'your-workspace')
     """
     safety.validate_freeform_string(namespace, "namespace", allow_empty=False)
     safety.validate_freeform_string(name, "name", allow_empty=False)

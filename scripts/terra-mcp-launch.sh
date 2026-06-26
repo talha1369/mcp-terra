@@ -20,7 +20,7 @@ then restart Claude Code:
 
     bash "${HERE}/terra-bootstrap.sh" <namespace>/<workspace>
 
-e.g.  bash "${HERE}/terra-bootstrap.sh" claussnitzer-fdp/your-workspace
+e.g.  bash "${HERE}/terra-bootstrap.sh" your-namespace/your-workspace
 EOF
   exit 1
 fi

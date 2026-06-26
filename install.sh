@@ -3,7 +3,7 @@
 #
 # Usage:
 #   ./install.sh                                # interactive — asks for workspace
-#   ./install.sh claussnitzer-fdp/your-ws      # non-interactive with workspace
+#   ./install.sh your-namespace/your-ws      # non-interactive with workspace
 #
 # What this does (idempotent — safe to re-run):
 #   1. Verifies Python ≥ 3.10, gcloud, gcloud ADC login, Claude Code CLI
@@ -155,7 +155,7 @@ step "Terra workspace"
 WORKSPACE="${1:-}"
 if [ -z "$WORKSPACE" ]; then
   printf "  Enter your Terra workspace as 'namespace/name'\n"
-  printf "  (e.g. claussnitzer-fdp/talha_notebooks): "
+  printf "  (e.g. your-namespace/your-workspace): "
   read -r WORKSPACE
 fi
 [[ "$WORKSPACE" == */* ]] || fail "Workspace must be 'namespace/name', got '$WORKSPACE'"

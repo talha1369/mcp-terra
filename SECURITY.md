@@ -202,7 +202,7 @@ Example settings.json entry:
       "command": "/Users/<you>/bin/python",
       "args": ["-m", "mcp_terra.server"],
       "env": {
-        "MCP_TERRA_WORKSPACE": "claussnitzer-fdp/talha_notebooks",
+        "MCP_TERRA_WORKSPACE": "your-namespace/your-workspace",
         "MCP_TERRA_ALLOW_WRITES": "0"
       }
     }
