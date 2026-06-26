@@ -5,7 +5,7 @@
   "author": {
     "name": "Broad Institute"
   },
-  "homepage": "https://github.com/talha1369/mcp-terra",
-  "repository": "https://github.com/talha1369/mcp-terra",
+  "homepage": "https://github.com/your-org/mcp-terra",
+  "repository": "https://github.com/your-org/mcp-terra",
   "keywords": ["terra", "bioinformatics", "wdl", "cromwell", "notebooks", "gcp", "broad"]
 }
