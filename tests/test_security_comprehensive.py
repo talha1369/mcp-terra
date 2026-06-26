@@ -860,7 +860,7 @@ def _():
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# R. HARDENING ROUND-2 (HMAC, snapshot, dir-collision, locks, regex)
+# R. HARDENING (HMAC, snapshot, dir-collision, locks, regex)
 # ──────────────────────────────────────────────────────────────────────────
 
 @case("R-Hardening", "_SAFE_GS_RE rejects whitespace in bucket URI")
@@ -997,7 +997,7 @@ def _():
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# S. ROUND-3 HARDENING (audit-driven CRITICAL/HIGH fixes)
+# S. HARDENING (audit-driven CRITICAL/HIGH fixes)
 # ──────────────────────────────────────────────────────────────────────────
 
 @case("CC-RunnerSecret", "runner script scrubs MCP_TERRA_RUNNER_SECRET before papermill")
@@ -4471,7 +4471,7 @@ def _():
     import re
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     pats = [re.compile(r"\breview r\d", re.I),
-            re.compile(r"\bround[ -]\d"),
+            re.compile(r"\bround[ -]\d", re.I),
             re.compile(r"\bCC-[A-Za-z]+\d")]
     files = (glob.glob(os.path.join(repo, "src/mcp_terra/*.py"))
              + [os.path.join(repo, f) for f in ("SECURITY.md", "CHANGELOG.md",
