@@ -248,6 +248,9 @@ _nset=0
 for _nk in $NOTIFY_KEYS; do
   _nv="$(printenv "$_nk" 2>/dev/null || true)"
   if [ -n "$_nv" ]; then
+    # a newline/CR in a value would inject extra lines into config.env — refuse
+    # (no legitimate Slack/SMTP value contains one). Robustness, not a boundary.
+    case "$_nv" in *$'\n'*|*$'\r'*) fail "$_nk contains a newline/CR — refusing (set a single-line value)." ;; esac
     NOTIFY_ENV_ARGS+=( -e "$_nk=$_nv" )
     NOTIFY_CONFIG_LINES="${NOTIFY_CONFIG_LINES}${_nk}=${_nv}
 "

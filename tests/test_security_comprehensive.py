@@ -1017,6 +1017,9 @@ def _():
             "0123456789ABCDEFGHIJKLMNOPQRSTUV",        # digit-then-alpha walk (32 unique)
             "qwertyuiopasdfghjklzxcvbnm123456",        # QWERTY walk  # pragma: allowlist secret
             "asdfghjklqwertyuiopzxcvbnm098765",        # mixed-row walk  # pragma: allowlist secret
+            "correcthorsebatterystaple12345!",         # famous xkcd example  # pragma: allowlist secret
+            "ToBeOrNotToBeThatIsTheQuestionX",         # well-known phrase  # pragma: allowlist secret
+            "iLoveYouSoVeryMuchForeverXyz1234",        # contains a common token  # pragma: allowlist secret
         ):
             _os.environ["MCP_TERRA_RUNNER_SECRET"] = weak
             must_raise(nbr.get_runner_secret, RuntimeError)
@@ -1584,6 +1587,8 @@ def _():
     # wired into BOTH sinks: the plugin config.env AND the claude mcp add registration
     assert "$NOTIFY_CONFIG_LINES" in sh and '>> "$CONFIG_TMP"' in sh, \
         "notification vars not appended to the staged config.env temp file"
+    # a newline/CR in a notification value must be refused (would inject config.env lines)
+    assert "contains a newline/CR" in sh, "install.sh must reject newline/CR in notification values"
 
 @case("CC-Hardening", "doc tool-counts stay in sync with the live registered tool count")
 def _():
@@ -6115,12 +6120,14 @@ def _():
             "cap=%r rate=%r must fail closed, did not (rc=%s)" % (cap, rate, rc)
         assert "failing closed" in blob, "cap=%r rate=%r: no fail-closed message" % (cap, rate)
     # empty / unset cap is the legitimate OPT-OUT (no spend cap) — the feature is
-    # opt-in, so it must run NORMALLY (not arm, not fail closed)
-    rc, out, err, events = _run_watchdog_snippet(
-        {"MCP_TERRA_MAX_COST_USD": "", "MCP_TERRA_VM_HOURLY_USD": "5"})
-    blob = out + err
-    assert rc == 0 and "RUNNER-LAUNCHED" in blob and "watchdog armed" not in blob, \
-        "empty cap must opt out (run uncapped), not arm or fail (rc=%s)" % rc
+    # opt-in, so it must run NORMALLY (not arm, not fail closed) REGARDLESS of the
+    # rate (a malformed/empty rate on an uncapped run must NOT halt — strict opt-out).
+    for _cap, _rate in (("", "5"), ("", "abc"), ("0", "abc"), ("0", "")):
+        rc, out, err, events = _run_watchdog_snippet(
+            {"MCP_TERRA_MAX_COST_USD": _cap, "MCP_TERRA_VM_HOURLY_USD": _rate})
+        blob = out + err
+        assert rc == 0 and "RUNNER-LAUNCHED" in blob and "watchdog armed" not in blob, \
+            "no-cap opt-out (cap=%r rate=%r) must run uncapped, not arm or halt (rc=%s)" % (_cap, _rate, rc)
     # a value that CONTAINS awk source must be passed as data, never executed
     sentinel = pathlib.Path(tempfile.mkdtemp()) / "PWNED"
     inj = '0)} END{system("touch %s")} BEGIN{exit !(1' % sentinel

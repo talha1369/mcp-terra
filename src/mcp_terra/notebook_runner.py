@@ -115,7 +115,12 @@ def _validate_secret_strength(secret) -> None:
       • Length: ≥ 32 chars (raised from 16 per a hardening audit)
       • Character diversity: ≥ 12 unique chars (defeats 'aaaa…' or simple
         repeating patterns that pass length but have low entropy)
-      • Not a recognizable trivial string (UUIDs, hex of common words)
+      • Not a predictable walk (alphabet / digit / QWERTY row+column) or a
+        repeated block, and not a well-known example / common password.
+
+    This is a guard against obviously-weak secrets, NOT a full strength
+    estimator: a novel high-entropy human passphrase can still pass. Always
+    prefer the generated token_urlsafe value the messages/installer steer to.
     """
     if not isinstance(secret, str):
         raise ValueError(f"secret must be str; got {type(secret).__name__}")
@@ -143,8 +148,8 @@ def _validate_secret_strength(secret) -> None:
     if shannon < 3.5:
         raise ValueError(
             f"MCP_TERRA_RUNNER_SECRET Shannon entropy {shannon:.2f} bits/char "
-            f"is below 3.5 (looks predictable: alphabet walks, repeating "
-            f"patterns, dictionary-derived strings fail this check). "
+            f"is below 3.5 (looks predictable: alphabet/keyboard walks and "
+            f"repeating patterns fail this check). "
             f"Use python -c 'import secrets; print(secrets.token_urlsafe(32))'."
         )
     # Shannon measures DISTRIBUTION, not GUESSABILITY: a full alphabet/keyboard
@@ -195,6 +200,25 @@ def _validate_secret_strength(secret) -> None:
                 f"MCP_TERRA_RUNNER_SECRET is mostly a repeated pattern "
                 f"({best_period:.0%} periodic) — guessable (e.g. a short word or "
                 f"block repeated). Use python -c "
+                f"'import secrets; print(secrets.token_urlsafe(32))'."
+            )
+    # Famous example / common-password screen. This is NOT a full strength
+    # estimator and does not claim to reject every human passphrase — but it must
+    # catch the well-known named strings a human types instead of token_urlsafe
+    # (above all the xkcd "correct horse battery staple") and common passwords
+    # that appear in any targeted guess list. Always prefer the generated token.
+    _low = secret.lower()
+    _COMMON = (
+        "correcthorsebatterystaple", "tobeornottobe", "thequickbrownfox",
+        "password", "passw0rd", "letmein", "qwerty", "iloveyou", "admin",
+        "welcome", "dragon", "monkey", "abc123", "trustno1", "changeme",
+        "superman", "baseball", "football", "starwars", "whatever",
+    )
+    for _w in _COMMON:
+        if _w in _low:
+            raise ValueError(
+                f"MCP_TERRA_RUNNER_SECRET contains a well-known/common secret "
+                f"phrase ({_w!r}) — guessable. Use python -c "
                 f"'import secrets; print(secrets.token_urlsafe(32))'."
             )
 
@@ -399,9 +423,16 @@ _WD_ACCUM="${MCP_TERRA_SPEND_ACCUM_FILE:-/home/jupyter/.mcp_terra_spend_seconds}
       exit 1
     }'
   }
-  if ! _wd_num "$_WD_CAP" || ! _wd_num "$_WD_RATE"; then
-    echo "[watchdog] non-numeric/non-finite spend cap or rate; failing closed (stopping, not launching runner)." >&2
-    _wd_stop "non-numeric spend cap/rate" 5
+  if ! _wd_num "$_WD_CAP"; then
+    echo "[watchdog] non-numeric/non-finite spend cap; failing closed (stopping, not launching runner)." >&2
+    _wd_stop "non-numeric spend cap" 5
+    exit 1
+  fi
+  # Validate the RATE only when a cap is actually set (cap>0). For an opt-out run
+  # (cap<=0) a malformed/empty rate is irrelevant and must NOT halt the VM.
+  if LC_ALL=C awk -v c="$_WD_CAP" 'BEGIN{exit !(c>0)}' && ! _wd_num "$_WD_RATE"; then
+    echo "[watchdog] non-numeric/non-finite hourly rate with a cap set; failing closed (stopping, not launching runner)." >&2
+    _wd_stop "non-numeric spend rate" 5
     exit 1
   fi
   # A cap set with no positive rate cannot be enforced (no spend estimate) — FAIL
@@ -958,9 +989,15 @@ kill_pool() {
 # the cap for the whole batch before the next top-of-loop check. Halts + exits
 # on breach; warns once at 80%.
 enforce_spend_cap() {
-    if ! _num "$MAX_COST_USD" || ! _num "$VM_HOURLY_USD"; then
-        echo "[runner] non-numeric/non-finite spend cap or rate — halting the VM (fail closed)." >&2
-        kill_pool; halt_vm "non-numeric spend cap/rate"; exit 1
+    if ! _num "$MAX_COST_USD"; then
+        echo "[runner] non-numeric/non-finite spend cap — halting the VM (fail closed)." >&2
+        kill_pool; halt_vm "non-numeric spend cap"; exit 1
+    fi
+    # Validate the RATE only when a cap is set (cap>0). For an opt-out run (cap<=0)
+    # a malformed/empty rate is irrelevant and must NOT halt — strict opt-out.
+    if LC_ALL=C awk -v c="$MAX_COST_USD" 'BEGIN{exit !(c>0)}' && ! _num "$VM_HOURLY_USD"; then
+        echo "[runner] non-numeric/non-finite hourly rate with a cap set — halting the VM (fail closed)." >&2
+        kill_pool; halt_vm "non-numeric spend rate"; exit 1
     fi
     # A cap with no positive rate cannot be enforced (no spend estimate). On the
     # legacy/no-watchdog path the runner is the sole enforcer, so FAIL CLOSED here
