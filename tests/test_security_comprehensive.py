@@ -1020,6 +1020,13 @@ def _():
             "correcthorsebatterystaple12345!",         # famous xkcd example  # pragma: allowlist secret
             "ToBeOrNotToBeThatIsTheQuestionX",         # well-known phrase  # pragma: allowlist secret
             "iLoveYouSoVeryMuchForeverXyz1234",        # contains a common token  # pragma: allowlist secret
+            # unmodified placeholder / template values — the single most plausible
+            # real-world weak secret (user copied a doc/template, forgot to replace)
+            "ChangeThisSecretBeforeProduction",        # pragma: allowlist secret
+            "ReplaceWithYourOwnSecretKeyHere1",        # pragma: allowlist secret
+            "PutYourRunnerSecretValueRightHere",       # pragma: allowlist secret
+            "InsertSecretKeyForTerraRunnerHere",       # pragma: allowlist secret
+            "MySuperSecretRunnerKeyDoNotShare",        # pragma: allowlist secret
         ):
             _os.environ["MCP_TERRA_RUNNER_SECRET"] = weak
             must_raise(nbr.get_runner_secret, RuntimeError)
@@ -1028,6 +1035,9 @@ def _():
         strong = _secrets.token_urlsafe(32)
         _os.environ["MCP_TERRA_RUNNER_SECRET"] = strong
         assert nbr.get_runner_secret() == strong
+        # the placeholder/common screens must NEVER reject a real generated token
+        for _ in range(5000):
+            assert nbr._validate_secret_strength(_secrets.token_urlsafe(32)) is None
     finally:
         for k, v in (("MCP_TERRA_RUNNER_SECRET", saved), ("MCP_TERRA_RUNNER_SECRET_FILE", savedf)):
             if v is None: _os.environ.pop(k, None)
@@ -4844,6 +4854,70 @@ def _():
         # one object MISSING from the destination (a raced cp -n skip) -> FAIL CLOSED
         state["good"] = True; state["drop_a"] = True
         must_raise(server.terra_upload_to_bucket, safety.SafetyError, base, BUCKET, recursive=True)
+    finally:
+        restore()
+        _bk2.upload_file, _bk2._run_gsutil, safety.safe_bucket_uri, safety.bucket_object_exists = o
+
+
+@case("CC-Hardening", "recursive upload verify uses the EXACT dest URI, not a suffix-decoy match")
+def _():
+    # Regression: the verifier used `_uri.endswith('/' + rel)` and broke on the
+    # FIRST listing match. A pre-existing sibling object that merely SHARES the
+    # relative-path suffix (e.g. a backup tree "out/oldbak/mydir/a.txt") with the
+    # CORRECT content could be matched in place of the REAL destination object —
+    # which a raced `cp -n` skip may have left holding wrong/stale bytes — yielding
+    # a false SUCCESS. The fix matches ONLY the two exact gsutil destination URIs.
+    import os as _os
+    import tempfile
+    from mcp_terra import policy as _p, bucket as _bk2
+    d = tempfile.mkdtemp()
+    base = _os.path.join(d, "mydir"); _os.makedirs(base)
+    open(_os.path.join(base, "a.txt"), "w").write("aaa")
+    BUCKET = "gs://fc-secure-x/out/"
+    GOOD_C, GOOD_M = "CRCgood==", "MD5good=="   # == local a.txt hashes
+    mode = {"v": ""}
+
+    def _obj(uri, c, m):
+        return [f"{uri}:", f"  Hash (crc32c):  {c}", f"  Hash (md5):  {m}"]
+
+    def _manifest():
+        # decoy is FIRST in listing order: it would win an endswith()+break match
+        decoy = _obj(f"{BUCKET}oldbak/mydir/a.txt", GOOD_C, GOOD_M)  # suffix-shares + correct
+        if mode["v"] == "real_wrong":          # real dest holds wrong content -> FAIL
+            return "\n".join(decoy + _obj(f"{BUCKET}mydir/a.txt", "WRONGc==", "WRONGm==")) + "\n"
+        if mode["v"] == "with_dir_ok":         # gsutil kept the top dir name, correct
+            return "\n".join(decoy + _obj(f"{BUCKET}mydir/a.txt", GOOD_C, GOOD_M)) + "\n"
+        if mode["v"] == "without_dir_ok":      # gsutil stripped the top dir name, correct
+            return "\n".join(decoy + _obj(f"{BUCKET}a.txt", GOOD_C, GOOD_M)) + "\n"
+        if mode["v"] == "decoy_only":          # ONLY the decoy exists, real dest missing -> FAIL
+            return "\n".join(decoy) + "\n"
+        return ""
+
+    def _run(args, **k):
+        if args and args[0] == "ls":
+            return _manifest()
+        if args and args[0] == "hash":
+            return f"Hash (crc32c):  {GOOD_C}\nHash (md5):  {GOOD_M}\n"
+        return ""
+    o = (_bk2.upload_file, _bk2._run_gsutil, safety.safe_bucket_uri, safety.bucket_object_exists)
+    _bk2.upload_file = lambda *a, **k: "Copying...\n"
+    _bk2._run_gsutil = _run
+    safety.safe_bucket_uri = lambda u: u
+    safety.bucket_object_exists = lambda u: False
+    restore = _write_guards_on(_p)
+    try:
+        # decoy carries correct content but the REAL dest is wrong -> FAIL CLOSED
+        mode["v"] = "real_wrong"
+        must_raise(server.terra_upload_to_bucket, safety.SafetyError, base, BUCKET, recursive=True)
+        # ONLY a suffix-decoy exists (no object at either exact dest URI) -> FAIL CLOSED
+        mode["v"] = "decoy_only"
+        must_raise(server.terra_upload_to_bucket, safety.SafetyError, base, BUCKET, recursive=True)
+        # real dest present (top dir name kept) and correct, decoy also present -> SUCCESS
+        mode["v"] = "with_dir_ok"
+        server.terra_upload_to_bucket(base, BUCKET, recursive=True)
+        # gsutil stripped the dir name (alternate naming): exact without-dir URI -> SUCCESS
+        mode["v"] = "without_dir_ok"
+        server.terra_upload_to_bucket(base, BUCKET, recursive=True)
     finally:
         restore()
         _bk2.upload_file, _bk2._run_gsutil, safety.safe_bucket_uri, safety.bucket_object_exists = o

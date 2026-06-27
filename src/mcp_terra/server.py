@@ -1263,17 +1263,33 @@ def terra_upload_to_bucket(local_path: str, bucket_uri: str,
                 if _m:
                     _manifest[_cur][1] = _m
         _base = local_path.rstrip("/")
+        _prefix = bucket_uri.rstrip("/")
         _missing = 0
         for _root, _ds, _fs in _osu.walk(_base):
             for _f in _fs:
                 _fp = _osu.path.join(_root, _f)
-                _rel = _osu.path.relpath(_fp, _osu.path.dirname(_base))   # includes the dir name
                 _lc, _lm = _hashes(["hash", _fp], f"local hash {_fp}")
+                # `gsutil cp -r` names the destination object in one of two ways
+                # depending on whether the prefix already existed: WITH the top
+                # directory name ("mydir/a.txt") or WITHOUT it ("a.txt"). Accept a
+                # match ONLY against one of these two EXACT destination URIs — never
+                # a suffix match anywhere in the listing. A decoy object that merely
+                # shares the trailing path (e.g. a sibling backup tree at
+                # "out/oldbak/mydir/a.txt") with the right content would otherwise
+                # satisfy the check while the REAL destination still holds a
+                # stale / raced / wrong-content object.
+                _rel_with = _osu.path.relpath(_fp, _osu.path.dirname(_base))
+                _rel_without = _osu.path.relpath(_fp, _base)
                 _found = False
-                for _uri, (_dc, _dm) in _manifest.items():
-                    if _uri.endswith("/" + _rel) or _uri == bucket_uri.rstrip("/") + "/" + _rel:
-                        _found = bool((_lm and _dm and _lm == _dm) or (_lc and _dc and _lc == _dc))
-                        break
+                for _rel in (_rel_with, _rel_without):
+                    _key = _prefix + "/" + _rel
+                    if _key not in _manifest:
+                        continue
+                    _dc, _dm = _manifest[_key]
+                    # the destination-candidate object exists → its content ALONE
+                    # decides; do NOT fall through to a looser match.
+                    _found = bool((_lm and _dm and _lm == _dm) or (_lc and _dc and _lc == _dc))
+                    break
                 if not _found:
                     _missing += 1
         if _missing:

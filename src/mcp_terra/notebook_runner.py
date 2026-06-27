@@ -221,6 +221,25 @@ def _validate_secret_strength(secret) -> None:
                 f"phrase ({_w!r}) — guessable. Use python -c "
                 f"'import secrets; print(secrets.token_urlsafe(32))'."
             )
+    # Placeholder / template screen. The single most plausible real-world weak
+    # secret is a doc/template value the user copied and forgot to replace (e.g.
+    # "ChangeThisSecretBeforeProduction"). A compromised secret defeats the whole
+    # HMAC defense, so reject the common template stems. None of these substrings
+    # occur in token_urlsafe output, so screening them is free (0 false-rejects).
+    _PLACEHOLDER = (
+        "changethis", "changethe", "replacewith", "replaceme", "replacethis",
+        "putyour", "insertyour", "insertsecret", "yoursecret", "yourkey",
+        "yourown", "yourpassword", "examplesecret", "examplekey", "placeholder",
+        "supersecret", "donotshare", "secrethere", "valuehere", "fillthisin",
+        "tobereplaced", "notarealsecret",
+    )
+    for _w in _PLACEHOLDER:
+        if _w in _low:
+            raise ValueError(
+                f"MCP_TERRA_RUNNER_SECRET looks like an unmodified placeholder / "
+                f"template value (contains {_w!r}) — set a real random secret. "
+                f"Use python -c 'import secrets; print(secrets.token_urlsafe(32))'."
+            )
 
 
 def sign_spec(spec: dict, secret: str) -> dict:
