@@ -212,8 +212,21 @@ def fold_confusables(text: str) -> str:
     compatibility forms.
     """
     import unicodedata as _ud
+
+    def _foldch(ch: str) -> str:
+        # Non-ASCII DECIMAL digits (Arabic-Indic ٢٩, Devanagari २९, Bengali ২৯, …)
+        # render like ASCII digits but NFKD does NOT fold them and the confusable
+        # table maps only letters — so a digit substituted into a numeric anchor
+        # (e.g. 'ya29.' → 'ya٢٩.') would slip the byte-scan. Map every non-ASCII
+        # Nd digit to its ASCII value so the anchored patterns fire.
+        if ord(ch) > 127 and _ud.category(ch) == "Nd":
+            _d = _ud.decimal(ch, None)
+            if _d is not None:
+                return str(_d)
+        return ch
+
     t = _ud.normalize("NFKD", text)
-    t = "".join(ch for ch in t
+    t = "".join(_foldch(ch) for ch in t
                 if ch in ("\t", "\n", " ") or _ud.category(ch) not in _STRIP_CATS)
     return t.translate(_CONFUSABLE_TABLE)
 
@@ -405,22 +418,27 @@ def scan_egress(text: str) -> list[dict]:
     # the real secret past with junk fillers — that was a bypass). The input is
     # already length-bounded by the callers (audio ≤4000 chars, email ≤64 KiB);
     # bound the total decoded volume and FAIL CLOSED on pathological volume.
+    # Scan BOTH the fold AND the whitespace-collapsed `dense` form: an encoded
+    # secret split by an inserted space/newline ('QUtJ QUlP…') has no ≥24-char run
+    # in `fold` but re-contiguates in `dense`, so decoding only `fold` missed it.
+    # Shared `_seen` decodes a blob appearing in both forms once.
     _seen: set = set()
     _total = 0
-    for _m in re.finditer(r"[A-Za-z0-9+/=_-]{24,}", fold):
-        _b = _m.group(0)
-        if _b in _seen or len(_b) > 200000:
-            continue
-        _seen.add(_b)
-        for _dec in _try_decode(_b):
-            if _dec:
-                _total += len(_dec)
-                hits += scan_bytes(_dec, "egress-decoded")
-        if _total > 4_000_000:   # pathological encoded volume → refuse (fail closed)
-            hits.append({"pattern": "egress_decode_volume", "severity": "HIGH",
-                         "source": "egress", "offset": 0,
-                         "context": "…[REDACTED—excessive encoded content]…"})
-            break
+    for _src in (fold, dense):
+        for _m in re.finditer(r"[A-Za-z0-9+/=_-]{24,}", _src):
+            _b = _m.group(0)
+            if _b in _seen or len(_b) > 200000:
+                continue
+            _seen.add(_b)
+            for _dec in _try_decode(_b):
+                if _dec:
+                    _total += len(_dec)
+                    hits += scan_bytes(_dec, "egress-decoded")
+            if _total > 4_000_000:   # pathological encoded volume → refuse (fail closed)
+                hits.append({"pattern": "egress_decode_volume", "severity": "HIGH",
+                             "source": "egress", "offset": 0,
+                             "context": "…[REDACTED—excessive encoded content]…"})
+                return hits
     return hits
 
 

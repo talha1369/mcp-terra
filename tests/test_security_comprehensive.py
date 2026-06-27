@@ -2859,6 +2859,31 @@ def _():
                  _b64e.b32encode(_tok.encode()).decode()):
         assert _audio_blocked(PRE + "result " + _enc + " done"), f"audio leaked encoded secret {_enc[:12]}"
         assert _email_blocked("result " + _enc + " done"), f"email leaked encoded secret {_enc[:12]}"
+    # REGRESSION (R16): an encoded secret split by an inserted space/newline/tab
+    # has no contiguous ≥24-char run in the fold but RE-CONTIGUATES in the
+    # whitespace-collapsed `dense` form — the decode pass must scan dense too. A
+    # recipient strips whitespace and base64-decodes in one step.
+    for _sec in (_tok, "AKIAIOSFODNN7EXAMPLE"):
+        _e = _b64e.b64encode(_sec.encode()).decode()
+        _mid = len(_e) // 2
+        for _ws in (" ", "\n", "\t"):
+            _split = "Archived blob " + _e[:_mid] + _ws + _e[_mid:] + " for the record."
+            assert _email_blocked(_split), f"email leaked whitespace-split encoded {_sec[:6]} ({_ws!r})"
+            assert _audio_blocked(PRE + _split), f"audio leaked whitespace-split encoded {_sec[:6]}"
+    # REGRESSION (R16): a non-ASCII DECIMAL digit (Arabic-Indic ٢٩, Devanagari २९,
+    # Bengali ২৯) substituted into the numeric 'ya29.' anchor must be folded to
+    # ASCII so the byte-scan fires — fold_confusables maps letters AND now digits.
+    _body = "a0AfH6SMBxyz1234567890ABCDEFGHIJKLMNOPqrstuvwx_-x"  # pragma: allowlist secret
+    for _d2, _d9 in (("٢", "٩"), ("२", "९"), ("২", "৯")):
+        _htok = "ya" + _d2 + _d9 + "." + _body
+        assert _email_blocked("The session token is " + _htok + " do not share it please."), \
+            f"email leaked digit-homoglyph ya29 ({hex(ord(_d2))})"
+        assert _audio_blocked("The session token is " + _htok + " do not share it now please."), \
+            f"audio leaked digit-homoglyph ya29 ({hex(ord(_d2))})"
+    # NO false positive: prose with real non-ASCII numerals / spaced hashes renders.
+    for _ok in ("Arabic numerals appear in prose like ٢٩ and ٣٠ samples were analyzed here today.",
+                "The result had 29 samples and the digest a94a8fe5ccb19ba61c4c0873d391e987 was logged here ok."):
+        assert not _audio_blocked(_ok), f"audio false-positive on numerals/hash: {_ok[:24]}"
     # GLUED to a preceding key/word (key=<b64>, JSON "k":"<b64>") must still be
     # caught (decode alignment offsets), and a JUNK-FILLER prefix must NOT disable
     # the decode pass for a real secret after it.
