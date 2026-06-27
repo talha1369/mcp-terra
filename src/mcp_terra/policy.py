@@ -127,40 +127,74 @@ def session_margin_sec() -> int:
     return max(60, min(m, 3600))
 
 
+def _spend_env_dollars(var: str, *, malformed_code: str, nonfinite_code: str,
+                       what: str) -> float:
+    """Parse a spend-control dollar/rate env var, FAILING CLOSED.
+
+    Unset or empty/whitespace → 0.0 (the control is intentionally off). But a
+    NON-empty value that is unparsable (e.g. ``500O``, ``"20 dollars"``) or
+    non-finite (``inf``/``nan``, including ``1e309``) raises PolicyError rather
+    than silently coercing to 0.0 — silently coercing would DISABLE the spend
+    control the user thought they set. Negative values clamp to 0."""
+    raw = os.environ.get(var, "").strip()
+    if not raw:
+        return 0.0
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        raise PolicyError(
+            f"{var} is not a valid number ({raw!r}); refusing rather than "
+            f"silently disabling the {what}.",
+            code=malformed_code,
+            user_action_required=f"set {var} to a finite number, or unset it")
+    if not math.isfinite(v):
+        raise PolicyError(
+            f"{var} is not finite ({raw!r}); refusing rather than silently "
+            f"disabling the {what}.",
+            code=nonfinite_code,
+            user_action_required=f"set {var} to a finite number, or unset it")
+    # Fail closed on float UNDERFLOW: a positive magnitude too small to represent
+    # (e.g. '5e-400') parses finite but becomes exactly 0.0 — silently disabling
+    # the control the user thought they set. A literal zero ('0', '0.0', '0e5')
+    # or a negative value is still allowed to mean "off" (clamped below).
+    if v == 0.0:
+        _mant = raw.lower().split("e")[0]
+        try:
+            _mant_positive = float(_mant) > 0.0
+        except (TypeError, ValueError):
+            _mant_positive = False
+        if _mant_positive:
+            raise PolicyError(
+                f"{var} ({raw!r}) is a positive value too small to represent "
+                f"(underflows to 0); refusing rather than silently disabling the "
+                f"{what}.",
+                code=nonfinite_code,
+                user_action_required=f"set {var} to a normal finite amount, or unset it")
+    return max(0.0, v)
+
+
 def max_cost_usd() -> float:
     """Workspace credit cap (USD) the user opts into via MCP_TERRA_MAX_COST_USD.
     0 / unset = no cap. When set, the on-VM runner self-HALTS the VM (stop/pause,
     persistent disk kept — never delete) before the estimated VM spend exceeds
-    it, and the submit tools warn in advance. Clamp >= 0."""
-    try:
-        c = float(os.environ.get("MCP_TERRA_MAX_COST_USD", "0") or "0")
-    except (TypeError, ValueError):
-        c = 0.0
-    if not math.isfinite(c):  # an inf cap is not enforceable by the runner — fail closed
-        raise PolicyError(
-            "MCP_TERRA_MAX_COST_USD is not a finite dollar amount (parses to "
-            "inf/nan); refusing rather than propagating an unenforceable cap.",
-            code="E_COST_NONFINITE",
-            user_action_required="set MCP_TERRA_MAX_COST_USD to a finite amount, or unset it")
-    return max(0.0, c)
+    it, and the submit tools warn in advance. Clamp >= 0. Fails closed on a
+    malformed / non-finite value."""
+    return _spend_env_dollars("MCP_TERRA_MAX_COST_USD",
+                              malformed_code="E_COST_MALFORMED",
+                              nonfinite_code="E_COST_NONFINITE",
+                              what="spend cap")
 
 
 def vm_hourly_usd() -> float:
     """The operator's VM hourly rate (USD) for the spend-cap estimate, set via
     MCP_TERRA_VM_HOURLY_USD. We do NOT hardcode GCP prices (they drift + vary by
     machine/GPU/region) — the estimate is honest (real uptime x the user's real
-    rate). 0 / unset = the VM self-halt is disabled (cap stays advisory)."""
-    try:
-        r = float(os.environ.get("MCP_TERRA_VM_HOURLY_USD", "0") or "0")
-    except (TypeError, ValueError):
-        r = 0.0
-    if not math.isfinite(r):  # an inf rate is not enforceable by the runner — fail closed
-        raise PolicyError(
-            "MCP_TERRA_VM_HOURLY_USD is not a finite rate (parses to inf/nan); "
-            "refusing rather than propagating an unenforceable rate.",
-            code="E_RATE_NONFINITE",
-            user_action_required="set MCP_TERRA_VM_HOURLY_USD to a finite $/hr, or unset it")
-    return max(0.0, r)
+    rate). 0 / unset = the VM self-halt is disabled (cap stays advisory). Fails
+    closed on a malformed / non-finite value."""
+    return _spend_env_dollars("MCP_TERRA_VM_HOURLY_USD",
+                              malformed_code="E_RATE_MALFORMED",
+                              nonfinite_code="E_RATE_NONFINITE",
+                              what="rate-based cap")
 
 
 # ── Rolling spend budget (opt-in; per-run cap OR over a time window) ─────────
@@ -175,29 +209,32 @@ _SPEND_LEDGER = CONFIG_DIR / "spend_ledger.jsonl"
 
 
 def budget_usd() -> float:
-    """Opt-in rolling spend budget (USD) over budget_window_days(). 0/unset = off."""
-    try:
-        b = float(os.environ.get("MCP_TERRA_BUDGET_USD", "0") or "0")
-    except (TypeError, ValueError):
-        b = 0.0
-    if not math.isfinite(b):
-        # inf/nan (e.g. 1e309 -> inf) must NOT silently disable the ceiling —
-        # fail closed so the user fixes the config instead of running unbounded.
-        raise PolicyError(
-            "MCP_TERRA_BUDGET_USD is not a finite dollar amount (got a value that "
-            "parses to inf/nan); refusing to run rather than silently disabling "
-            "the spend ceiling.",
-            code="E_BUDGET_NONFINITE",
-            user_action_required="set MCP_TERRA_BUDGET_USD to a finite amount, or unset it")
-    return max(0.0, b)
+    """Opt-in rolling spend budget (USD) over budget_window_days(). 0/unset = off.
+    Fails closed on a malformed / non-finite value (e.g. ``500O`` or ``1e309``)
+    rather than silently disabling the ceiling."""
+    return _spend_env_dollars("MCP_TERRA_BUDGET_USD",
+                              malformed_code="E_BUDGET_MALFORMED",
+                              nonfinite_code="E_BUDGET_NONFINITE",
+                              what="spend ceiling")
 
 
 def budget_window_days() -> int:
-    """The rolling window (days) the budget applies over. Default 30; clamp 1..366."""
+    """The rolling window (days) the budget applies over. Unset/empty → default 30;
+    clamp 1..366. FAILS CLOSED on a malformed non-empty value (consistent with the
+    dollar getters) — silently defaulting to 30 could weaken a longer intended
+    window and let more spend through."""
+    raw = os.environ.get("MCP_TERRA_BUDGET_WINDOW_DAYS", "").strip()
+    if not raw:
+        return 30
     try:
-        d = int(os.environ.get("MCP_TERRA_BUDGET_WINDOW_DAYS", "30") or "30")
+        d = int(raw)
     except (TypeError, ValueError):
-        d = 30
+        raise PolicyError(
+            f"MCP_TERRA_BUDGET_WINDOW_DAYS is not a valid integer ({raw!r}); "
+            f"refusing rather than silently using a default window that could "
+            f"weaken the budget ceiling.",
+            code="E_BUDGET_WINDOW_MALFORMED",
+            user_action_required="set MCP_TERRA_BUDGET_WINDOW_DAYS to an integer, or unset it")
     return max(1, min(d, 366))
 
 
@@ -215,8 +252,12 @@ def _read_ledger_window(now_epoch: float, *, strict: bool = False) -> tuple[list
     if not _SPEND_LEDGER.exists():
         return [], 0.0
     cutoff = now_epoch - budget_window_days() * 86400
+    # Read BYTES so a non-UTF-8 byte does not raise UnicodeDecodeError (a
+    # ValueError, NOT an OSError) past the handler. strict (reservation): an
+    # unreadable OR non-UTF-8 ledger fails CLOSED. lenient (advisory): degrade
+    # via errors="replace" so corrupt bytes drop their line, not the whole read.
     try:
-        raw = _SPEND_LEDGER.read_text(encoding="utf-8")
+        data = _SPEND_LEDGER.read_bytes()
     except OSError as e:
         if strict:
             raise PolicyError(
@@ -226,6 +267,16 @@ def _read_ledger_window(now_epoch: float, *, strict: bool = False) -> tuple[list
                 code="E_BUDGET_LEDGER_READ",
                 user_action_required="restore read access to the spend ledger in ~/.mcp-terra") from e
         return [], 0.0
+    try:
+        raw = data.decode("utf-8")
+    except UnicodeDecodeError as e:
+        if strict:
+            raise PolicyError(
+                f"spend ledger is not valid UTF-8 ({e}); refusing to reserve "
+                f"because rewriting now would drop prior commitments.",
+                code="E_BUDGET_LEDGER_READ",
+                user_action_required="repair the spend ledger in ~/.mcp-terra") from e
+        raw = data.decode("utf-8", errors="replace")
     kept: list[str] = []
     total = 0.0
     for line in raw.splitlines():
@@ -242,6 +293,10 @@ def _read_ledger_window(now_epoch: float, *, strict: bool = False) -> tuple[list
             ts = float(rec.get("ts", 0))
             usd = float(rec.get("usd", 0) or 0)
         except (TypeError, ValueError):
+            continue
+        # Drop non-finite entries: a tampered usd of Infinity/1e400 would otherwise
+        # sum to inf and PERMANENTLY brick the budget (every reserve refused).
+        if not (math.isfinite(ts) and math.isfinite(usd)):
             continue
         if ts >= cutoff:
             kept.append(s)
@@ -415,8 +470,13 @@ def release_reservation(token: str | None) -> None:
         try:
             if not _SPEND_LEDGER.exists():
                 return
+            # read BYTES + decode with errors="replace" so a non-UTF-8 byte can
+            # never raise UnicodeDecodeError (a ValueError) past the OSError
+            # handler — the "never raises" contract must hold (it runs inside the
+            # create-failure except, where raising would mask the real error).
+            raw = _SPEND_LEDGER.read_bytes().decode("utf-8", errors="replace")
             kept = []
-            for line in _SPEND_LEDGER.read_text(encoding="utf-8").splitlines():
+            for line in raw.splitlines():
                 s = line.strip()
                 if not s:
                     continue

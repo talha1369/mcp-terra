@@ -1,33 +1,48 @@
+<div align="center">
+
+<img src="docs/banner.svg" alt="mcp-terra" width="100%">
+
 # mcp-terra
 
-![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
-![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)
-![Tests](https://img.shields.io/badge/tests-392%20passing-brightgreen.svg)
-![Lint](https://img.shields.io/badge/lint-ruff-black.svg)
-![Security](https://img.shields.io/badge/security-detect--secrets%20%2B%20pip--audit-success.svg)
-<!-- After publishing, add the live CI badge:
-![CI](https://github.com/talha1369/mcp-terra/actions/workflows/ci.yml/badge.svg) -->
+**Run, auto-fix, and explain your Terra notebooks &amp; WDL workflows from a single
+sentence — with no delete or overwrite primitive anywhere.**
+
+[![CI](https://github.com/talha1369/mcp-terra/actions/workflows/ci.yml/badge.svg)](https://github.com/talha1369/mcp-terra/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-0b4a86.svg)](LICENSE)
+![Python](https://img.shields.io/badge/python-3.10%2B-0b4a86.svg)
+![Security](https://img.shields.io/badge/security-detect--secrets%20%2B%20pip--audit-74ae43.svg)
+![Destruction primitives: zero](https://img.shields.io/badge/destruction%20primitives-zero-74ae43.svg)
+
+</div>
+
+---
 
 An MCP (Model Context Protocol) server that lets an AI assistant — any MCP-aware
 agent — manage Terra (terra.bio) workspaces, runtime VMs, workspace buckets,
 and WDL/Cromwell workflows on your behalf.
 
-**The gap it closes:** on your laptop an AI coding assistant runs your code and
-fixes the bugs; on Terra it could only copy a notebook into your bucket. mcp-terra
-lets the assistant drive the *whole loop* — provision the right-sized VM, run the
-notebook, **auto-fix** failures and re-run, then **email a verified report + an
-audio explainer** of the results — from a single sentence, with **no
-delete/overwrite primitive anywhere** and a controlled-access guard, spend cap,
-and 24h-session awareness built in.
+> **The gap it closes:** on your laptop an AI coding assistant runs your code and
+> fixes the bugs; on Terra it could only copy a notebook into your bucket.
+> `mcp-terra` lets the assistant drive the *whole loop* — provision the
+> right-sized VM, run the notebook, **auto-fix** failures and re-run, then
+> **email a verified report + an audio explainer** of the results — with a
+> controlled-access guard, spend caps, and 24h-session awareness built in.
 
-Built for the Broad / Stanford Terra ecosystem. Wraps these Terra services:
+### What you can do
 
-- **Rawls** — workspaces, data tables, submissions, method configs
-- **Leonardo** — runtime (Jupyter VM) lifecycle + seamless on-boot runner
-- **Sam** — Terra user identity
-- **Agora** — WDL method registration
-- **Cromwell** (via Rawls) — workflow submission, metadata, cost
-- plus **gsutil** for bucket I/O
+|   |   |
+|---|---|
+| 🚀 **Run the whole loop** | Provision a right-sized VM → run the notebook → auto-fix bugs → re-run, from one sentence. |
+| 🛠️ **Deterministic auto-fix** | Tier-0 triage (`missing_module`, `name_error`, …) fixes most failures with no LLM cost; escalates only when needed. |
+| 📧 **Verified report + audio** | A second agent cross-checks the report against the run log; optional NotebookLM-style audio explainer. |
+| 🧬 **WDL / Cromwell** | Author, register, and submit workflows; a `scatter` fans hundreds of Batch tasks out in parallel. |
+| 🔒 **Safe by construction** | **No delete or overwrite primitive at any layer** — plus a workspace-bucket allowlist, HMAC-signed jobs, an audit trail, and a kill-switch. |
+| 💸 **Spend controls** | Optional per-run cap + rolling time-window budget; at the cap the VM **self-pauses** (disk kept — never deleted). |
+
+Built for the Broad / Stanford Terra ecosystem. Wraps **Rawls** (workspaces, data
+tables, submissions, method configs), **Leonardo** (runtime VMs + seamless on-boot
+runner), **Sam** (identity), **Agora** (WDL methods), **Cromwell** via Rawls
+(workflow submit, metadata, cost), and **gsutil** for bucket I/O.
 
 ## Install
 
@@ -88,36 +103,9 @@ Run <my-notebook>.ipynb via the auto-fix loop, auto-stop on success, email me th
 
 ## Architecture (trust boundaries)
 
-```
-   ┌─────────────┐    MCP stdio    ┌─────────────────────┐
-   │ Claude /    │ ──────────────► │ mcp-terra (local)   │
-   │ MCP client  │ ◄────────────── │  • _pre() gate      │
-   └─────────────┘                 │  • safety.py        │
-                                   │  • policy.py        │
-                                   │  • audit chain      │
-                                   └──┬──────────────┬───┘
-                            HMAC-     │              │   gcloud OAuth
-                            signed    │              │   (user identity)
-                            spec      ▼              ▼
-                              ┌──────────────┐   ┌──────────────┐
-                              │ GCS bucket   │   │ Terra REST   │
-                              │ (workspace)  │   │ Rawls/Leo/Sam│
-                              └──────┬───────┘   └──────────────┘
-                                     │
-                              polled │   uploads result.json
-                              every  │   + runner.log
-                              15s    ▼   (HMAC-signed)
-                              ┌──────────────────┐
-                              │ on-VM runner.sh  │
-                              │  • verifies sig  │
-                              │  • verifies sha  │
-                              │  • runs papermill│
-                              │  • heartbeat     │
-                              └──────────────────┘
-                                     │
-                                     ▼
-                              Jupyter VM
-```
+<div align="center">
+<img src="docs/architecture.svg" alt="mcp-terra architecture: agent → safety-gated MCP → Terra REST + GCS bucket → on-VM runner+watchdog → Jupyter VM" width="100%">
+</div>
 
 **Trust boundaries:**
 - `Agent ⇄ MCP`: stdio, in-process. Agent input is treated as untrusted.
@@ -292,13 +280,95 @@ hijack). To change a value, restart the MCP process.
 | `MCP_TERRA_SLACK_BOT_TOKEN` | *(unset)* | Slack file upload | `xoxb-…` bot token (Slack app with `files:write`). Required to attach the audio file to Slack (webhooks can't upload files). |
 | `MCP_TERRA_SLACK_CHANNEL` | *(unset)* | Slack file upload | One **or more** targets (comma/space-separated) the bot uploads into — DM **and/or** channel. A **channel ID** (`C…`/`G…`; bot must be a member — `/invite @bot`), and/or a **user ID** (`U…`) to DM that user (no invite needed; requires the `im:write` bot scope). E.g. `U0123ABCD, C0456WXYZ`. Each target's outcome is reported independently. |
 
+## Notifications: email + Slack (setup)
+
+End-of-run reports (and the NotebookLM-style audio explainer) can be delivered by
+**email** and/or **Slack**. Both are **optional** and **off by default** — with no
+setup the report is written as a local `.eml` file you can open.
+
+**Where to put these variables.** They're read **once at MCP startup** (snapshotted —
+changing them mid-session has no effect; restart the MCP after editing):
+- **Plugin install (Option A):** add them to `~/.mcp-terra/config.env` (one
+  `KEY=value` per line), then restart Claude Code.
+- **One-shot installer (Option B):** add `--env KEY=value` to your `claude mcp add`
+  (or `./install.sh`) registration, or `export` them in the shell you launch
+  `claude` from.
+
+> **Safety built in:** the email recipient is **hard-locked to your own Terra
+> account email** (there is no `to:` parameter — defeats data-exfil-by-email), and
+> the Slack webhook/token are **locked at startup** (the `terra_notify_slack` tool
+> has no URL/token parameter). Secrets live only in your env/`config.env`
+> (mode `0600`), never in chat or the audit log.
+
+### Email — pick ONE mode
+
+**A · Zero setup (local `.eml` file).** Leave all `MCP_TERRA_SMTP_*` unset. The MCP
+writes the report to `~/.mcp-terra/reports/<id>.eml` (mode `0600`) and returns the
+path; open or forward it yourself. No credentials anywhere.
+
+**B · Authenticated send (e.g. Gmail app password).** Use a scoped **app password**,
+never your real account password:
+1. Enable 2-Step Verification on the Google account, then create an **App Password**
+   at <https://myaccount.google.com/apppasswords> (pick "Mail").
+2. Set:
+   ```bash
+   MCP_TERRA_SMTP_HOST=smtp.gmail.com
+   MCP_TERRA_SMTP_PORT=587            # 587 = STARTTLS (default); 465 = implicit TLS
+   MCP_TERRA_SMTP_USER=you@broadinstitute.org
+   MCP_TERRA_SMTP_PASS='<the-16-char-app-password>'   # NOT your login password
+   ```
+3. Restart the MCP, then ask Claude to email a report — it sends to your Terra email.
+
+**C · Relay, no password (org SMTP relay that authorizes by IP).** For a
+Broad/Workspace relay:
+```bash
+MCP_TERRA_SMTP_HOST=smtp-relay.gmail.com
+MCP_TERRA_SMTP_RELAY=1              # explicit opt-in; sends without USER/PASS
+```
+A merely *forgotten* password never silently relays — relay requires the explicit
+`=1`; otherwise the MCP falls back to the `.eml` file (mode A).
+
+### Slack — two levels
+
+> Slack has no "app password" — the equivalent credential is a **bot OAuth token**
+> (`xoxb-…`) you create in a Slack app (steps below). For just a text ping you only
+> need a webhook URL (no token).
+
+**1 · Text ping (incoming webhook).** Simplest; posts the run summary as text.
+1. In Slack: **Create app → From scratch** (<https://api.slack.com/apps>), pick your
+   workspace → **Incoming Webhooks → Activate** → **Add New Webhook to Workspace**,
+   choose the channel, and copy the `https://hooks.slack.com/services/…` URL.
+2. Set `MCP_TERRA_SLACK_WEBHOOK='https://hooks.slack.com/services/…'` and restart.
+
+**2 · File upload (attach the audio explainer).** Webhooks can't upload files, so an
+audio attachment needs a **bot token**:
+1. In your Slack app → **OAuth & Permissions** → add the Bot Token Scopes
+   `files:write` (and `im:write` if you want it to DM you) → **Install to Workspace**
+   → copy the **Bot User OAuth Token** (`xoxb-…`).
+2. Find your target ID(s): a **channel ID** (`C…`/`G…` — open the channel → *View
+   channel details* → ID at the bottom; then `/invite @your-bot` in that channel),
+   and/or your **user ID** (`U…` — your profile → *Copy member ID*) to receive a DM.
+3. Set:
+   ```bash
+   MCP_TERRA_SLACK_BOT_TOKEN='xoxb-…'
+   MCP_TERRA_SLACK_CHANNEL='U0123ABCD, C0456WXYZ'   # DM and/or channel; comma/space-separated
+   ```
+   Restart the MCP. Each target's success/failure is reported independently.
+
+### Try it
+
+```text
+Run my notebook via the bug-fix loop and email me the report.        # email
+Run it and post the result + audio to Slack.                          # Slack
+```
+
 ## Tool reference
 
 All tools take simple parameters (strings, ints, bools) and return JSON
 (or plain text). See docstrings in `src/mcp_terra/server.py` for full args.
 
 This lists the most-used tools; `terra_health` reports the exact
-`tools_count` (currently **39**), and `src/mcp_terra/server.py` is the
+`tools_count` (currently **45**), and `src/mcp_terra/server.py` is the
 authoritative reference for every tool and its arguments.
 
 ### Read-only / inspection
@@ -578,26 +648,81 @@ and a high-mem env for preprocessing — and submit jobs to the shared bucket;
 the running runtimes divide them. (For one VM to run several jobs at once, see
 single-VM concurrency; for large fan-out, prefer the WDL/Cromwell scatter path.)
 
-## Example collaboration flow
+## Use cases
+
+Grouped by what people actually ask for:
+
+| Category | Example asks |
+|---|---|
+| **Run & debug** | "run this notebook and fix whatever breaks", "re-run only the failed WDL shards", "why did my submission fail?" |
+| **Inspect** | "which of my VMs are running?", "tail the training log", "list my last workflow's outputs", "what did that run cost?" |
+| **Author & submit** | register a WDL method, create a method config, submit a Cromwell workflow with a `scatter` |
+| **Cost hygiene** | "pause every running VM before I leave", "run this but cap spend at $20" |
+| **Report** | verified end-of-run report + NotebookLM-style audio explainer, by email or Slack |
+
+## Example sessions
+
+Realistic, end-to-end. The agent calls MCP tools (shown in `[brackets]`); the hard
+safety guards apply to every one.
+
+### 1 · Run a notebook, auto-fix the bugs, email a verified report
+
+*Verified end-to-end on real Terra (provision → fail → auto-fix → succeed → audio email).*
 
 ```text
-You:    "Run my analysis.ipynb on Terra, fix any bugs, and email me the results."
+You:    Run my analysis.ipynb on Terra, fix any bugs, and email me the results.
 Claude: [terra_recommend_runtime_for_notebook] → "Needs a T4 GPU VM (~$0.50/hr). OK?"
-You:    "yes"
-Claude: [terra_create_runtime]  → blocks ~5 min, returns status="ready"
-          (VM Running AND runner live — no SSH, no IAM, no manual step)
+You:    yes
+Claude: [terra_create_runtime] → ~5 min → status="ready"
+          (VM Running AND on-VM runner live — no SSH, no IAM, no manual step)
         [terra_submit_notebook_job auto_stop=True] → job_id
         [terra_get_notebook_job_result wait_for_complete=True]
-          → FAILED: triage = missing_module 'pyarrow'
-        → prepends '!pip install pyarrow', re-uploads (.BAK), re-submits
+          → FAILED · triage = missing_module 'pyarrow'
+        → prepends '!pip install pyarrow', re-uploads (old kept as .BAK), re-submits
           → succeeded (rc=0)
-        [terra_get_run_log] → verifier sub-agent cross-checks the report
+        [terra_get_run_log] → a verifier sub-agent cross-checks the report vs the log
         [terra_render_audio_summary] + [terra_send_run_report_email]
           → "Emailed you the verified report + a NotebookLM-style audio explainer."
 ```
 
-(This whole flow is the `terra-bugfix-loop` skill — provision → run → auto-fix
-→ verified report + audio email.)
+### 2 · Triage a failed Cromwell submission
+
+```text
+You:    My submission 1a2b… failed — what happened?
+Claude: [terra_get_submission] → 3 of 40 workflows Failed
+        [terra_get_workflow_logs failed_only=True] → reads the per-task Cromwell stderr
+        [terra_classify_workflow_failure] → deterministic categories:
+```
+
+| shard | task | category | cause |
+|---|---|---|---|
+| 7 | HaplotypeCaller | `oom` | killed at ~13 GB (request ≥ 16 GB) |
+| 22 | HaplotypeCaller | `oom` | same |
+| 31 | MergeVcfs | `missing_file` | upstream shard 7 produced no output |
+
+```text
+Claude: "Two OOMs plus one downstream miss. Bump HaplotypeCaller memory to 16 GB and
+         re-submit — call-caching re-runs only the 3 failed shards, not all 40."
+```
+
+### 3 · Cap the spend up front
+
+```text
+You:    Train on a GPU box, but don't let it cost more than $20.
+Claude: [terra_create_runtime gpu_type=nvidia-tesla-t4 max_cost_usd=20 vm_hourly_usd=0.55]
+          → an independent on-VM watchdog self-PAUSES the VM (disk kept — never
+            deleted) before estimated spend reaches $20, warning at 80% first.
+        [terra_submit_notebook_job …] → runs under the cap.
+```
+
+### 4 · End-of-day cost hygiene
+
+```text
+You:    Pause every running VM in my workspace.
+Claude: [terra_list_runtimes] → 3 Running
+        [terra_stop_runtime] ×3
+          → "Paused all 3 (persistent disks kept). The MCP has no delete primitive."
+```
 
 ## Auth notes
 
@@ -610,8 +735,6 @@ Claude: [terra_create_runtime]  → blocks ~5 min, returns status="ready"
 
 ## Limitations / not-yet-supported
 
-- **WDL / Cromwell workflows** — not yet supported (planned). Use the Terra
-  UI for workflow submission for now.
 - **No interactive Jupyter-kernel control** — the MCP executes notebooks
   *headless* via the on-VM runner (`papermill`) — that's how the bug-fix loop
   runs them — but it does not drive cells in a live, interactive kernel.

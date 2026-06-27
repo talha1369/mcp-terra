@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="300" viewBox="0 0 1200 300" role="img" aria-label="mcp-terra — safety-gated automation for Terra; append-only, never deletes">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#062a4e"/>
+      <stop offset="0.6" stop-color="#0a3f74"/>
+      <stop offset="1" stop-color="#0b4a86"/>
+    </linearGradient>
+    <style>
+      .t    { font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+      .mono { font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace; }
+      .word { font-weight: 800; font-size: 72px; fill: #f5f9ff; letter-spacing: -2px; }
+      .eye  { font-weight: 700; font-size: 16px; fill: #74ae43; letter-spacing: 4px; }
+      .lead { font-weight: 500; font-size: 25px; fill: #cfe0f2; }
+      .pipe { font-weight: 600; font-size: 19px; fill: #a9c6e3; }
+      .cap  { font-weight: 600; font-size: 14px; fill: #9fc0e0; letter-spacing: 1px; }
+      .plus { font-weight: 800; font-size: 19px; fill: #74ae43; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="300" rx="18" fill="url(#bg)"/>
+
+  <!-- left: eyebrow / wordmark / thesis / pipeline -->
+  <text x="64" y="62" class="t eye">SAFETY-GATED AUTOMATION FOR TERRA</text>
+  <text x="62" y="132" class="t word">mcp-terra</text>
+  <rect x="64" y="150" width="190" height="5" rx="2.5" fill="#74ae43"/>
+
+  <text x="64" y="190" class="t lead">Run, auto-fix &amp; explain your Terra notebooks &amp; WDL —</text>
+  <text x="64" y="222" class="t lead">with <tspan fill="#f5f9ff" font-weight="700">no delete or overwrite primitive anywhere.</tspan></text>
+
+  <!-- pipeline as a technical instrument readout (monospace), Terra-green arrows -->
+  <g class="mono pipe" transform="translate(64,262)">
+    <text x="0" y="14">provision</text>
+    <text x="120" y="14" fill="#74ae43">→</text>
+    <text x="140" y="14">run</text>
+    <text x="190" y="14" fill="#74ae43">→</text>
+    <text x="210" y="14">auto-fix</text>
+    <text x="316" y="14" fill="#74ae43">→</text>
+    <text x="336" y="14">verified report + audio</text>
+  </g>
+
+  <!-- SIGNATURE: append-only strata. Layers only ACCRETE (green +), never erased.
+       Bands run Terra-green (newest, top) → Broad-blue (oldest) — both brand colors;
+       encodes "terra" (strata) and the no-delete invariant as the brand mark. -->
+  <g transform="translate(905,70)">
+    <rect x="36" y="0"   width="190" height="20" rx="4" fill="#74ae43" opacity="0.95"/>
+    <rect x="22" y="28"  width="204" height="20" rx="4" fill="#3f9e7a" opacity="0.92"/>
+    <rect x="44" y="56"  width="182" height="20" rx="4" fill="#2f86c9" opacity="0.92"/>
+    <rect x="14" y="84"  width="212" height="20" rx="4" fill="#1f6fb2" opacity="0.9"/>
+    <rect x="40" y="112" width="186" height="20" rx="4" fill="#14507f" opacity="0.9"/>
+    <text x="6"  y="15"  class="t plus">+</text>
+    <text x="6"  y="43"  class="t plus">+</text>
+    <text x="6"  y="71"  class="t plus">+</text>
+    <text x="6"  y="99"  class="t plus">+</text>
+    <text x="6"  y="127" class="t plus">+</text>
+    <text x="0"  y="160" class="mono cap">append-only · never deleted</text>
+  </g>
+</svg>

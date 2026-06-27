@@ -689,10 +689,11 @@ def terra_create_runtime(
         # A cap is only a real ceiling if the on-VM runner can ENFORCE it: it needs
         # a positive $/hr to estimate spend AND the auto-start runner installed to
         # act on it (the runner enforces only when BOTH MAX_COST_USD>0 and
-        # VM_HOURLY_USD>0). Require both whenever a budget is in force OR a per-run
-        # cap was requested — otherwise the ledger would record a commitment the VM
-        # cannot honor and actual spend could exceed the budget.
-        if policy.budget_usd() > 0 or max_cost_usd > 0:
+        # VM_HOURLY_USD>0). Gate on the EFFECTIVE cap (_eff_cap), which includes the
+        # MCP_TERRA_MAX_COST_USD env default — NOT the raw arg — so an env-only cap
+        # can't slip through with a zero rate or auto_start_runner=False. (A budget
+        # in force always ends with _eff_cap>0 or a requires-cap refusal below.)
+        if _eff_cap > 0:
             if _eff_rate <= 0:
                 raise policy.PolicyError(
                     "a spend cap was requested (max_cost_usd or MCP_TERRA_BUDGET_USD) "
@@ -873,22 +874,22 @@ def terra_create_runtime(
             start_user_script_uri=start_user_script_uri,
             custom_env_vars=custom_env_vars,
         )
-    except Exception:
-        # leo_create_runtime is a non-idempotent POST: an ambiguous failure
-        # (read timeout, connection reset, 5xx after Leonardo accepted) may have
-        # created a billable VM. Release the reservation ONLY if we can CONFIRM
-        # the runtime does not exist (a definitive 404); otherwise KEEP it (fail
-        # closed) so a VM that may be billing can't oversubscribe the budget.
+    except Exception as _ce:
+        # leo_create_runtime is a non-idempotent POST. Classify by the FAILURE
+        # itself, not by probing for a runtime (a probe can't tell a VM this call
+        # created from a pre-existing one — a 409 name-conflict would falsely look
+        # "created"). Release the reservation ONLY for statuses Leonardo returns
+        # as a PRE-create rejection (the request definitively created no VM): bad-
+        # request / auth / forbidden / not-found / validation. KEEP it for
+        # everything else — 408/425/429 (may be throttled AFTER accept), 409
+        # (conflict / retry edge), any other 4xx, all 5xx, status 0 (network), and
+        # non-API exceptions — because the create may have been accepted and may
+        # now bill, so releasing would let later creates oversubscribe the budget.
+        _NO_CREATE_STATUSES = (400, 401, 403, 404, 422)
         if _budget_token is not None:
-            _confirmed_absent = False
-            try:
-                tc.leo_get_runtime(token, google_project, runtime_name)
-                # runtime EXISTS → it bills → keep the reservation
-            except tc.TerraAPIError as _probe:
-                _confirmed_absent = (_probe.status == 404)
-            except Exception:
-                _confirmed_absent = False  # unknown → keep (fail closed)
-            if _confirmed_absent:
+            _definitive_no_create = (
+                isinstance(_ce, tc.TerraAPIError) and _ce.status in _NO_CREATE_STATUSES)
+            if _definitive_no_create:
                 policy.release_reservation(_budget_token)
         raise
     # Never echo the secret back (Leonardo's create response may include the
@@ -923,14 +924,21 @@ def terra_create_runtime(
         if leo_status == "Running":
             break
         if leo_status in ("Error", "Deleting", "Deleted"):
+            _err_note = ""
             if leo_status == "Error":
                 # an Error VM may still bill; pause it (never delete) — keep the
-                # reservation since the VM was created
-                _stop_runtime_best_effort(token, google_project, runtime_name,
-                                          "entered Error during provisioning")
+                # reservation since the VM was created. Surface whether the pause
+                # succeeded so the user knows if a manual pause is needed.
+                _paused = _stop_runtime_best_effort(
+                    token, google_project, runtime_name,
+                    "entered Error during provisioning")
+                _err_note = (" It has been PAUSED (stop requested; disk kept)."
+                             if _paused else
+                             " It could NOT be auto-paused — PAUSE IT MANUALLY to"
+                             " avoid charges.")
             raise RuntimeError(
                 f"Runtime {runtime_name} entered status {leo_status!r} during "
-                f"provisioning (expected Running). Check the Terra UI."
+                f"provisioning (expected Running).{_err_note} Check the Terra UI."
             )
         time.sleep(15)
     if leo_status != "Running":
@@ -1351,10 +1359,96 @@ def terra_install_notebook_runner(bucket_uri: str) -> str:
     })
 
 
+def _resolve_restart_cap_rate(max_cost_usd, vm_hourly_usd, cev_readable, cev):
+    """Resolve the (cap, rate) to enforce on an SSH runner RESTART — FAIL CLOSED.
+
+    Pure + unit-testable (the network read of the runtime cEV is done by the
+    caller and passed in as cev_readable + cev). Priority: explicit caller
+    override > the runtime's OWN stored per-run cap (only from a positively-
+    readable cEV dict) > env default. Cap and rate are always taken from the SAME
+    source, so an env cap is never paired with a stale stored rate. An UNKNOWN
+    stored cap (cEV unreadable/redacted/missing) with no explicit cap → fail
+    closed. A positive cap with no positive rate → fail closed. Env values are
+    read LAZILY (only in the branch that needs them) so a malformed UNRELATED
+    spend env var cannot block a restart an explicit/stored cap already specifies.
+
+    Returns (eff_cap, eff_rate). Raises ValueError (bad args) or PermissionError
+    (cannot confirm / unenforceable)."""
+    import math as _m
+    if (max_cost_usd < 0 or vm_hourly_usd < 0
+            or not _m.isfinite(max_cost_usd) or not _m.isfinite(vm_hourly_usd)):
+        raise ValueError("max_cost_usd and vm_hourly_usd must be finite and >= 0")
+
+    def _env_cap():
+        try:
+            return policy.max_cost_usd()
+        except policy.PolicyError as e:
+            raise PermissionError(str(e))
+
+    def _env_rate():
+        try:
+            return policy.vm_hourly_usd()
+        except policy.PolicyError as e:
+            raise PermissionError(str(e))
+
+    def _tri(_key):
+        # TRI-STATE: (known, value). known=False → missing/redacted/unparsable/
+        # negative/non-finite/underflowed → UNKNOWN. known=True, 0.0 → explicitly
+        # uncapped (a literal zero).
+        if not cev_readable or not isinstance(cev, dict) or _key not in cev:
+            return (False, 0.0)
+        _rawv = cev.get(_key)
+        try:
+            _f = float(_rawv)
+        except (TypeError, ValueError):
+            return (False, 0.0)
+        if not _m.isfinite(_f) or _f < 0:
+            return (False, 0.0)
+        # A stored positive magnitude that float-UNDERFLOWS to exactly 0.0 (e.g.
+        # '1e-400') is UNKNOWN, NOT a confirmed-uncapped zero — otherwise a real
+        # per-run cap would silently restart the VM uncapped. (Mirrors
+        # _spend_env_dollars; a literal '0' has a zero mantissa and stays known.)
+        if _f == 0.0:
+            try:
+                if float(str(_rawv).lower().split("e")[0]) > 0.0:
+                    return (False, 0.0)
+            except (TypeError, ValueError):
+                pass
+        return (True, _f)
+
+    cap_known, stored_cap = _tri("MCP_TERRA_MAX_COST_USD")
+    rate_known, stored_rate = _tri("MCP_TERRA_VM_HOURLY_USD")
+    if max_cost_usd > 0:
+        cap = float(max_cost_usd)
+        rate = float(vm_hourly_usd) if vm_hourly_usd > 0 else _env_rate()
+    elif cev_readable and cap_known and stored_cap > 0:
+        cap = stored_cap
+        rate = (float(vm_hourly_usd) if vm_hourly_usd > 0
+                else (stored_rate if (rate_known and stored_rate > 0) else _env_rate()))
+    elif cev_readable and cap_known and stored_cap == 0:
+        cap = _env_cap()
+        rate = float(vm_hourly_usd) if vm_hourly_usd > 0 else _env_rate()
+    else:
+        raise PermissionError(
+            "could not positively read this runtime's stored spend cap "
+            "(Leonardo/cEV unavailable, redacted, unparsable, or missing) to "
+            "confirm enforcement on restart — refusing rather than risk restarting "
+            "the VM uncapped. Pass max_cost_usd (and vm_hourly_usd) explicitly, or "
+            "fix gcloud auth, then retry.")
+    if cap > 0 and rate <= 0:
+        raise PermissionError(
+            "this runtime has a spend cap but no positive hourly rate is available "
+            "to enforce it on restart — refusing rather than running under-enforced. "
+            "Pass vm_hourly_usd (or set MCP_TERRA_VM_HOURLY_USD).")
+    return cap, rate
+
+
 @server.tool(title="Start runner on Terra VM via gcloud SSH",
               annotations=ANN_SPEND_NEW)
 def terra_start_runner_on_vm(google_project: str, runtime_name: str,
-                               bucket_uri: str) -> str:
+                               bucket_uri: str,
+                               max_cost_usd: float = 0.0,
+                               vm_hourly_usd: float = 0.0) -> str:
     """Start the on-VM runner script on a Terra runtime via `gcloud compute ssh`.
 
     Automates the per-VM-session bootstrap so you don't need to SSH into the
@@ -1476,6 +1570,26 @@ def terra_start_runner_on_vm(google_project: str, runtime_name: str,
     import hashlib as _hashlib
     _runner_sha = _hashlib.sha256(
         nbr.runner_script_template().encode("utf-8")).hexdigest()
+    # Same crash-safe spend-cap watchdog the seamless boot path uses, so the SSH
+    # restart path is also covered (a runner crash here can't run uncapped).
+    _watchdog = nbr.spend_watchdog_snippet()
+    # Recover the runtime's STORED per-run cap/rate (set in its cEV at create) so
+    # an SSH RESTART enforces the SAME cap — not just the current env default.
+    # Without this, a per-run cap passed to terra_create_runtime would be silently
+    # dropped on recovery (the watchdog would export 0 and never arm).
+    # Read the runtime's stored cEV (network); a non-dict / read error is treated
+    # as UNKNOWN by the resolver, which fails closed unless an explicit cap is
+    # given. The (cap, rate) resolution itself lives in a pure, unit-tested helper.
+    _cev_readable = False
+    _cev = None
+    try:
+        _rt = tc.leo_get_runtime(auth.get_access_token(), google_project, runtime_name)
+        _cev = (_rt or {}).get("customEnvironmentVariables")
+        _cev_readable = isinstance(_cev, dict)
+    except Exception:
+        _cev_readable = False  # could NOT read the runtime config → cannot confirm
+    _eff_cap_ssh, _eff_rate_ssh = _resolve_restart_cap_rate(
+        max_cost_usd, vm_hourly_usd, _cev_readable, _cev)
     bootstrap = f"""#!/usr/bin/env bash
 set -eu
 read -r SECRET_LINE
@@ -1483,6 +1597,14 @@ SECRET="${{SECRET_LINE#RUNNER_SECRET=}}"
 [ -n "$SECRET" ] || {{ echo "no secret on stdin" >&2; exit 1; }}
 
 cd /home/jupyter
+
+# Arm the spend-cap watchdog FIRST (before the fallible runner fetch), via the
+# SAME shared snippet the seamless boot path uses — so this SSH restart path is
+# crash-safe too. Export the cap/rate/bucket the snippet reads from the env.
+export MCP_TERRA_BUCKET='{bucket_clean}'
+export MCP_TERRA_MAX_COST_USD='{_eff_cap_ssh}'
+export MCP_TERRA_VM_HOURLY_USD='{_eff_rate_ssh}'
+{_watchdog}
 
 # Pull latest runner script
 gsutil cp '{bucket_clean}/mcp_terra_jobs/mcp_terra_runner.sh' \
@@ -1511,8 +1633,8 @@ MCP_TERRA_RUNNER_SECRET="$SECRET" \
 MCP_TERRA_RUNTIME_NAME='{runtime_name}' \
 MCP_TERRA_MAX_RUN_HOURS='{policy.max_run_hours()}' \
 MCP_TERRA_SESSION_MARGIN_SEC='{policy.session_margin_sec()}' \
-MCP_TERRA_MAX_COST_USD='{policy.max_cost_usd()}' \
-MCP_TERRA_VM_HOURLY_USD='{policy.vm_hourly_usd()}' \
+MCP_TERRA_MAX_COST_USD='{_eff_cap_ssh}' \
+MCP_TERRA_VM_HOURLY_USD='{_eff_rate_ssh}' \
 MCP_TERRA_RUNNER_CONCURRENCY='{policy.runner_concurrency()}' \
 nohup /home/jupyter/mcp_terra_runner.sh \
     > /home/jupyter/.mcp_terra_runner.log 2>&1 &
@@ -1708,6 +1830,16 @@ def terra_submit_notebook_job(notebook_gcs: str, bucket_uri: str,
     # agent has been pre-authorized to call submit without per-call permission.
     policy.enforce_submit_cap()
 
+    # Resolve + validate the spend-advisory values UP FRONT — these helpers fail
+    # closed on non-finite/garbage env. Do it BEFORE any bucket write so we never
+    # leave a signed spec in GCS (which the runner would execute) only to error
+    # out afterwards and prompt a retry that double-spends.
+    try:
+        _adv_cap = policy.max_cost_usd()
+        _adv_rate = policy.vm_hourly_usd()
+    except policy.PolicyError as e:
+        raise PermissionError(str(e))
+
     # Runner heartbeat freshness — refuse if no runner is alive on a VM, so
     # the agent gets a clean error instead of silently waiting for a dead loop.
     hb_path = f"{bucket_uri.rstrip('/')}/{nbr.JOBS_PREFIX}/.runner_heartbeat.txt"
@@ -1808,15 +1940,15 @@ def terra_submit_notebook_job(notebook_gcs: str, bucket_uri: str,
             f"(terra_submit_workflow): Batch tasks auto-refresh credentials and "
             f"are not bound by the interactive-runtime window."),
         **({"spend_cap_advisory": (
-            f"A workspace spend cap of ${policy.max_cost_usd():.2f} is set "
+            f"A workspace spend cap of ${_adv_cap:.2f} is set "
             f"(MCP_TERRA_MAX_COST_USD)" + (
                 f"; the on-VM runner self-stops the VM when its estimated compute "
-                f"spend (uptime x ${policy.vm_hourly_usd():.2f}/hr) reaches the cap "
+                f"spend (uptime x ${_adv_rate:.2f}/hr) reaches the cap "
                 f"(stop/pause; persistent disk kept)."
-                if policy.vm_hourly_usd() > 0 else
+                if _adv_rate > 0 else
                 "; set MCP_TERRA_VM_HOURLY_USD to enable the runner's auto-stop "
                 "(otherwise the cap is advisory only)."))}
-           if policy.max_cost_usd() > 0 else {}),
+           if _adv_cap > 0 else {}),
     })
 
 

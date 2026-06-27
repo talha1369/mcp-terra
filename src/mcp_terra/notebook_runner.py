@@ -248,6 +248,164 @@ def parse_heartbeat(text: str) -> tuple[int, str | None]:
     return epoch, runtime
 
 
+def spend_watchdog_snippet() -> str:
+    """Bash for the INDEPENDENT, crash-safe spend-cap watchdog — SHARED by the
+    startUserScriptUri boot script AND the gcloud-ssh bootstrap so BOTH runner
+    entry points get crash-safe enforcement.
+
+    It is meant to be placed BEFORE any fallible runner fetch/verify, so a failed
+    fetch on a resume still leaves the cap enforced. It only arms when both a cap
+    and a rate are set, reads MCP_TERRA_MAX_COST_USD / MCP_TERRA_VM_HOURLY_USD /
+    MCP_TERRA_BUCKET from the environment, estimates this VM's CUMULATIVE spend
+    (uptime x rate, persisted across pause/resume on the persistent disk), and
+    STOPS the VM (stop/pause; disk kept — NEVER delete) at the cap. It FAILS
+    CLOSED: a corrupt or unwritable accumulator stops the VM rather than silently
+    resetting the lifetime ceiling to per-session; the stop is retried with
+    backoff (a single transient failure must not end enforcement)."""
+    return r'''
+# ── Independent, crash-safe spend-cap watchdog (shared by both runner entry
+# points; armed BEFORE the runner fetch so a failed fetch still leaves the cap
+# enforced). Arms only when BOTH a cap and a rate are set.
+_WD_CAP="${MCP_TERRA_MAX_COST_USD:-0}"
+_WD_RATE="${MCP_TERRA_VM_HOURLY_USD:-0}"
+_WD_BUCKET="${MCP_TERRA_BUCKET:-}"; _WD_BUCKET="${_WD_BUCKET%/}"
+_WD_ACCUM="${MCP_TERRA_SPEND_ACCUM_FILE:-/home/jupyter/.mcp_terra_spend_seconds}"
+if awk "BEGIN{exit !($_WD_CAP>0 && $_WD_RATE>0)}"; then
+  # Stop THIS VM (pause; disk kept; NEVER delete). Kill billable compute first,
+  # then retry the cloud stop until accepted — one transient failure must not
+  # leave the VM billing with no enforcer.
+  # Run a command with a HARD deadline. ALWAYS use a pure-bash TERM-then-KILL
+  # watchdog (NOT coreutils timeout, which lacks --kill-after on old hosts and
+  # would wait forever if the child ignores SIGTERM). Run the command in its own
+  # process group (setsid) when possible and signal the whole GROUP, so gcloud
+  # child processes die too. SIGKILL cannot be ignored, so the deadline is hard.
+  _wd_bounded() {
+    _bs="$1"; shift
+    if command -v setsid >/dev/null 2>&1; then setsid "$@" & else "$@" & fi
+    _bp=$!
+    # Killer: poll once a second; if the command finishes on its own it exits with
+    # NO kill (so a finished/pid-reused group is never signalled). If the deadline
+    # is reached it TERMs the whole group, then ALWAYS completes a hard SIGKILL of
+    # the group — a TERM-ignoring descendant cannot outlive the bound. The parent
+    # waits for the killer to finish, so the KILL phase is never cancelled early.
+    (
+      _i=0
+      while [ "$_i" -lt "$_bs" ]; do
+        sleep 1; _i=$(( _i + 1 ))
+        kill -0 "$_bp" 2>/dev/null || exit 0
+      done
+      kill -TERM -"$_bp" 2>/dev/null || kill -TERM "$_bp" 2>/dev/null || true
+      sleep 3
+      kill -KILL -"$_bp" 2>/dev/null || kill -KILL "$_bp" 2>/dev/null || true
+    ) & _bk=$!
+    _brc=0; wait "$_bp" 2>/dev/null || _brc=$?
+    wait "$_bk" 2>/dev/null || true   # let the killer finish its KILL phase; never cancel it
+    return "$_brc"
+  }
+  _wd_stop() {
+    _wdr="$1"; _wdmax="${2:-10}"; _wdh='Metadata-Flavor: Google'
+    _wdu='http://metadata.google.internal/computeMetadata/v1/instance'; _wdn=0
+    while [ "$_wdn" -lt "$_wdmax" ]; do
+      _wdn=$(( _wdn + 1 ))
+      # kill billable compute on EVERY attempt (the cloud stop may be delayed)
+      pkill -f 'papermill' 2>/dev/null || true
+      _wdi="$(curl -sf --max-time 10 -H "$_wdh" "$_wdu/name" 2>/dev/null || true)"
+      _wdz="$(curl -sf --max-time 10 -H "$_wdh" "$_wdu/zone" 2>/dev/null || true)"; _wdz="${_wdz##*/}"
+      # graceful cloud stop, hard-bounded (deadline-independent of coreutils)
+      if [ -n "$_wdi" ] && [ -n "$_wdz" ] && _wd_bounded 120 env -u MCP_TERRA_RUNNER_SECRET gcloud compute instances stop "$_wdi" --zone "$_wdz" --quiet; then
+        echo "[watchdog] VM $_wdi stopped via gcloud ($_wdr, attempt $_wdn)."; return 0
+      fi
+      echo "[watchdog] WARN: gcloud stop attempt $_wdn failed ($_wdr); retry in 30s." >&2
+      sleep 30
+    done
+    # TRUE fail-closed fallback: power the VM off LOCALLY. This needs no gcloud,
+    # network, IAM, or coreutils — GCE marks a halted instance TERMINATED, so
+    # compute billing stops even when the cloud control plane is unreachable.
+    echo "[watchdog] gcloud stop exhausted ($_wdr); forcing LOCAL poweroff." >&2
+    pkill -f 'papermill' 2>/dev/null || true
+    sudo -n shutdown -h now 2>/dev/null || sudo -n poweroff 2>/dev/null \
+      || shutdown -h now 2>/dev/null || poweroff 2>/dev/null \
+      || { echo "[watchdog] FATAL: could not stop VM ($_wdr); MANUAL STOP REQUIRED NOW." >&2; return 1; }
+    return 0
+  }
+  # Accumulator: ABSENT => valid first boot (0). PRESENT but not a SANE bounded
+  # unsigned integer (non-digit, empty, or > 10 digits => bash-arithmetic
+  # overflow risk) => CORRUPT. CORRUPT or UNWRITABLE => FAIL CLOSED: stop the VM
+  # in the FOREGROUND and ABORT this script (exit 1) so the runner is NEVER
+  # launched with an untrusted or non-persistable lifetime counter.
+  _wd_prior=0
+  if [ -e "$_WD_ACCUM" ]; then
+    if [ -f "$_WD_ACCUM" ]; then
+      # Pipe-free read (no SIGPIPE under pipefail). EOF-after-data SAFE: read
+      # assigns the value even with no trailing newline (it just returns nonzero),
+      # so we IGNORE its rc and fall back only if the var is still empty. Tolerate
+      # CRLF. Guarded by -f so a FIFO/device/dir at this path can never BLOCK the
+      # read (a FIFO with no writer) or read unbounded (/dev/zero).
+      _wd_prior=""; { IFS= read -r _wd_prior < "$_WD_ACCUM"; } 2>/dev/null || true
+      _wd_prior="${_wd_prior%$'\r'}"; [ -n "$_wd_prior" ] || _wd_prior=X
+    else
+      _wd_prior=X   # exists but NOT a regular file (FIFO/device/dir) → corrupt
+    fi
+    case "$_wd_prior" in ''|*[!0-9]*) _wd_prior="" ;; esac
+    if [ -z "$_wd_prior" ] || [ "${#_wd_prior}" -gt 10 ]; then
+      echo "[watchdog] spend accumulator corrupt/out-of-range; failing closed (stopping, not launching runner)." >&2
+      _wd_stop "corrupt spend accumulator" 5
+      exit 1
+    fi
+  fi
+  # Normalize to canonical base-10 (10#) so a leading-zero value like 08/09 can
+  # never be read as invalid octal and abort the arithmetic later.
+  _wd_prior=$(( 10#$_wd_prior ))
+  if ! ( printf '%s\n' "$_wd_prior" > "${_WD_ACCUM}.tmp" 2>/dev/null && mv -f "${_WD_ACCUM}.tmp" "$_WD_ACCUM" 2>/dev/null ); then
+    echo "[watchdog] cannot persist spend accumulator $_WD_ACCUM; failing closed (stopping, not launching runner)." >&2
+    _wd_stop "unwritable spend accumulator" 5
+    exit 1
+  fi
+  # Pick a WRITABLE log path. The monitor loop below is backgrounded as
+  # ( loop ) >> "$_WD_LOG" 2>&1 & — bash opens the redirect BEFORE running the
+  # body, so an unwritable target would SILENTLY skip the whole enforcement loop
+  # (fail-open). The default lives on the persistent disk, but fall back to /tmp
+  # then /dev/null so the loop ALWAYS runs once the watchdog reports armed.
+  _WD_LOG="/home/jupyter/.mcp_terra_watchdog.log"
+  { : >> "$_WD_LOG"; } 2>/dev/null || _WD_LOG="${TMPDIR:-/tmp}/.mcp_terra_watchdog.log"
+  { : >> "$_WD_LOG"; } 2>/dev/null || _WD_LOG=/dev/null
+  (
+    _wds="$(date +%s)"
+    while true; do
+      _wdnow="$(date +%s)"
+      _wdtot=$(( _wd_prior + (_wdnow - _wds) ))
+      # MONOTONIC: never persist a value smaller than what is on disk (guards a
+      # stale/racing read from rewinding the counter). Clamp a huge/corrupt disk
+      # value to 0, and normalize base-10 so a leading-zero value cannot abort.
+      _wddisk=""; [ -f "$_WD_ACCUM" ] && { IFS= read -r _wddisk < "$_WD_ACCUM"; } 2>/dev/null || true  # pipe-free, EOF-safe, -f guards FIFO/device
+      _wddisk="${_wddisk%$'\r'}"; [ -n "$_wddisk" ] || _wddisk=0
+      case "$_wddisk" in ''|*[!0-9]*) _wddisk=0 ;; esac
+      if [ "${#_wddisk}" -gt 10 ]; then _wddisk=0; fi
+      _wddisk=$(( 10#$_wddisk ))
+      if [ "$_wddisk" -gt "$_wdtot" ]; then _wdtot="$_wddisk"; fi
+      printf '%s\n' "$_wdtot" > "${_WD_ACCUM}.tmp" 2>/dev/null && mv -f "${_WD_ACCUM}.tmp" "$_WD_ACCUM" 2>/dev/null || true
+      _wdest="$(awk "BEGIN{printf \"%.4f\", $_wdtot/3600.0*$_WD_RATE}")"
+      if awk "BEGIN{exit !($_wdest>=$_WD_CAP)}"; then
+        # STOP COMPUTE + VM FIRST. The marker upload is BACKGROUNDED so a hung
+        # GCS/auth dependency can never delay the stop (stop first).
+        _wdts="$(date -u +%Y%m%dT%H%M%SZ)"
+        ( printf 'watchdog est=%s cap=%s rate=%s total_s=%s\n' "$_wdest" "$_WD_CAP" "$_WD_RATE" "$_wdtot" \
+            | gsutil cp -n - "${_WD_BUCKET}/mcp_terra_jobs/HALTED-SPEND-CAP-WATCHDOG.${_wdts}.txt" ) >/dev/null 2>&1 &
+        _wd_stop "spend cap \$$_WD_CAP reached (est \$$_wdest)"
+        exit $?
+      fi
+      # sleep is LAST so the FIRST check is immediate — a resume whose persisted
+      # lifetime spend already exceeds the cap is stopped at once (no ~30s of
+      # over-cap compute before the first check).
+      sleep 30
+    done
+  ) >> "$_WD_LOG" 2>&1 &
+  disown 2>/dev/null || true
+  echo "[watchdog] spend-cap watchdog armed (cap=\$$_WD_CAP rate=\$$_WD_RATE/hr; crash-safe lifetime cap)."
+fi
+'''
+
+
 def start_runner_script_template() -> str:
     """Return the Leonardo ``startUserScriptUri`` script (``start_runner.sh``).
 
@@ -264,12 +422,18 @@ def start_runner_script_template() -> str:
     audit-log entry. The secret is handed to the runner child through its
     environment (not its command line).
     """
-    return r"""#!/usr/bin/env bash
+    _tmpl = r"""#!/usr/bin/env bash
 # start_runner.sh — Leonardo startUserScriptUri (NOT userScriptUri).
 # Runs on EVERY VM start: initial create AND every resume after a 30-min
 # auto-pause. Launches the MCP notebook runner so the VM is never
 # idle-without-a-runner. Installed automatically by terra_create_runtime.
 set -euo pipefail
+
+# Arm the spend-cap watchdog FIRST — before ANY fallible prerequisite (the runner
+# secret, the bucket check, or the runner fetch/verify). The watchdog only needs
+# the cap/rate from the env to STOP the VM, so even a missing/corrupt secret or a
+# failed runner fetch on a resume cannot leave the VM running uncapped.
+# __SPEND_WATCHDOG__
 
 # BUCKET + secret arrive via Leonardo customEnvironmentVariables (encrypted at
 # rest, injected into the VM env on every start). Never in GCS / argv / audit.
@@ -346,6 +510,7 @@ if [ "${MCP_TERRA_INSTALL_CLAUDE:-1}" != "0" ] && [ ! -x /home/jupyter/.local/bi
     echo "[start_runner] installing Claude Code in background, sanitized env (log: ~/.mcp_claude_install.log)"
 fi
 """
+    return _tmpl.replace("# __SPEND_WATCHDOG__", spend_watchdog_snippet())
 
 
 def runner_script_template() -> str:
@@ -523,22 +688,75 @@ echo "[runner] polling $BUCKET/mcp_terra_jobs/ every ${POLL_SEC}s (Ctrl-C to sto
 MAX_COST_USD="${MCP_TERRA_MAX_COST_USD:-0}"
 VM_HOURLY_USD="${MCP_TERRA_VM_HOURLY_USD:-0}"
 COST_WARNED=0
+# Cumulative-spend accumulator: the cap is a LIFETIME ceiling on this VM, NOT a
+# per-uptime-session one. startUserScriptUri reruns on every resume, so estimating
+# from the current boot alone would hand each resume a fresh full cap window and
+# let cumulative spend blow past it. We persist total running SECONDS on the
+# PERSISTENT DISK (/home/jupyter survives pause/resume); the runner reads it ONCE
+# at boot (before this session contributes) and adds its own elapsed, writing the
+# running total back. The independent watchdog uses the SAME file the same way.
+SPEND_ACCUM_FILE="${MCP_TERRA_SPEND_ACCUM_FILE:-/home/jupyter/.mcp_terra_spend_seconds}"
+# Pipe-free + EOF-after-data safe (preserve a value with no trailing newline) + CRLF-tolerant.
+SPEND_PRIOR_SEC=""; [ -f "$SPEND_ACCUM_FILE" ] && { IFS= read -r SPEND_PRIOR_SEC < "$SPEND_ACCUM_FILE"; } 2>/dev/null || true  # -f guards FIFO/device
+SPEND_PRIOR_SEC="${SPEND_PRIOR_SEC%$'\r'}"; [ -n "$SPEND_PRIOR_SEC" ] || SPEND_PRIOR_SEC=0
+case "$SPEND_PRIOR_SEC" in ''|*[!0-9]*) SPEND_PRIOR_SEC=0 ;; esac
+# Bound to a sane unsigned integer (<= 10 digits) so a huge/corrupt value cannot
+# wrap bash arithmetic negative and read as "below cap". The independent watchdog
+# is the authoritative fail-closed enforcer for a corrupt counter.
+[ "${#SPEND_PRIOR_SEC}" -gt 10 ] && SPEND_PRIOR_SEC=0 || true
+# Normalize base-10 so a leading-zero value (08/09) can't be read as bad octal.
+SPEND_PRIOR_SEC=$(( 10#$SPEND_PRIOR_SEC ))
+
+# Run a command with a HARD deadline, coreutils-independent (pure-bash TERM-then-
+# KILL of the process group; SIGKILL cannot be ignored). Mirrors the watchdog's
+# _wd_bounded so a wedged gcloud can never hang the enforcer.
+_bounded() {
+    local _bs="$1"; shift
+    if command -v setsid >/dev/null 2>&1; then setsid "$@" & else "$@" & fi
+    local _bp=$!
+    ( _i=0
+      while [ "$_i" -lt "$_bs" ]; do
+        sleep 1; _i=$(( _i + 1 ))
+        kill -0 "$_bp" 2>/dev/null || exit 0
+      done
+      kill -TERM -"$_bp" 2>/dev/null || kill -TERM "$_bp" 2>/dev/null || true
+      sleep 3
+      kill -KILL -"$_bp" 2>/dev/null || kill -KILL "$_bp" 2>/dev/null || true ) & local _bk=$!
+    local _brc=0; wait "$_bp" 2>/dev/null || _brc=$?
+    wait "$_bk" 2>/dev/null || true
+    return "$_brc"
+}
 
 # Stop THIS VM (stop/pause, persistent disk kept — NEVER delete). Reusable.
+# Hardened like the independent watchdog: on the MANUAL-launch path (no watchdog
+# armed) this is the SOLE spend-cap enforcer, so it must NOT hang or fail open.
+# Each attempt is HARD-bounded (pure-bash deadline, no coreutils dependency),
+# retried, and after the retries are exhausted it falls back to a LOCAL poweroff
+# so billing stops even when the cloud control plane is unreachable.
 halt_vm() {
-    local _reason="$1" _meta_hdr _meta_url _inst _zone
+    local _reason="$1" _meta_hdr _meta_url _inst _zone _n
     _meta_hdr='Metadata-Flavor: Google'
     _meta_url='http://metadata.google.internal/computeMetadata/v1/instance'
-    _inst="$(curl -sf -H "$_meta_hdr" "$_meta_url/name" 2>/dev/null || true)"
-    _zone="$(curl -sf -H "$_meta_hdr" "$_meta_url/zone" 2>/dev/null || true)"; _zone="${_zone##*/}"
-    if [ -n "$_inst" ] && [ -n "$_zone" ]; then
-        env -u MCP_TERRA_RUNNER_SECRET gcloud compute instances stop "$_inst" \
-            --zone "$_zone" --quiet \
-            && echo "[runner] VM $_inst stop requested ($_reason)." \
-            || echo "[runner] WARN: gcloud stop failed; stop the VM manually ($_reason)." >&2
-    else
-        echo "[runner] WARN: could not read instance metadata; stop the VM manually ($_reason)." >&2
-    fi
+    _n=0
+    while [ "$_n" -lt 10 ]; do
+        _n=$(( _n + 1 ))
+        _inst="$(curl -sf --max-time 10 -H "$_meta_hdr" "$_meta_url/name" 2>/dev/null || true)"
+        _zone="$(curl -sf --max-time 10 -H "$_meta_hdr" "$_meta_url/zone" 2>/dev/null || true)"; _zone="${_zone##*/}"
+        if [ -n "$_inst" ] && [ -n "$_zone" ] \
+            && _bounded 120 env -u MCP_TERRA_RUNNER_SECRET gcloud compute instances stop "$_inst" --zone "$_zone" --quiet; then
+            echo "[runner] VM $_inst stopped via gcloud ($_reason, attempt $_n)."
+            return 0
+        fi
+        echo "[runner] WARN: gcloud stop attempt $_n failed ($_reason); retry in 30s." >&2
+        sleep 30
+    done
+    # Deadline-independent fail-closed fallback: power the VM off LOCALLY (no
+    # gcloud/network/IAM needed). GCE marks a halted instance TERMINATED, so
+    # compute billing stops even when the cloud control plane is unreachable.
+    echo "[runner] gcloud stop exhausted ($_reason); forcing LOCAL poweroff." >&2
+    sudo -n shutdown -h now 2>/dev/null || sudo -n poweroff 2>/dev/null \
+        || shutdown -h now 2>/dev/null || poweroff 2>/dev/null \
+        || echo "[runner] FATAL: could not stop VM ($_reason); MANUAL STOP REQUIRED NOW." >&2
 }
 
 # security review: positively distinguish "object absent" (a 404, safe to
@@ -630,15 +848,31 @@ kill_pool() {
 # on breach; warns once at 80%.
 enforce_spend_cap() {
     awk "BEGIN{exit !($MAX_COST_USD>0 && $VM_HOURLY_USD>0)}" || return 0
-    local _now_c _est _ts
+    local _now_c _est _ts _total_s _disk_s
     _now_c="$(date +%s)"
-    _est="$(awk "BEGIN{printf \"%.2f\", ($_now_c-$RUNNER_START_EPOCH)/3600.0*$VM_HOURLY_USD}")"
+    # CUMULATIVE running seconds = persisted prior sessions + this session. The
+    # independent watchdog is the authoritative fail-closed enforcer; here we keep
+    # the persist MONOTONIC (never write a value smaller than what is on disk) so
+    # the runner and watchdog can't rewind each other's lifetime total. Persist
+    # atomically (tmp + mv) so a resume continues from the running total.
+    _total_s=$(( SPEND_PRIOR_SEC + (_now_c - RUNNER_START_EPOCH) ))
+    _disk_s=""; [ -f "$SPEND_ACCUM_FILE" ] && { IFS= read -r _disk_s < "$SPEND_ACCUM_FILE"; } 2>/dev/null || true  # pipe-free, EOF-safe, -f guards FIFO/device
+    _disk_s="${_disk_s%$'\r'}"; [ -n "$_disk_s" ] || _disk_s=0
+    case "$_disk_s" in ''|*[!0-9]*) _disk_s=0 ;; esac
+    if [ "${#_disk_s}" -gt 10 ]; then _disk_s=0; fi
+    _disk_s=$(( 10#$_disk_s ))   # base-10 normalize (no octal abort on 08/09)
+    if [ "$_disk_s" -gt "$_total_s" ]; then _total_s="$_disk_s"; fi
+    printf '%s\n' "$_total_s" > "${SPEND_ACCUM_FILE}.tmp" 2>/dev/null \
+        && mv -f "${SPEND_ACCUM_FILE}.tmp" "$SPEND_ACCUM_FILE" 2>/dev/null || true
+    _est="$(awk "BEGIN{printf \"%.2f\", $_total_s/3600.0*$VM_HOURLY_USD}")"
     if awk "BEGIN{exit !($_est>=$MAX_COST_USD)}"; then
         echo "[runner] estimated VM spend \$$_est >= cap \$$MAX_COST_USD — STOPPING the VM (stop/pause; persistent disk kept) to avoid exceeding the credit limit." >&2
-        _ts="$(date -u +%Y%m%dT%H%M%SZ)"
-        echo "est_vm_cost_usd=$_est cap_usd=$MAX_COST_USD rate_usd_per_hr=$VM_HOURLY_USD" \
-            | gsutil cp -n - "${BUCKET%/}/mcp_terra_jobs/HALTED-SPEND-CAP.${_ts}.txt" 2>/dev/null || true
+        # KILL COMPUTE FIRST, then BACKGROUND the marker upload so a hung GCS/auth
+        # dependency can never delay the halt (stop first, marker after).
         kill_pool
+        _ts="$(date -u +%Y%m%dT%H%M%SZ)"
+        ( echo "est_vm_cost_usd=$_est cap_usd=$MAX_COST_USD rate_usd_per_hr=$VM_HOURLY_USD" \
+            | gsutil cp -n - "${BUCKET%/}/mcp_terra_jobs/HALTED-SPEND-CAP.${_ts}.txt" ) >/dev/null 2>&1 &
         halt_vm "spend cap \$$MAX_COST_USD reached"
         exit 0
     elif [ "$COST_WARNED" -eq 0 ] && awk "BEGIN{exit !($_est>=0.8*$MAX_COST_USD)}"; then

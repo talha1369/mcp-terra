@@ -211,9 +211,17 @@ No per-session setup needed (the runner auto-starts — §3). A typical run:
 >    timeout_s=3600)`; terminal state is read from the signed `result.json`.
 > 6. **If FAILED** — read the `triage` block and apply the deterministic fix
 >    (`missing_module` → prepend `!pip install …`; `name_error`/typo → fix the
->    cell; etc.), re-upload with `version_method='bak'`, re-submit.
->    (`transient_network` → just re-submit; `unknown` + a configured LLM key →
->    an `llm_suggested_patch` Claude validates, never auto-applies.)
+>    cell; etc.), re-upload with `version_method='bak'`, re-submit. Claude's own
+>    fixes are applied **automatically, with no user prompt** — the loop is
+>    seamless. (`transient_network` → just re-submit.) For `unknown` with a
+>    configured **secondary** LLM key, that cheaper model returns an
+>    `llm_suggested_patch`; Claude **auto-validates it** (confirms it is a scoped,
+>    safe fix for the actual error) and then applies it — also automatically, so
+>    the loop stays seamless. It is **never executed unread**: the suggestion
+>    comes from a weaker model and is built from attacker-influenceable traceback
+>    text, so Claude's quick check guards against prompt-injection or a
+>    silently-wrong "fix". Validation is done by Claude, not the user — it never
+>    stalls the loop.
 > 7. **If succeeded** — pull `terra_get_run_log`, compose the **bug/method
 >    report + a NotebookLM-style results explainer**, have a sub-agent verify
 >    both against the log, then `terra_render_audio_summary` (if Cloud TTS is
@@ -304,6 +312,29 @@ Three delivery modes (pick what your org allows):
   `MCP_TERRA_SMTP_RELAY=1` (for a Workspace/Broad relay that authorizes by IP).
   A forgotten password never silently relays — relay needs the explicit opt-in,
   else it falls back to mode A.
+
+> **Full step-by-step setup** (Gmail app password, relay, and Slack) is in the
+> README **"Notifications: email + Slack (setup)"** section.
+
+---
+
+## 5c. Slack notifications (optional)
+
+Deliver the run summary (and the audio explainer) to Slack. Set the variables in
+`config.env` (plugin) or via `claude mcp add --env` (installer); they're
+snapshotted at startup, so restart the MCP after changing them.
+
+- **Text ping:** create a Slack **incoming webhook** and set
+  `MCP_TERRA_SLACK_WEBHOOK='https://hooks.slack.com/services/…'`. The
+  `terra_notify_slack` tool has no URL parameter (the webhook is env-locked —
+  anti-exfil).
+- **Audio file upload:** webhooks can't upload files, so add a Slack app **bot
+  token** with `files:write` (and `im:write` to DM you): set
+  `MCP_TERRA_SLACK_BOT_TOKEN='xoxb-…'` and `MCP_TERRA_SLACK_CHANNEL` to a channel
+  ID (`C…`/`G…`; `/invite @your-bot` first) and/or your user ID (`U…`) for a DM.
+  Multiple comma/space-separated targets are allowed; each is reported separately.
+
+Then: *"Run my notebook and post the result + audio to Slack."*
 
 ---
 

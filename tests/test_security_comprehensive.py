@@ -4815,16 +4815,19 @@ def _():
 
 @case("CC-Hygiene", "no internal iteration-revealing identifiers in shipped files")
 def _():
-    # Fail-closed: review-round numbers / numbered internal class codes must not
-    # leak into shipped source or docs (professional optics). The test file
-    # itself is excluded (it necessarily contains these patterns).
+    # Fail-closed: review-round numbers / numbered internal class codes / external
+    # review-tool names must not leak into shipped source or docs (professional
+    # optics). The test file itself is excluded (it necessarily contains these
+    # patterns). The external review-tool name is split below so this scanner
+    # never matches its own source.
     import glob
     import os
     import re
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     pats = [re.compile(r"\breview r\d", re.I),
             re.compile(r"\bround[ -]\d", re.I),
-            re.compile(r"\bCC-[A-Za-z]+\d")]
+            re.compile(r"\bCC-[A-Za-z]+\d"),
+            re.compile("cod" + "ex", re.I)]   # external review tool — must be scrubbed
     files = (glob.glob(os.path.join(repo, "src/mcp_terra/*.py"))
              + [os.path.join(repo, f) for f in ("SECURITY.md", "CHANGELOG.md",
                                                 "README.md", "SOP.md")]
@@ -4851,7 +4854,9 @@ def _():
         assert _p.max_cost_usd() == 0.0 and _p.vm_hourly_usd() == 0.0   # unset = no cap
         _os.environ["MCP_TERRA_MAX_COST_USD"] = "250.5"; assert _p.max_cost_usd() == 250.5
         _os.environ["MCP_TERRA_MAX_COST_USD"] = "-5"; assert _p.max_cost_usd() == 0.0   # clamp >=0
-        _os.environ["MCP_TERRA_MAX_COST_USD"] = "junk"; assert _p.max_cost_usd() == 0.0
+        # malformed now FAILS CLOSED (no longer silently coerced to 0.0 = off)
+        _os.environ["MCP_TERRA_MAX_COST_USD"] = "junk"; must_raise(_p.max_cost_usd, _p.PolicyError)
+        _os.environ.pop("MCP_TERRA_MAX_COST_USD", None)
         _os.environ["MCP_TERRA_VM_HOURLY_USD"] = "0.55"; assert _p.vm_hourly_usd() == 0.55
     finally:
         for k, v in zip(("MCP_TERRA_MAX_COST_USD", "MCP_TERRA_VM_HOURLY_USD"), sv):
@@ -4864,13 +4869,27 @@ def _():
     from mcp_terra import notebook_runner as nbr
     s = nbr.runner_script_template()
     assert "MAX_COST_USD" in s and "VM_HOURLY_USD" in s
-    # honest estimate: uptime x rate (no hardcoded prices)
-    assert "RUNNER_START_EPOCH)/3600.0*$VM_HOURLY_USD" in s
+    # honest estimate: CUMULATIVE uptime x rate (no hardcoded prices). The cap is
+    # a LIFETIME ceiling — spend is the persisted prior sessions + this session,
+    # so a pause/resume does not reset the cap window.
+    assert "_total_s/3600.0*$VM_HOURLY_USD" in s
+    assert "SPEND_PRIOR_SEC" in s and "SPEND_ACCUM_FILE" in s
+    assert "SPEND_PRIOR_SEC + (_now_c - RUNNER_START_EPOCH)" in s
     # halts via STOP (not delete) when over the cap, warns at 80%
     assert "halt_vm" in s and "gcloud compute instances stop" in s
     assert "instances delete" not in s, "must NEVER delete the VM"
     assert "STOPPING the VM" in s and "HALTED-SPEND-CAP" in s
     assert ">=80% of the" in s, "must warn in advance"
+    # security review (audit): halt_vm is the SOLE enforcer on the manual-launch
+    # path (no watchdog) — it must NOT hang or fail open. Hard-bounded
+    # (coreutils-independent), retried, with a LOCAL poweroff fallback; curls
+    # have a max-time.
+    assert "_bounded 120 env -u MCP_TERRA_RUNNER_SECRET gcloud" in s
+    assert "--max-time 10" in s
+    assert 'while [ "$_n" -lt 10 ]' in s          # retry loop
+    assert "forcing LOCAL poweroff" in s and "shutdown -h now" in s
+    # the bounded helper is pure-bash (no reliance on coreutils timeout)
+    assert "_bounded()" in s and "kill -0" in s
 
 
 @case("CC-SpendCap", "cap + rate propagate to the VM runner env (create + SSH paths)")
@@ -5043,6 +5062,84 @@ def _():
             if v is None: _os.environ.pop(k, None)
             else: _os.environ[k] = v
 
+@case("CC-SpendCap", "non-UTF-8 ledger: strict reserve fails closed, lenient degrades, release never raises")
+def _():
+    import os as _os
+    import tempfile
+    import pathlib
+    saved = {k: _os.environ.get(k) for k in ("MCP_TERRA_BUDGET_USD", "MCP_TERRA_BUDGET_WINDOW_DAYS")}
+    led, lock = policy._SPEND_LEDGER, policy._SPEND_LEDGER_LOCK
+    try:
+        _os.environ["MCP_TERRA_BUDGET_USD"] = "100"
+        _os.environ["MCP_TERRA_BUDGET_WINDOW_DAYS"] = "30"
+        base = pathlib.Path(tempfile.mkdtemp())
+        policy._SPEND_LEDGER = base / "l.jsonl"
+        policy._SPEND_LEDGER_LOCK = base / "l.lock"
+        now = 1_000_000_000.0
+        # invalid UTF-8 bytes (UnicodeDecodeError is a ValueError, NOT OSError)
+        policy._SPEND_LEDGER.write_bytes(
+            b'{"ts":1000000000,"usd":20,"id":"a"}\n\xff\xfe\x80\n')
+        # lenient reader (advisory) must NOT raise — degrade + count the valid entry
+        assert policy.windowed_spend_usd(now) == 20.0
+        # strict reader (reserve) must FAIL CLOSED, not crash with a raw ValueError
+        e = must_raise(policy.reserve_within_budget, policy.PolicyError, 30, "r", now)
+        assert getattr(e, "code", None) == "E_BUDGET_LEDGER_READ"
+        # release must honor its never-raises contract on a non-UTF-8 ledger
+        policy.release_reservation("a")  # must not raise
+    finally:
+        policy._SPEND_LEDGER, policy._SPEND_LEDGER_LOCK = led, lock
+        for k, v in saved.items():
+            if v is None: _os.environ.pop(k, None)
+            else: _os.environ[k] = v
+
+@case("CC-SpendCap", "non-finite ledger entry cannot brick the budget (inf is dropped)")
+def _():
+    import os as _os
+    import tempfile
+    import pathlib
+    saved = {k: _os.environ.get(k) for k in ("MCP_TERRA_BUDGET_USD", "MCP_TERRA_BUDGET_WINDOW_DAYS")}
+    led, lock = policy._SPEND_LEDGER, policy._SPEND_LEDGER_LOCK
+    try:
+        _os.environ["MCP_TERRA_BUDGET_USD"] = "100"
+        _os.environ["MCP_TERRA_BUDGET_WINDOW_DAYS"] = "30"
+        base = pathlib.Path(tempfile.mkdtemp())
+        policy._SPEND_LEDGER = base / "l.jsonl"
+        policy._SPEND_LEDGER_LOCK = base / "l.lock"
+        now = 1_000_000_000.0
+        # a tampered/corrupt Infinity must NOT sum to inf and refuse every run
+        policy._SPEND_LEDGER.write_text(
+            '{"ts":1000000000,"usd":Infinity,"id":"a"}\n'
+            '{"ts":1000000000,"usd":20,"id":"b"}\n')
+        w = policy.windowed_spend_usd(now)
+        assert w == 20.0, "inf entry must be dropped, not summed (got %s)" % w
+        assert policy.reserve_within_budget(30, "r", now)  # budget not bricked
+    finally:
+        policy._SPEND_LEDGER, policy._SPEND_LEDGER_LOCK = led, lock
+        for k, v in saved.items():
+            if v is None: _os.environ.pop(k, None)
+            else: _os.environ[k] = v
+
+@case("CC-SpendCap", "budget_window_days fails CLOSED on malformed input (parity with dollar getters)")
+def _():
+    import os as _os
+    saved = _os.environ.get("MCP_TERRA_BUDGET_WINDOW_DAYS")
+    try:
+        # genuinely unparsable values (note: int("+7")==7 and int("1_000")==1000
+        # are VALID to Python, so they are intentionally not in this list)
+        for bad in ("30days", "abc", "1.5", "twelve", "0x10"):
+            _os.environ["MCP_TERRA_BUDGET_WINDOW_DAYS"] = bad
+            e = must_raise(policy.budget_window_days, policy.PolicyError)
+            assert getattr(e, "code", None) == "E_BUDGET_WINDOW_MALFORMED"
+        _os.environ.pop("MCP_TERRA_BUDGET_WINDOW_DAYS", None)
+        assert policy.budget_window_days() == 30          # unset → default
+        _os.environ["MCP_TERRA_BUDGET_WINDOW_DAYS"] = "  "
+        assert policy.budget_window_days() == 30          # blank → default
+        _os.environ["MCP_TERRA_BUDGET_WINDOW_DAYS"] = "9999"
+        assert policy.budget_window_days() == 366         # clamp
+    finally:
+        if saved is None: _os.environ.pop("MCP_TERRA_BUDGET_WINDOW_DAYS", None)
+        else: _os.environ["MCP_TERRA_BUDGET_WINDOW_DAYS"] = saved
+
 @case("CC-SpendCap", "malformed/non-object ledger lines never crash the budget")
 def _():
     import os as _os
@@ -5113,15 +5210,21 @@ def _():
 def _():
     import inspect
     csrc = inspect.getsource(server.terra_create_runtime)
-    # Codex [critical]: a budget/cap requires a positive rate AND the runner, or
-    # the cap is unenforceable — must refuse pre-flight
+    # security review [critical]: a budget/cap requires a positive rate AND the runner, or
+    # the cap is unenforceable — must refuse pre-flight. The gate keys off the
+    # EFFECTIVE cap (incl. the env default), NOT the raw arg, so an env-only cap
+    # can't slip through.
     assert "E_CAP_NOT_ENFORCEABLE" in csrc and "E_CAP_NEEDS_RUNNER" in csrc
-    assert "policy.budget_usd() > 0 or max_cost_usd > 0" in csrc
-    # Codex [high]: post-create runner-liveness failure must STOP/PAUSE the VM
+    assert "if _eff_cap > 0:" in csrc
+    # security review [high]: post-create runner-liveness failure must STOP/PAUSE the VM
     # (never delete) so it can't run uncapped
     assert "_stop_runtime_best_effort(" in csrc
-    # Codex [high]: ambiguous create failure releases ONLY on a confirmed 404
-    assert "_confirmed_absent" in csrc and "_probe.status == 404" in csrc
+    # security review [high]: create failure releases ONLY for a narrow allowlist of
+    # pre-create-definitive statuses (NOT all 4xx — 408/409/425/429 may follow a
+    # server-side accept); everything else keeps the reservation (fail closed)
+    assert "_definitive_no_create" in csrc and "_NO_CREATE_STATUSES" in csrc
+    assert "(400, 401, 403, 404, 422)" in csrc
+    assert "400 <= _ce.status < 500" not in csrc, "must not release on all 4xx"
     # the stop helper must pause via leo_stop_runtime (delete primitives don't
     # exist anywhere in terra_client — no-destruction invariant)
     hsrc = inspect.getsource(server._stop_runtime_best_effort)
@@ -5139,6 +5242,316 @@ def _():
         assert server._stop_runtime_best_effort("t", "p", "rt", "x") is True
     finally:
         _tc_mod.leo_stop_runtime = saved
+
+@case("CC-SpendCap", "malformed spend env FAILS CLOSED (does not silently disable the control)")
+def _():
+    import os as _os
+    saved = {k: _os.environ.get(k) for k in
+             ("MCP_TERRA_BUDGET_USD", "MCP_TERRA_MAX_COST_USD", "MCP_TERRA_VM_HOURLY_USD")}
+    try:
+        # non-empty unparsable values must RAISE, not coerce to 0.0 (=off)
+        for val in ("500O", "20 dollars", "abc", "$30"):
+            _os.environ["MCP_TERRA_BUDGET_USD"] = val
+            must_raise(policy.budget_usd, policy.PolicyError)
+        _os.environ.pop("MCP_TERRA_BUDGET_USD", None)
+        _os.environ["MCP_TERRA_MAX_COST_USD"] = "1O"
+        must_raise(policy.max_cost_usd, policy.PolicyError)
+        _os.environ.pop("MCP_TERRA_MAX_COST_USD", None)
+        _os.environ["MCP_TERRA_VM_HOURLY_USD"] = "free"
+        must_raise(policy.vm_hourly_usd, policy.PolicyError)
+        _os.environ.pop("MCP_TERRA_VM_HOURLY_USD", None)
+        # float UNDERFLOW of a positive magnitude (e.g. '5e-400' → exactly 0.0)
+        # must FAIL CLOSED, not silently disable the control. Literal zero and
+        # negatives still mean "off" (clamp), and a tiny-but-representable
+        # subnormal stays a (useless but non-zero) positive value.
+        for val in ("5e-400", "1e-400", "9e-999"):
+            _os.environ["MCP_TERRA_MAX_COST_USD"] = val
+            must_raise(policy.max_cost_usd, policy.PolicyError)
+        for off in ("0", "0.0", "0e5", "-1", "-5e-400"):
+            _os.environ["MCP_TERRA_MAX_COST_USD"] = off
+            assert policy.max_cost_usd() == 0.0, "literal-zero/negative must clamp to off: %s" % off
+        _os.environ.pop("MCP_TERRA_MAX_COST_USD", None)
+        # unset / empty / whitespace are still a legit "off" → 0.0, never raise
+        _os.environ.pop("MCP_TERRA_BUDGET_USD", None)
+        assert policy.budget_usd() == 0.0
+        _os.environ["MCP_TERRA_BUDGET_USD"] = "   "
+        assert policy.budget_usd() == 0.0
+    finally:
+        for k, v in saved.items():
+            if v is None: _os.environ.pop(k, None)
+            else: _os.environ[k] = v
+
+@case("CC-SpendCap", "submit validates spend env BEFORE the spec upload (no orphan spec)")
+def _():
+    import inspect
+    src = inspect.getsource(server.terra_submit_notebook_job)
+    # the advisory values are resolved up front (fail-closed) and reused, so a
+    # bad env can't leave a signed spec in GCS that a retry would double-spend
+    pre = src.index("_adv_cap = policy.max_cost_usd()")
+    up = src.index("bk.upload_file(")
+    assert pre < up, "spend env must be validated before the spec upload"
+    # the advisory reuses the pre-resolved locals, not fresh helper calls post-upload
+    assert "${_adv_cap:.2f}" in src or "_adv_cap:.2f" in src
+
+@case("CC-SpendCap", "start_runner.sh arms an INDEPENDENT crash-safe spend-cap watchdog")
+def _():
+    from mcp_terra import notebook_runner as nbr
+    s = nbr.start_runner_script_template()
+    # an independent watchdog stops the VM at the cap even if the main runner dies
+    assert "spend-cap watchdog" in s and "crash-safe" in s
+    # it only arms when BOTH cap and rate are set
+    assert '$_WD_CAP>0 && $_WD_RATE>0' in s
+    # it STOPS (pause), never deletes
+    assert "instances stop" in s and "instances delete" not in s
+    # security review [high]: cumulative across pause/resume (no per-resume reset)
+    assert "_WD_ACCUM" in s and "_wd_prior + (_wdnow - _wds)" in s
+    # security review [high]: a single failed stop must NOT end enforcement — keep
+    # retrying with backoff + kill the billable compute meanwhile
+    assert 'pkill -f ' in s and "papermill" in s
+    assert 'while [ "$_wdn" -lt "$_wdmax" ]' in s, "watchdog must retry the stop, not exit after one"
+    # security review [high]: every stop attempt is HARD-bounded, deadline-
+    # independent of coreutils timeout, with a metadata curl max-time
+    assert "_wd_bounded 120" in s and "--max-time 10" in s
+    # security review [high]: deadline-independent bound + LOCAL poweroff fail-closed
+    # fallback so a wedged/absent gcloud or timeout still stops the billing VM
+    assert "_wd_bounded()" in s
+    assert "poweroff" in s and "shutdown -h now" in s
+    assert "MANUAL STOP REQUIRED" in s
+    # security review [high]: armed BEFORE the fallible runner fetch
+    assert s.index("spend-cap watchdog armed") < s.index('gsutil cp "$RUNNER_SRC"')
+    # security review [high]: fail closed on a corrupt / unwritable accumulator
+    assert "failing closed" in s and "corrupt spend accumulator" in s
+
+@case("CC-SpendCap", "spend cap is a LIFETIME ceiling: runner + watchdog share a fail-closed accumulator")
+def _():
+    from mcp_terra import notebook_runner as nbr
+    runner = nbr.runner_script_template()
+    snip = nbr.spend_watchdog_snippet()
+    # both processes read the SAME persisted seconds file (persistent disk =
+    # survives pause/resume), add their own session, and write the running total
+    assert ".mcp_terra_spend_seconds" in runner and ".mcp_terra_spend_seconds" in snip
+    # both persist atomically (tmp + mv) and MONOTONICALLY (never rewind)
+    assert 'mv -f "${SPEND_ACCUM_FILE}.tmp"' in runner
+    assert 'mv -f "${_WD_ACCUM}.tmp"' in snip
+    assert '[ "$_disk_s" -gt "$_total_s" ]' in runner  # runner monotonic
+    assert '[ "$_wddisk" -gt "$_wdtot" ]' in snip       # watchdog monotonic
+
+@case("CC-SpendCap", "SSH runner bootstrap installs the SAME crash-safe watchdog")
+def _():
+    import inspect
+    src = inspect.getsource(server.terra_start_runner_on_vm)
+    # the SSH path arms the watchdog too (was runner-only) and exports the
+    # cap/rate/bucket it reads
+    assert "nbr.spend_watchdog_snippet()" in src and "{_watchdog}" in src
+    assert "export MCP_TERRA_BUCKET=" in src
+    assert "export MCP_TERRA_MAX_COST_USD='{_eff_cap_ssh}'" in src
+    # the restart reads the runtime's stored cEV and resolves the cap via the
+    # fail-closed helper; an explicit override param exists
+    assert "customEnvironmentVariables" in src and "isinstance(_cev, dict)" in src
+    assert "_resolve_restart_cap_rate(" in src
+    assert "max_cost_usd: float = 0.0" in src
+
+@case("CC-SpendCap", "_resolve_restart_cap_rate: fail-closed cap recovery (behavioral)")
+def _():
+    import os as _os
+    rr = server._resolve_restart_cap_rate
+    saved = {k: _os.environ.get(k) for k in ("MCP_TERRA_MAX_COST_USD", "MCP_TERRA_VM_HOURLY_USD")}
+    try:
+        _os.environ.pop("MCP_TERRA_MAX_COST_USD", None)
+        _os.environ.pop("MCP_TERRA_VM_HOURLY_USD", None)
+        D = "MCP_TERRA_MAX_COST_USD"
+        R = "MCP_TERRA_VM_HOURLY_USD"
+        # explicit override wins (no cEV needed); pairs with explicit rate
+        assert rr(20, 0.5, False, None) == (20.0, 0.5)
+        # runtime's OWN stored cap+rate (positively-readable cEV)
+        assert rr(0, 0, True, {D: "15", R: "0.4"}) == (15.0, 0.4)
+        # CONFIRMED uncapped (stored cap known-zero) + no env → uncapped allowed
+        assert rr(0, 0, True, {D: "0"}) == (0.0, 0.0)
+        # UNKNOWN stored cap → FAIL CLOSED unless explicit:
+        must_raise(rr, PermissionError, 0, 0, False, None)            # cEV unreadable
+        must_raise(rr, PermissionError, 0, 0, True, {})               # cEV dict but cap missing
+        must_raise(rr, PermissionError, 0, 0, True, {D: "[REDACTED]"})  # redacted
+        must_raise(rr, PermissionError, 0, 0, True, {D: "12 dollars"})  # unparsable
+        # positive cap with NO positive rate → enforceability gate fails closed
+        must_raise(rr, PermissionError, 0, 0, True, {D: "15"})        # stored cap, no rate
+        must_raise(rr, PermissionError, 7, 0, False, None)            # explicit cap, no rate, no env
+        # negative / non-finite args → ValueError
+        must_raise(rr, ValueError, -1, 0, False, None)
+        must_raise(rr, ValueError, float("inf"), 0, False, None)
+        # a STORED cap that float-underflows to 0.0 ('1e-400') is UNKNOWN → fail
+        # closed (NOT a confirmed-uncapped zero); a literal '0' stays known-zero.
+        must_raise(rr, PermissionError, 0, 0, True, {D: "1e-400", R: "0.5"})
+        assert rr(0, 0, True, {D: "0"}) == (0.0, 0.0)     # literal zero = uncapped
+        # PAIRING: a stale stored rate must NOT pair with an env cap. Runtime is
+        # confirmed-uncapped (stored cap 0) but has an old stored rate; env sets a
+        # NEW cap+rate → the resolved rate must be the ENV rate, not the stale one.
+        _os.environ[D] = "30"
+        _os.environ[R] = "1.0"
+        cap, rate = rr(0, 0, True, {D: "0", R: "0.10"})  # stored cap 0, stale rate 0.10
+        assert cap == 30.0 and rate == 1.0, "env cap must pair with env rate, not stale stored rate"
+        # LAZY env: a malformed UNRELATED env must NOT block an explicit cap+rate
+        _os.environ[D] = "not-a-number"
+        assert rr(20, 0.5, False, None) == (20.0, 0.5)   # never reads env → no raise
+    finally:
+        for k, v in saved.items():
+            if v is None: _os.environ.pop(k, None)
+            else: _os.environ[k] = v
+
+@case("CC-SpendCap", "watchdog ENFORCES even if its log path is unwritable + checks the cap immediately (functional)")
+def _():
+    import subprocess
+    import tempfile
+    import os
+    import time
+    from mcp_terra import notebook_runner as nbr
+    snip = nbr.spend_watchdog_snippet()
+    # source guards: a writable-log fallback + the cap check BEFORE the sleep
+    assert "_WD_LOG=/dev/null" in snip, "watchdog log must fall back to a writable path"
+    assert '>> "$_WD_LOG" 2>&1 &' in snip, "monitor loop must redirect to the chosen writable log"
+    d = tempfile.mkdtemp()
+    binp = os.path.join(d, "bin")
+    os.makedirs(binp)
+    ev = os.path.join(d, "events")
+    for n, body in [("curl", "echo fake"), ("gcloud", 'echo gcloud >> "%s"' % ev),
+                    ("pkill", 'echo pkill >> "%s"' % ev), ("gsutil", "exit 0"),
+                    ("sudo", "exit 0"), ("setsid", 'exec "$@"'),
+                    ("shutdown", "exit 0"), ("poweroff", "exit 0")]:
+        p = os.path.join(binp, n)
+        open(p, "w").write("#!/bin/sh\n%s\n" % body)
+        os.chmod(p, 0o755)
+    acc = os.path.join(d, "acc")
+    open(acc, "w").write("999999\n")   # lifetime spend already WAY over a $10 cap
+    env = dict(os.environ, PATH=binp + ":/usr/bin:/bin",
+               MCP_TERRA_MAX_COST_USD="10", MCP_TERRA_VM_HOURLY_USD="5",
+               MCP_TERRA_BUCKET="gs://b", MCP_TERRA_SPEND_ACCUM_FILE=acc,
+               HOME="/home/jupyter")   # hardcoded watchdog-log dir absent on this host
+    subprocess.run(["bash", "-c", "set -euo pipefail\n" + snip + "\necho ARMED\n"],
+                   env=env, capture_output=True, text=True, timeout=20)
+    # the detached monitor loop MUST run (fail-open if the unwritable log skipped
+    # it) and MUST stop on the FIRST iteration (no 30s pre-sleep): events appear fast
+    fired = False
+    for _ in range(12):
+        if os.path.exists(ev) and os.path.getsize(ev) > 0:
+            fired = True
+            break
+        time.sleep(0.5)
+    assert fired, "watchdog enforcement loop never ran (fail-open) or did not check immediately"
+
+@case("CC-SpendCap", "_wd_bounded enforces a HARD deadline on a TERM-ignoring child (functional)")
+def _():
+    import re
+    import subprocess
+    import tempfile
+    import os
+    import time
+    from mcp_terra import notebook_runner as nbr
+    snip = nbr.spend_watchdog_snippet()
+    m = re.search(r"\n(  _wd_bounded\(\) \{.*?\n  \})\n", snip, re.S)
+    assert m, "could not extract _wd_bounded from the watchdog snippet"
+    # SINGLE-process TERM-ignorer (no grandchild) so the test is portable to hosts
+    # without setsid (e.g. macOS); on the Terra VM setsid gives whole-group kill.
+    child = ("python3 -c 'import signal,time; "
+             "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)'")
+    script = m.group(1) + '\n_wd_bounded 3 ' + child + '\necho "rc=$?"\n'
+    fh = tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False)
+    fh.write(script)
+    fh.close()
+    try:
+        t0 = time.time()
+        r = subprocess.run(["bash", fh.name], capture_output=True, text=True, timeout=30)
+        dt = time.time() - t0
+    finally:
+        os.unlink(fh.name)
+    # the child IGNORES SIGTERM and sleeps 30s; the bound is 3s. A correct hard
+    # deadline KILLs it within a few seconds (TERM, then SIGKILL) — not 30s.
+    assert dt <= 15, "deadline not enforced (took %.1fs)" % dt
+    assert "rc=0" not in r.stdout, "expected nonzero rc from a hard-killed child"
+
+@case("CC-SpendCap", "accumulator reads are pipefail-safe (no cat|head SIGPIPE abort)")
+def _():
+    import subprocess
+    import tempfile
+    import os
+    from mcp_terra import notebook_runner as nbr
+    snip = nbr.spend_watchdog_snippet()
+    runner = nbr.runner_script_template()
+    # security review [high]: NO cat|head pipeline on the spend accumulator — under
+    # set -euo pipefail a large multi-line file makes head close the pipe early,
+    # cat gets SIGPIPE, and the read aborts the script BEFORE the fail-closed stop.
+    # Use a pipe-free read instead.
+    assert 'cat "$_WD_ACCUM"' not in snip and "IFS= read -r" in snip
+    assert 'cat "$SPEND_ACCUM_FILE"' not in runner and "IFS= read -r" in runner
+    # security review [high]: EOF-after-data safe — read assigns even with no
+    # trailing newline, so the rc must be IGNORED and fallback only on empty.
+    assert "[ -n \"$_wd_prior\" ] || _wd_prior=X" in snip
+    assert "%$'\\r'" in snip and "%$'\\r'" in runner          # CRLF tolerated
+    # security review (own audit): every read is -f guarded so a FIFO/device/dir
+    # at the accumulator path can never BLOCK (FIFO no writer) or read unbounded.
+    assert snip.count('[ -f "$_WD_ACCUM" ]') >= 2
+    assert runner.count('[ -f "$SPEND_ACCUM_FILE" ]') >= 2
+    # functional: the shared read pattern under set -euo pipefail must (a) not abort
+    # on a large multi-line file, (b) PRESERVE a no-trailing-newline digit value,
+    # (c) tolerate CRLF, (d) fall back on empty/missing, and (e) NOT BLOCK on a
+    # FIFO/dir (the -f guard skips the read).
+    read_pat = (' _v=""; [ -f "$F" ] && { IFS= read -r _v < "$F"; } 2>/dev/null || true; '
+                '_v="${_v%$\'\\r\'}"; [ -n "$_v" ] || _v=DEF; printf "%s" "$_v"')
+
+    def _read(path):
+        # timeout is the regression guard: if the -f guard were removed, a FIFO
+        # read would block and this raises TimeoutExpired (test fails, not hangs).
+        return subprocess.run(
+            ["bash", "-c", "set -euo pipefail; F='%s';%s" % (path, read_pat)],
+            capture_output=True, text=True, timeout=10).stdout
+
+    def _read_content(content):
+        h = tempfile.NamedTemporaryFile("wb", suffix=".acc", delete=False)
+        h.write(content)
+        h.close()
+        try:
+            return _read(h.name)
+        finally:
+            os.unlink(h.name)
+    assert _read_content(b"0123456789abcdef\n" * 9000) == "0123456789abcdef"  # large multi-line, no abort
+    assert _read_content(b"4567") == "4567"      # EOF-after-data (no trailing \n) PRESERVED
+    assert _read_content(b"89\r\n") == "89"      # CRLF tolerated
+    assert _read_content(b"") == "DEF"           # empty → fallback
+    assert _read("/nonexistent_acc_xyz_98765") == "DEF"   # missing → fallback
+    # FIFO (no writer) and a directory must fall back WITHOUT blocking
+    _d = tempfile.mkdtemp()
+    _fifo = os.path.join(_d, "acc")
+    os.mkfifo(_fifo)
+    try:
+        assert _read(_fifo) == "DEF"             # FIFO → -f false → skipped, no block
+        assert _read(_d) == "DEF"                # directory → fallback
+    finally:
+        os.remove(_fifo)
+        os.rmdir(_d)
+
+@case("CC-SpendCap", "watchdog fail-closed ABORTS the runner launch + rejects overflow counters")
+def _():
+    from mcp_terra import notebook_runner as nbr
+    snip = nbr.spend_watchdog_snippet()
+    runner = nbr.runner_script_template()
+    start = nbr.start_runner_script_template()
+    # security review [critical]: corrupt/unwritable accumulator stops the VM AND
+    # exits non-zero so the runner is never launched with an untrusted counter
+    assert "failing closed (stopping, not launching runner)" in snip
+    assert snip.count("exit 1") >= 2  # corrupt path + unwritable path
+    # security review [high]: a huge digit string is rejected (bash-arith overflow)
+    assert '"${#_wd_prior}" -gt 10' in snip
+    assert '[ "${#SPEND_PRIOR_SEC}" -gt 10 ]' in runner
+    # security review [high]: base-10 normalization so leading-zero (08/09) values
+    # cannot abort the arithmetic as bad octal
+    assert "10#$_wd_prior" in snip and "10#$_wddisk" in snip
+    assert "10#$SPEND_PRIOR_SEC" in runner and "10#$_disk_s" in runner
+    # security review [high]: at the cap the marker upload is BACKGROUNDED (cannot
+    # hang the stop); compute is killed first
+    assert ") >/dev/null 2>&1 &" in snip          # backgrounded marker in watchdog
+    # security review [high]: runner kills the pool BEFORE the (backgrounded) marker
+    ks = runner.index("kill_pool"); ms = runner.index("HALTED-SPEND-CAP.")
+    assert ks < ms, "runner must kill_pool before the spend-cap marker upload"
+    # security review [high]: watchdog armed before the secret requirement
+    assert start.index("watchdog armed") < start.index("MCP_TERRA_RUNNER_SECRET must be set")
 
 
 # ──────────────────────────────────────────────────────────────────────────
