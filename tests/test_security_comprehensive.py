@@ -1015,6 +1015,8 @@ def _():
             "abcdefghijklmnopqrstuvwxyzABCDEF",        # alphabet WALK: 32 unique + high Shannon, yet guessable
             "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef",        # descending-class walk
             "0123456789ABCDEFGHIJKLMNOPQRSTUV",        # digit-then-alpha walk (32 unique)
+            "qwertyuiopasdfghjklzxcvbnm123456",        # QWERTY keyboard walk (not codepoint-adjacent)
+            "asdfghjklqwertyuiopzxcvbnm098765",        # mixed keyboard-row walk
         ):
             _os.environ["MCP_TERRA_RUNNER_SECRET"] = weak
             must_raise(nbr.get_runner_secret, RuntimeError)

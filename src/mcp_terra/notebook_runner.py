@@ -148,18 +148,33 @@ def _validate_secret_strength(secret) -> None:
             f"Use python -c 'import secrets; print(secrets.token_urlsafe(32))'."
         )
     # Shannon measures DISTRIBUTION, not GUESSABILITY: a full alphabet/keyboard
-    # walk ('abc…XYZ', '0123…') has high unique-count AND high Shannon yet is
-    # trivially guessable. Reject strings that are mostly monotonic/repeated runs
-    # (adjacent code points stepping by <= 1) — this catches such walks while a
-    # cryptographically-random token has only a few percent such adjacencies.
+    # walk ('abc…XYZ', '0123…', 'qwerty…asdf…zxcv…') has high unique-count AND
+    # high Shannon yet is trivially guessable. Reject strings that are MOSTLY a
+    # predictable walk — adjacent characters that are either consecutive code
+    # points OR neighbours on a QWERTY keyboard row (so 'qwerty…' is caught even
+    # though its code points are not adjacent). A cryptographically-random token
+    # has only a few percent such adjacencies, so it is not affected.
+    _ROWS = ("1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm",
+             "abcdefghijklmnopqrstuvwxyz")
+
+    def _adjacent(a, b):
+        if abs(ord(a) - ord(b)) <= 1:
+            return True
+        la, lb = a.lower(), b.lower()
+        for _row in _ROWS:
+            ia, ib = _row.find(la), _row.find(lb)
+            if ia != -1 and ib != -1 and abs(ia - ib) == 1:
+                return True
+        return False
     if n >= 2:
-        seq_pairs = sum(1 for i in range(n - 1) if abs(ord(secret[i + 1]) - ord(secret[i])) <= 1)
-        if seq_pairs / (n - 1) >= 0.5:
+        walk = sum(1 for i in range(n - 1) if _adjacent(secret[i], secret[i + 1]))
+        if walk / (n - 1) >= 0.5:
             raise ValueError(
-                f"MCP_TERRA_RUNNER_SECRET is mostly a sequential/repeated run "
-                f"({seq_pairs}/{n - 1} adjacent chars step by <=1) — predictable "
-                f"despite high character diversity (an alphabet, digit, or keyboard "
-                f"walk). Use python -c 'import secrets; print(secrets.token_urlsafe(32))'."
+                f"MCP_TERRA_RUNNER_SECRET is mostly a predictable walk "
+                f"({walk}/{n - 1} adjacent chars are consecutive or keyboard "
+                f"neighbours) — guessable despite high diversity (an alphabet, "
+                f"digit, or keyboard-row walk). Use python -c "
+                f"'import secrets; print(secrets.token_urlsafe(32))'."
             )
 
 
