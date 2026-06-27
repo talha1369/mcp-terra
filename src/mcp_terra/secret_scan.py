@@ -125,10 +125,43 @@ _COPTIC_CONFUSABLES = {
     0x2C94: "K", 0x2C98: "M", 0x2C9A: "N", 0x2C9E: "O", 0x2CA2: "P",
     0x2CA4: "C", 0x2CA6: "T", 0x2CA8: "Y", 0x2CAC: "X",
 }
+# Extended-Latin / IPA confusables → ASCII, built from codepoints (the glyphs are
+# not eye-distinguishable in source, so a literal-glyph dict is error-prone). These
+# are Latin-SCRIPT letters that render like an ASCII letter — IPA alpha ɑ↔a, small-
+# capital Q ꞯ↔Q, the African hook letters ɓ↔b ɗ↔d ƙ↔k ƴ↔y, the retroflex/turned
+# IPA letters, and the small-capital series. FOLDING them (rather than name-
+# exempting every 'LATIN …' letter, the R14 regression that let ɑ/ꞯ bypass) does
+# double duty: the byte-scan recovers a secret that substituted one in, AND a
+# legitimate Azerbaijani/Hausa/Fula word that uses them folds to ASCII so it is NOT
+# a residual non-ASCII letter → no false refusal. Letters that do NOT resemble any
+# ASCII char (glottals ʔʕ, clicks ʘǁǂ, esh ʃ, ezh ʒ) are deliberately omitted —
+# folding them would be wrong, and they do not occur in token-shaped runs.
+_EXTLATIN_CONFUSABLES = {
+    0x0250: "a", 0x0251: "a", 0x0252: "a", 0x0253: "b", 0x0254: "o", 0x0255: "c",
+    0x0256: "d", 0x0257: "d", 0x0258: "e", 0x0259: "e", 0x025B: "e", 0x025C: "e",
+    0x025E: "e", 0x0260: "g", 0x0261: "g", 0x0262: "G", 0x0265: "h", 0x0266: "h",
+    0x0267: "h", 0x0268: "i", 0x0269: "i", 0x026A: "i", 0x026B: "l", 0x026C: "l",
+    0x026D: "l", 0x026F: "m", 0x0270: "m", 0x0271: "m", 0x0272: "n", 0x0273: "n",
+    0x0274: "N", 0x0275: "o", 0x0277: "w", 0x0279: "r", 0x027A: "r", 0x027B: "r",
+    0x027C: "r", 0x027D: "r", 0x027E: "r", 0x0280: "R", 0x0282: "s", 0x0288: "t",
+    0x0289: "u", 0x028A: "u", 0x028B: "v", 0x028C: "v", 0x028D: "w", 0x028E: "y",
+    0x0290: "z", 0x0291: "z", 0x0299: "B", 0x029B: "G", 0x029C: "H", 0x029D: "j",
+    0x029F: "l",
+    # Latin Extended-B hook / stroke letters used in African orthographies
+    0x0192: "f", 0x0199: "k", 0x0198: "K", 0x01A5: "p", 0x01AB: "t", 0x01AD: "t",
+    0x01B4: "y", 0x01B3: "Y", 0x0188: "c", 0x0263: "g", 0x0237: "j",
+    0x0249: "j", 0x024D: "r", 0x024F: "y",
+    # Latin small-capital letters in the Latin Extended-D block (ꞯ small-cap Q is
+    # the R15 bypass char — it carries a 'LATIN …' name and was name-exempted)
+    0xA7AF: "Q", 0xA7B0: "T", 0x1D04: "c", 0x1D07: "e", 0x1D0A: "j", 0x1D0B: "k",
+    0x1D18: "p", 0x1D1B: "t", 0x1D20: "v", 0x1D21: "w", 0x1D22: "z",
+}
 _CONFUSABLE_TABLE = {ord(k): v for k, v in _CONFUSABLES.items()}
 for _cp, _lat in _COPTIC_CONFUSABLES.items():
     _CONFUSABLE_TABLE[_cp] = _lat            # capital
     _CONFUSABLE_TABLE[_cp + 1] = _lat.lower()  # lowercase (Coptic pairs are cap, cap+1)
+for _cp, _lat in _EXTLATIN_CONFUSABLES.items():
+    _CONFUSABLE_TABLE.setdefault(_cp, _lat)  # don't override a curated mapping
 
 # GENUINE science Greek letters that are NOT Latin look-alikes (δ θ λ ξ π σ …),
 # excluded from the homoglyph backstop so 'TGFβ1' / 'λmax-2024' / 'δ13C' / a
@@ -188,8 +221,10 @@ def fold_confusables(text: str) -> str:
 # Common Latin-script letters WITHOUT an NFKD-to-ASCII decomposition (used in
 # real European text) → folded to ASCII for the homoglyph backstop ONLY, so a
 # legit Scandinavian/Polish/German word does not look like a non-Latin homoglyph.
-# Deliberately EXCLUDES small-caps / phonetic letters (ʏ ᴀ ɡ …) — those are
-# homoglyph vectors we WANT to flag, not legitimate prose letters.
+# The ASCII-RESEMBLING small-caps / phonetic letters (ʏ ᴀ ɡ ɑ ꞯ …) are folded too,
+# via _CONFUSABLE_TABLE / _EXTLATIN_CONFUSABLES — they are homoglyph vectors, so
+# folding them lets the byte-scan recover the real token (stronger than the
+# backstop merely refusing).
 _LATIN_EXTRAS = {
     "ø": "o", "Ø": "O", "ł": "l", "Ł": "L", "đ": "d", "Đ": "D",
     "æ": "a", "Æ": "A", "œ": "o", "Œ": "O", "ß": "s", "þ": "t", "Þ": "T",
@@ -232,21 +267,24 @@ def has_homoglyph_token_shape(text: str) -> bool:
     fold = orig.translate(_CONFUSABLE_TABLE).translate(_LATIN_EXTRAS_TABLE)
 
     def _suspect(c: str) -> bool:
-        # A residual letter is a homoglyph SUSPECT unless it is:
+        # A residual (post-fold) letter is a homoglyph SUSPECT unless it is:
         #  • a genuine-science Greek letter (δ θ λ μ…, allow-listed); or
         #  • a WIDE/ideographic letter (Han/Hiragana/Katakana/Hangul, EAW W/F —
-        #    not [A-Za-z] look-alikes; glued to Latin gene-IDs in CJK prose); or
-        #  • a LATIN-script letter (Unicode name starts 'LATIN') — these are legit
-        #    extended-Latin orthography (Azerbaijani schwa ə, Hausa/Fula hook
-        #    letters ɓ/ɗ/ɛ/ɔ, accented letters) that have no ASCII decomposition;
-        #    the Latin-script letters that ARE homoglyph vectors (small-caps,
-        #    phonetic) are already mapped by the fold, so they never reach here.
-        # Cross-script confusables (Cyrillic/Armenian/Coptic/… not in the fold)
-        # remain suspects — that is the actual smuggling vector.
+        #    not [A-Za-z] look-alikes; glued to Latin gene-IDs in CJK prose).
+        # We do NOT name-exempt 'LATIN …' letters: that was the R15 bypass — IPA
+        # alpha ɑ and small-capital Q ꞯ carry 'LATIN …' names yet render as a/Q.
+        # Instead the ASCII-resembling extended-Latin/IPA letters are FOLDED to
+        # ASCII (so fold[i] is ASCII and never reaches here), and legitimate
+        # extended-Latin orthography (Azerbaijani ə, Hausa ɓ/ɗ/ɛ/ɔ/ƙ/ƴ, Norse
+        # ø/ð/þ, dotless ı, ŋ) is likewise folded by _CONFUSABLE_TABLE /
+        # _LATIN_EXTRAS → not residual → not flagged. So the only Latin letters
+        # reaching here are UNFOLDED ones (a confusable we missed, or an exotic
+        # non-prose phonetic letter); flagging them is the intended defense in
+        # depth. Cross-script confusables (Cyrillic/Armenian/Coptic/…) likewise
+        # remain suspects — the actual smuggling vector.
         return (ord(c) > 127 and _ud.category(c)[0] == "L"
                 and c not in _GREEK_SCIENCE
-                and _ud.east_asian_width(c) not in ("W", "F")
-                and not _ud.name(c, "").startswith("LATIN"))
+                and _ud.east_asian_width(c) not in ("W", "F"))
 
     def _is_run_char(c: str) -> bool:
         return (c in _ASCII_TOKEN_CHARS

@@ -313,23 +313,40 @@ def _validate_secret_strength(secret, _depth: int = 0) -> None:
     # bytes, so _screen_encoded returns False / does not raise → no false-reject.
     if _depth == 0:
         import base64 as _b64
-        _decoded = None
-        try:
-            if _alpha == 16:
-                _decoded = bytes.fromhex(_core)
-            elif _alpha == 32:
-                _decoded = _b64.b32decode(_core + "=" * ((8 - len(_core) % 8) % 8),
-                                          casefold=True)
-            elif _re_fmt.fullmatch(r"[A-Za-z0-9+/]+", _core):
-                _decoded = _b64.b64decode(_core + "=" * (-len(_core) % 4))
-            elif _re_fmt.fullmatch(r"[A-Za-z0-9_-]+", _core):
-                _decoded = _b64.urlsafe_b64decode(_core + "=" * (-len(_core) % 4))
-        except ValueError:   # binascii.Error subclasses ValueError; odd-length hex
-            _decoded = None
-            if _alpha:
+        # Try EVERY applicable decoding, NOT the first-matching branch. The alphabets
+        # OVERLAP (a base64 string with no 0/1/8/9/+/ is also valid base32; hex is a
+        # subset of base64), so an elif chain mis-routes such a string to a garbage
+        # decode and never screens the real interpretation — that was the R15 bypass
+        # (a base64-encoded weak phrase classified as base32 → garbage → accepted).
+        # `_decodes` pairs each decode with whether it is the FORMAT interpretation
+        # (hex/base32, which also carries the entropy exemption) so we deny the
+        # exemption only when the FORMAT decode is encoded text.
+        _decodes = []
+        if _alpha == 16:
+            try:
+                _decodes.append((True, bytes.fromhex(_core)))
+            except ValueError:
+                _fmt_strong = False          # undecodable hex → deny exemption
+        if _alpha == 32:
+            try:
+                _decodes.append((True, _b64.b32decode(
+                    _core + "=" * ((8 - len(_core) % 8) % 8), casefold=True)))
+            except ValueError:
                 _fmt_strong = False
-        if _decoded and _screen_encoded(_decoded) and _alpha:
-            _fmt_strong = False   # hex/base32 that encodes text → deny exemption
+        if _re_fmt.fullmatch(r"[A-Za-z0-9+/]+", _core):
+            try:
+                _decodes.append((False, _b64.b64decode(_core + "=" * (-len(_core) % 4))))
+            except ValueError:
+                pass
+        if _re_fmt.fullmatch(r"[A-Za-z0-9_-]+", _core):
+            try:
+                _decodes.append((False, _b64.urlsafe_b64decode(
+                    _core + "=" * (-len(_core) % 4))))
+            except ValueError:
+                pass
+        for _is_fmt, _dec in _decodes:
+            if _dec and _screen_encoded(_dec) and _is_fmt:
+                _fmt_strong = False   # hex/base32 that encodes text → deny exemption
     # Character-diversity floor: ≥12 unique for a general secret; a recognized
     # strong-format key draws from a smaller alphabet, so a lower floor is
     # correct. It is set to 11 (not lower): a real token_hex(16) clears it

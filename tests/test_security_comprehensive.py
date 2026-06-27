@@ -1118,6 +1118,16 @@ def _():
                   if _raises(nbr._validate_secret_strength, ValueError,
                              _b642.b64encode(_secrets.token_bytes(24)).decode()))
     assert _b64rej < 30, f"random base64 secrets broadly false-rejected {_b64rej}/3000"
+    # REGRESSION (R15): a base64-encoded phrase whose ciphertext happens to be a
+    # valid base32 alphabet (no 0/1/8/9/+/) must NOT be mis-classified as base32 and
+    # routed to a garbage base32 decode that passes — every applicable decoding is
+    # screened now. b64(phrase + 8 NUL) is the auditor's exact construction.
+    for _ph in (b"changethissecret", b"abcdefghijklmnop", b"supersecretkey00",
+                b"placeholderkey00"):
+        _enc = _b642.b64encode(_ph + b"\x00" * 8).decode()
+        assert __import__("re").fullmatch(r"[A-Za-z2-7]+", _enc), \
+            f"test fixture {_enc} is not base32-alphabet (regression no longer exercised)"
+        must_raise(nbr._validate_secret_strength, ValueError, _enc)
 
     def _nul_interleave(_b, _grp):
         _o = bytearray()
@@ -2864,11 +2874,33 @@ def _():
     assert not _audio_blocked(_withhash), "audio false-positive on a SHA-256 hash"
     assert not _email_blocked(_withhash[:60]), "email false-positive on a SHA-256 hash"
     # NO false positive: extended-Latin orthography (Azerbaijani schwa ə, Hausa
-    # hook ɓ/ɗ) — legitimate Latin-script summaries — must render in BOTH channels.
+    # hook ɓ/ɗ/ƙ) — legitimate Latin-script summaries — must render in BOTH channels.
     for _ok in ("Gen ifadəsi analizinin nəticələri ümumiləşdirilmişdir və əhəmiyyətlidir bu gün burada.",
-                "Sakamakon binciken samfurori 2024 ɓatacce ne kuma ɗimbin kayan an gama da kyau a nan."):
+                "Sakamakon binciken samfurori 2024 ɓatacce ne kuma ɗimbin kayan ƙwarai an gama a nan ok.",
+                "Phân tích biểu hiện gen đã hoàn thành và kết quả có ý nghĩa thống kê đáng kể vào hôm nay.",
+                "Die Genexpressionsanalyse ergab größere Veränderungen und Müller bestätigte das Ergebnis."):
         assert not _audio_blocked(_ok), f"audio false-positive on extended-Latin: {_ok[:24]}"
-        assert not _email_blocked(_ok[:50]), f"email false-positive on extended-Latin: {_ok[:24]}"
+        assert not _email_blocked(_ok[:55]), f"email false-positive on extended-Latin: {_ok[:24]}"
+    # REGRESSION (R15): a real secret with ONE char replaced by its Latin-script
+    # confusable (IPA alpha ɑ→a, small-capital Q ꞯ→Q, hook ɓ→b ɗ→d ƙ→k, retroflex
+    # ɭ→l ʂ→s, iota ɩ→i) must STILL be caught — the R14 'exempt every LATIN-named
+    # letter' rule let these bypass both the fold-scan and the backstop. These
+    # confusables are FOLDED to ASCII now, so the byte-scan recovers the pattern.
+    _realsec = {"ghp_A1b2C3d4E5f6G7h8I9j0KlMnOpQrStavWxYZ": ("a","b","d","l","i","s","Q"),  # pragma: allowlist secret
+                "AKIAIOSFODNN7EXAMPLE": ("a","i","s","o"),
+                "ya29.A0ARrdaM" + "b" * 30: ("a","b")}
+    _cmap = {"a": 0x0251, "b": 0x0253, "d": 0x0257, "l": 0x026D, "i": 0x0269,
+             "s": 0x0282, "Q": 0xA7AF, "o": 0x0254, "k": 0x0199}
+    from mcp_terra import secret_scan
+    for _sec, _chars in _realsec.items():
+        for _ch in _chars:
+            if _ch in _sec and _ch in _cmap:
+                _smug = _sec.replace(_ch, chr(_cmap[_ch]), 1)
+                assert (secret_scan.scan_egress(_smug)
+                        or secret_scan.has_homoglyph_token_shape(_smug)), \
+                    f"Latin-confusable homoglyph bypassed scan: {_ch}->{hex(_cmap[_ch])} in {_sec[:8]}"
+                assert _email_blocked("The deploy credential is " + _smug + " keep it safe today."), \
+                    f"email leaked Latin-confusable homoglyph secret {_ch}->{hex(_cmap[_ch])}"
     # NO false positive: Russian/Cyrillic biomedical prose with HYPHENATED Latin
     # technical terms (Latin head '-' Cyrillic suffix, no inline substitution) —
     # ubiquitous in real summaries — must render in BOTH channels.
