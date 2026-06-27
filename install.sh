@@ -163,14 +163,16 @@ fi
 # ── 4. Runner secret ───────────────────────────────────────────────────────
 step "Runner secret (HMAC key)"
 
-if [ -e "$SECRET_FILE" ] && [ -s "$SECRET_FILE" ]; then
-  # Reuse — but only a SAFE secret file: a regular file (not a symlink/device),
-  # owned by us, with no group/other access. An attacker who pre-creates the
-  # secret (or symlinks it) could otherwise steal/redirect the HMAC key that
-  # signs runner-accepted specs. Fail loud rather than trust a suspect file.
-  [ -L "$SECRET_FILE" ] && fail "$SECRET_FILE is a symlink — refusing (move it aside)."
-  [ -f "$SECRET_FILE" ] || fail "$SECRET_FILE is not a regular file — refusing."
-  # Owner == current user
+# Validate the path BEFORE any read OR write, regardless of whether it exists or
+# is empty: the HMAC key that signs runner-accepted specs must NEVER be written
+# THROUGH a symlink or non-regular file (an attacker could redirect or briefly
+# expose it). `[ -L ]` catches a dangling or empty-target symlink too. These run
+# on EVERY path — including the generate branch, which the old code skipped for an
+# empty/dangling/symlinked file, writing the secret through it.
+[ -L "$SECRET_FILE" ] && fail "$SECRET_FILE is a symlink — refusing (move it aside)."
+[ -e "$SECRET_FILE" ] && [ ! -f "$SECRET_FILE" ] && fail "$SECRET_FILE exists but is not a regular file — refusing."
+if [ -f "$SECRET_FILE" ] && [ -s "$SECRET_FILE" ]; then
+  # Reuse a SAFE existing secret: regular file (verified above), owned by us, 0600.
   # GNU stat (-c) FIRST, then BSD (-f): on Linux `stat -f` is --file-system and
   # pollutes stdout while exiting nonzero, so BSD-first would mis-read the owner.
   _own="$(stat -c '%u' "$SECRET_FILE" 2>/dev/null || stat -f '%u' "$SECRET_FILE" 2>/dev/null || echo -1)"
@@ -184,11 +186,16 @@ if [ -e "$SECRET_FILE" ] && [ -s "$SECRET_FILE" ]; then
   ok "Reusing existing runner secret at $SECRET_FILE"
   RUNNER_SECRET="$(cat "$SECRET_FILE")"
 else
+  # Generate: write to a fresh 0600 temp file in the private dir, then atomically
+  # rename over the (validated, non-symlink) path — the key is never written
+  # through the target path itself, even on a reinstall over an empty leftover.
   RUNNER_SECRET="$("$VENV_PY" -c 'import secrets; print(secrets.token_urlsafe(32))')"
   umask 077
-  printf '%s' "$RUNNER_SECRET" > "$SECRET_FILE"
-  chmod 600 "$SECRET_FILE"
-  ok "Generated new runner secret → $SECRET_FILE (mode 0600)"
+  _stmp="$(mktemp "$HOME/.mcp-terra/runner_secret.XXXXXX")" || fail "could not create a temp secret file"
+  printf '%s' "$RUNNER_SECRET" > "$_stmp"
+  chmod 600 "$_stmp"
+  mv -f "$_stmp" "$SECRET_FILE" || fail "could not install $SECRET_FILE"
+  ok "Generated new runner secret → $SECRET_FILE (mode 0600, atomic)"
 fi
 
 # Validate strength in the venv where mcp_terra is importable. Pass the secret

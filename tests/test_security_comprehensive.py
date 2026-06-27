@@ -1422,6 +1422,50 @@ def _():
     assert 'mv -f "$CONFIG_TMP" "$CONFIG_FILE"' in sh, "config.env must be installed atomically (rename)"
     assert 'cat > "$CONFIG_FILE"' not in sh, "config.env still written in place (loose-mode/symlink race)"
 
+@case("CC-Hardening", "install.sh runner-secret write refuses symlinks + never writes through (executable)")
+def _():
+    import os
+    import subprocess
+    import tempfile
+    import pathlib
+    sh = (REPO_ROOT / "install.sh").read_text()
+    # extract the runner-secret block (first symlink guard .. its closing `fi`)
+    i = sh.index('[ -L "$SECRET_FILE" ] && fail')
+    end = sh.index("\nfi\n", i)
+    block = sh[i:end + 3]
+    assert "mktemp" in block and "mv -f" in block, "did not extract the atomic secret block"
+
+    def run(setup):
+        d = pathlib.Path(tempfile.mkdtemp())
+        priv = d / ".mcp-terra"; priv.mkdir(mode=0o700)
+        secret = priv / "runner_secret"
+        outside = d / "OUTSIDE"            # symlink target — must NEVER be written
+        setup(secret, outside)
+        vpy = d / "vpy"
+        vpy.write_text("#!/bin/sh\necho AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n"); vpy.chmod(0o755)
+        harness = (
+            'fail() { echo "FAIL:$*"; exit 7; }\ninfo() { :; }\nok() { :; }\n'
+            + 'SECRET_FILE="%s"\nVENV_PY="%s"\nHOME="%s"\n' % (secret, vpy, d)
+            + block + "\necho GENERATED_OK\n"
+        )
+        r = subprocess.run(["bash", "-c", harness], capture_output=True, text=True, timeout=15)
+        return r.stdout + r.stderr, secret, outside
+    # (a) dangling symlink -> refuse; the (nonexistent) target stays unwritten
+    out, secret, outside = run(lambda s, o: os.symlink(str(o), str(s)))
+    assert "FAIL:" in out and "symlink" in out, "dangling symlink not refused: %r" % out
+    assert not outside.exists(), "secret was written THROUGH the dangling symlink"
+    # (b) symlink to an existing empty file -> refuse; target stays empty
+    def _symlink_empty(s, o):
+        o.write_text(""); os.symlink(str(o), str(s))
+    out, secret, outside = run(_symlink_empty)
+    assert "FAIL:" in out and "symlink" in out, "symlink-to-empty not refused: %r" % out
+    assert outside.read_text() == "", "secret was written THROUGH the symlink"
+    # (c) clean path -> generates a real, non-symlink, 0600 regular file
+    out, secret, outside = run(lambda s, o: None)
+    assert "GENERATED_OK" in out, "clean generate failed: %r" % out
+    assert secret.is_file() and not secret.is_symlink(), "generated secret is not a regular file"
+    assert oct(secret.stat().st_mode & 0o777) == "0o600", "generated secret not mode 0600"
+
 @case("CC-Hardening", "plugin .mcp.json is valid and uses the mcpServers schema")
 def _():
     import json
