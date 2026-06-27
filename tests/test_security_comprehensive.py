@@ -515,6 +515,16 @@ def _():
     assert fixed.read_text() == "PRECIOUS", "existing backup must be untouched (no-clobber)"
     assert f2.read_text() == "NEW", "source must remain when versioning refuses"
 
+@case("G-Edge", "version_existing_bucket move is server-side no-clobber (mv -n + post-verify)")
+def _():
+    import inspect
+    src = inspect.getsource(safety.version_existing_bucket)
+    # the GCS move must carry the server-side no-clobber precondition (mv -n) AND
+    # post-verify the backup landed — the precheck + random name alone are not a
+    # server-enforced no-clobber.
+    assert '"mv", "-n"' in src, "bucket move must use `gsutil mv -n` (server-side no-clobber)"
+    assert "not present after move" in src, "bucket move must post-verify the backup exists"
+
 @case("G-Edge", "Path(None) handled")
 def _():
     must_raise(safety.safe_local_read_path, (safety.SafetyError, TypeError), None)
@@ -998,7 +1008,14 @@ def _():
         # terra_start_runner_on_vm via get_runner_secret; the runner verifies HMACs
         # with this key, so it must enforce the FULL policy (>=32, >=12 unique,
         # entropy), not just a 16-char floor — else a co-member can guess it.
-        for weak in ("a" * 20, "abcd" * 5, "x" * 31):   # short / low-unique / 31-char
+        for weak in (
+            "a" * 20,                                  # short
+            "abcd" * 5,                                # low-unique
+            "x" * 31,                                  # 31-char
+            "abcdefghijklmnopqrstuvwxyzABCDEF",        # alphabet WALK: 32 unique + high Shannon, yet guessable
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef",        # descending-class walk
+            "0123456789ABCDEFGHIJKLMNOPQRSTUV",        # digit-then-alpha walk (32 unique)
+        ):
             _os.environ["MCP_TERRA_RUNNER_SECRET"] = weak
             must_raise(nbr.get_runner_secret, RuntimeError)
         # a strong secret passes

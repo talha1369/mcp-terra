@@ -147,6 +147,20 @@ def _validate_secret_strength(secret) -> None:
             f"patterns, dictionary-derived strings fail this check). "
             f"Use python -c 'import secrets; print(secrets.token_urlsafe(32))'."
         )
+    # Shannon measures DISTRIBUTION, not GUESSABILITY: a full alphabet/keyboard
+    # walk ('abc…XYZ', '0123…') has high unique-count AND high Shannon yet is
+    # trivially guessable. Reject strings that are mostly monotonic/repeated runs
+    # (adjacent code points stepping by <= 1) — this catches such walks while a
+    # cryptographically-random token has only a few percent such adjacencies.
+    if n >= 2:
+        seq_pairs = sum(1 for i in range(n - 1) if abs(ord(secret[i + 1]) - ord(secret[i])) <= 1)
+        if seq_pairs / (n - 1) >= 0.5:
+            raise ValueError(
+                f"MCP_TERRA_RUNNER_SECRET is mostly a sequential/repeated run "
+                f"({seq_pairs}/{n - 1} adjacent chars step by <=1) — predictable "
+                f"despite high character diversity (an alphabet, digit, or keyboard "
+                f"walk). Use python -c 'import secrets; print(secrets.token_urlsafe(32))'."
+            )
 
 
 def sign_spec(spec: dict, secret: str) -> dict:

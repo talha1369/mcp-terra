@@ -806,13 +806,22 @@ def version_existing_bucket(gs_uri: str, method: str = "timestamp") -> str:
             f"versioned URI {versioned!r} already exists — refusing to overwrite. "
             f"Move or rename it manually outside the MCP."
         )
-    # gsutil mv = server-side rename; data preserved at the versioned name. The
-    # versioned name carries a per-call random token (see versioned_name), so the
-    # destination is unique and cannot pre-exist from a concurrent versioning of
-    # the same object — the move can never clobber an existing backup. (gsutil has
-    # no rm in this codebase by design, so a cp+rm no-clobber sequence is not an
-    # option; the unique destination is the no-clobber guarantee.)
-    bk._run_gsutil(["mv", gs_uri, versioned], timeout=300.0)
+    # gsutil mv = server-side rename; data preserved at the versioned name. TWO
+    # independent guards make the destination non-clobbering: (1) a per-call random
+    # token in versioned_name makes the dest unique (cannot pre-exist from a
+    # concurrent versioning of the same object), and (2) `-n` applies a SERVER-SIDE
+    # no-clobber precondition, so even a TOCTOU between the precheck above and the
+    # move cannot overwrite an existing backup — gsutil fails (non-zero) instead,
+    # leaving the source intact. (gsutil has no rm in this codebase by design.)
+    bk._run_gsutil(["mv", "-n", gs_uri, versioned], timeout=300.0)
+    # Post-verify the backup landed (defense-in-depth): if the versioned object is
+    # not present after a "successful" move, refuse loudly rather than let the
+    # caller proceed assuming the original was safely preserved.
+    if not bucket_object_exists(versioned):
+        raise SafetyError(
+            f"versioned backup {versioned!r} not present after move — refusing "
+            f"(the original may not have been safely preserved)."
+        )
     _audit("version_existing_bucket", "WRITE-SAFE-RENAME",
            f"{gs_uri} → {versioned}  (method={method})")
     return versioned
