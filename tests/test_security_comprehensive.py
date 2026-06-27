@@ -2477,10 +2477,21 @@ def _():
         f"aws_secret_access_key: {KEY}",             # YAML ':' separator
         f'{{"aws_secret_access_key": "{KEY}"}}',     # JSON: quoted KEY name + value
         f"'aws_secret_access_key' = '{KEY}'",        # quoted key + value, '=' sep
+        # REGRESSION (R23): NATURAL-ENGLISH prose labels (space/hyphen separators,
+        # 'aws'/'access' optional) — the spelling an LLM writes in a run report.
+        f"AWS Secret Access Key: {KEY}",
+        f"AWS secret access key = {KEY}",
+        f"Secret access key: {KEY}",
+        f"aws secret key: {KEY}",
+        f"secret-access-key: {KEY}",
     ):
         hits = secret_scan.scan_bytes(line.encode())
         assert any(h["pattern"] == "aws_secret_key_assignment" for h in hits), \
             f"missed AWS secret key in: {line[:32]!r}"
+    # NO false positive: prose that merely mentions a key (no 40-char value) renders
+    for _ok in ("The secret key was rotated and the run finished cleanly here today now ok fine.",
+                "Key findings: expression was elevated across all replicates and verified here today ok."):
+        assert not secret_scan.scan_bytes(_ok.encode()), f"false positive on key-mention prose: {_ok[:24]}"
 
 @case("Y-SecretScan", "PEM private-key header blocks upload")
 def _():

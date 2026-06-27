@@ -140,9 +140,9 @@ python tests/test_security_comprehensive.py
 | B-Path | 13 | `/etc/passwd`, `~/.ssh/id_rsa`, case-insensitive-FS variants, `~/.aws/credentials`, gcloud ADC JSON, `/tmp/../etc/passwd`, trailing slash, oversize/empty path, overwrite refused, missing parent |
 | C-PromptInjection | 9 | ASCII `<\|im_start\|>`, Unicode full-width (U+FF5C), `[INST]`, `<system>`, C0/C1/DEL stripping; newline+tab preserved; output truncation |
 | D-Bucket | 6 | Non-`gs://` scheme, `http://`, non-workspace bucket, empty URI, bare `gs://`, CRLF in bucket URI |
-| E-Policy | 5 | Writes default OFF; ON only with `MCP_TERRA_ALLOW_WRITES=1`; non-truthy stays OFF; rate limiter raises on burst |
+| E-Policy | 7 | Writes default OFF; ON only with `MCP_TERRA_ALLOW_WRITES=1`; non-truthy stays OFF; rate limiter raises on burst |
 | F-Tools | 3 | No destruction primitive registered; **45 tools** registered exactly; every spend/write tool has the correct action class |
-| G-Edge | 6 | Valid identifiers accepted; empty/leading-non-alphanum refused; name-length cap; versioned-name shape; `Path(None)` handled |
+| G-Edge | 8 | Valid identifiers accepted; empty/leading-non-alphanum refused; name-length cap; versioned-name shape; `Path(None)` handled |
 | H-Supply | 5 | No `eval`/`exec`/`pickle.load*`/`shell=True` anywhere; dependency upper bounds present |
 | I-Output | 1 | Token-leak defense-in-depth wired into `_ok()` |
 | J-ReDoS | 2 | `_SAFE_ID_RE` / `_SAFE_GS_RE` complete in <0.1 s on 10 000-char inputs |
@@ -153,23 +153,23 @@ python tests/test_security_comprehensive.py
 | O-KillSwitch | 5 | Kill-switch: clean state, manual trip persists, out-of-band file trip, fail-closed refuse-all |
 | P-DataLoss | 4 | Non-regular files (device/FIFO/socket) refused; bucket upload/download pass `-n` no-clobber |
 | Q-Fetch | 9 | `terra_fetch_url` allowlist: `http` refused, non-allowlisted host, subdomain-spoof, userinfo, `file:`/`javascript:` schemes, oversize, writes-gated |
-| R-Hardening | 16 | Bucket-URI regex hardening; `writes_allowed` snapshotted at startup (env-flip immune); HMAC spec binding; dir-collision; locks |
+| R-Hardening | 19 | Bucket-URI regex hardening; `writes_allowed` snapshotted at startup (env-flip immune); HMAC spec binding; dir-collision; locks |
 | CC-RunnerSecret | 13 | Runner script scrubs `MCP_TERRA_RUNNER_SECRET` + other `MCP_TERRA_*` before papermill; spec signature binds spec-gcs + submit-ts |
 | T-Docker | 10 | Dockerfile present; non-root `USER`; read-only env defaults; pinned base; documented hardening run-flags |
 | U-Robustness | 10 | Every tool carries `ToolAnnotations`; destructive-hint only on kill-switch; read tools `readOnlyHint=True`; schema/version envelope |
 | V-EmailExfil | 14 | Recipient-locked email: CR/LF header injection, body smuggling, raw-token exfil defense, homoglyph/NFKC checks |
 | W-RunLog | 4 | `terra_get_run_log` read-only; stream arg validated; `max_bytes` bounds |
-| X-Triage | 8 | `bug_triager` categorization (missing_module / name_error / attribute_error / oom / …) + safe traceback truncation |
-| Y-SecretScan | 8 | `secret_scan` blocks ya29 / AWS key / PEM / GitHub PAT before upload; reports context not value; fail-closed on unreadable |
+| X-Triage | 11 | `bug_triager` categorization (missing_module / name_error / attribute_error / oom / …) + safe traceback truncation |
+| Y-SecretScan | 9 | `secret_scan` blocks ya29 / AWS key / PEM / GitHub PAT before upload; reports context not value; fail-closed on unreadable |
 | Z-LLMRouter | 5 | Optional LLM router: defaults off, schema validation, refuses dangerous tokens / shell metachars |
 | AA-AuditChain | 3 | HMAC audit hash-chain: ok on fresh chain, detects a tampered line, continues across restart |
-| BB-AudioSummary | 8 | Audio summary: length bounds, refuses raw token shapes, sends quota-project header |
+| BB-AudioSummary | 12 | Audio summary: length bounds, refuses raw token shapes, sends quota-project header |
 | CC-StartRunnerOnVM | 6 | Legacy gcloud-SSH runner start: identifier validation, secret via stdin (not argv), heartbeat verification |
 | CC-SeamlessRunner | 20 | Seamless on-boot runner (`startUserScriptUri` + `customEnvironmentVariables`); no literal secret; env redaction; the live-execution regression fixes |
 | CC-HeartbeatBinding | 7 | Heartbeat identity-binding (`<epoch> <runtime_name>`) parsing + verification |
-| CC-WDL | 7 | WDL submission primitives: entity-less body, no abort/delete, workspace-lock, SPEND gate, no delete-outputs switch, bool `method_version` rejected |
+| CC-WDL | 9 | WDL submission primitives: entity-less body, no abort/delete, workspace-lock, SPEND gate, no delete-outputs switch, bool `method_version` rejected |
 | CC-Email | 1 | SMTP modes: A `.eml` (no creds), B authenticated, C relay (explicit opt-in only) |
-| CC-Reads | 10 | comprehensive-read read tools: READ-class, no write/delete, paging clamps, call-tree summary, byte-range read, allowlist, Batch logging command |
+| CC-Reads | 11 | comprehensive-read read tools: READ-class, no write/delete, paging clamps, call-tree summary, byte-range read, allowlist, Batch logging command |
 | CC-RunRecord | 6 | Provenance run record: schema/version stamping, derived counts, agent-forged provenance overwritten, workspace from the lock, malformed-record rejection, order-independent integrity digest, secret-scan before persist |
 | CC-Notify | 4 | Slack ping: no-webhook safe return, host/https-locked webhook, secret-shaped payload refused before network, no `url` param (webhook env-locked, anti-exfil) |
 | CC-NoDeleteAttack | 7 | Social-engineering "delete the malware-infected files" request achieves nothing: no delete-capable tool, bucket layer uses only non-destructive verbs, no rmtree/rmdir call, os.unlink only on temp files, no delete primitive on any client layer, LLM-patch validator blocklists destructive tokens, attack has no callable to fulfill it |
@@ -180,10 +180,14 @@ python tests/test_security_comprehensive.py
 | CC-ControlledAccess | 5 | NIH GDS/DUC data-egress guard: off by default (lab/public unhindered), guard ON refuses the secure bucket but allows public + operator-allowlisted buckets, blocks `get_entities` rows, `read_bucket_object` enforces it while metadata-only stays available, `terra_health` surfaces the posture |
 | CC-ControlledAccessEgress | 6 | egress-path closure (executes the bypasses): exact-name public allowlist (prefix-collision blocked), `get_workflow_outputs` refused, `get_workflow_metadata` reduced to status+summary, `get_run_log` content withheld, `get_notebook_job_result` redacts source/traceback + gates the Tier-2 external LLM, audio render read-back md5 verify |
 | CC-Retry | 5 | Transient-failure retry in `terra_client._request`: Retry-After parse + bounded backoff, GET retries 429 then succeeds, POST is NOT retried (no double-submit), retries are bounded (exhaust→raise), non-retryable 4xx not retried |
-| CC-WorkflowLogs | 2 | `terra_get_workflow_logs` (per-task Cromwell stderr): controlled mode withholds stderr content (paths/status kept), off-mode reads the failed task's stderr tail with `failed_only` filtering |
-| CC-ControlledAccessGuard | 34 | egress closure + retry safety: a **fail-closed AST meta-test** (every registered tool must be explicitly classified; every data tool must carry a *runtime* guard call — a docstring mention can't satisfy it), `method_config` projected to **counts** (values AND key names withheld; sentinel-identifier test), `submission` projected to ids+statuses, `workflow_logs` refuses a stderr path outside the queried workspace bucket + flags per-task truncation, audio `say` fed via **stdin not argv**, retry aborts on the kill-switch hook (interruptible backoff) + deadline-capped, the `terra://health` resource is minimal + data-free |
+| CC-WorkflowLogs | 3 | `terra_get_workflow_logs` (per-task Cromwell stderr): controlled mode withholds stderr content (paths/status kept), off-mode reads the failed task's stderr tail with `failed_only` filtering |
+| CC-ControlledAccessGuard | 38 | egress closure + retry safety: a **fail-closed AST meta-test** (every registered tool must be explicitly classified; every data tool must carry a *runtime* guard call — a docstring mention can't satisfy it), `method_config` projected to **counts** (values AND key names withheld; sentinel-identifier test), `submission` projected to ids+statuses, `workflow_logs` refuses a stderr path outside the queried workspace bucket + flags per-task truncation, audio `say` fed via **stdin not argv**, retry aborts on the kill-switch hook (interruptible backoff) + deadline-capped, the `terra://health` resource is minimal + data-free |
 | CC-SessionLimit | 4 | Terra ~24h session/credential-window guard: `policy.max_run_hours` clamps 1..24, the on-VM runner wraps each run in a **total wall-clock budget** (coreutils `timeout`, TERM→KILL) so a too-long run is halted as `FAILED-SESSION-LIMIT` (not silently truncated), submit advises the limit + WDL path for long runs |
 | CC-Discoverability | 3 | MCP resources + prompts (discoverability): registered, the `terra://posture` resource exposes config only (no bucket/entity/data read), prompts are guidance-only (no destructive instruction) |
+| CC-SpendCap | 30 | On-VM spend watchdog: cap/hourly-rate parse + clamp, the runner self-STOPS (pauses, never deletes) the VM at the cost cap, cap+rate propagate to the VM env (create + SSH), opt-in per-run cap + rolling budget refuses over-budget/uncapped, atomic reserve/release ledger is locked + reversible, concurrent reservations cannot overshoot the ceiling, fail-closed log/resume/underflow, malformed/awk-injectable cap rejected |
+| CC-Hardening | 38 | Runner boot-chain + lease integrity: lease refresher resilient to transient errors + stopped by the per-job EXIT trap, spend cap enforced mid-batch with child-abort reaching the parent, fail-streak decision taken inside the lock (no shared-file race), spec-freshness window defaults to the session budget, rate limiter clamps 0/negative caps |
+| CC-Concurrency | 4 | Bounded on-VM concurrency: runner template wires a bounded pool, the concurrency var is integer-validated, `policy.runner_concurrency()` defaults 4 and clamps 1..16, the value propagates to the VM (customEnvironmentVariables + SSH bootstrap) |
+| CC-Hygiene | 1 | No internal iteration-revealing identifiers leak into shipped files |
 
 ## Single-workspace lock (`MCP_TERRA_WORKSPACE`)
 

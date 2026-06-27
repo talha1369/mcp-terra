@@ -39,13 +39,15 @@ _PATTERNS: list[tuple[str, re.Pattern[bytes], str]] = [
     # Slack bot/user tokens.
     ("slack_token",
      re.compile(rb"\bxox[abprs]-[A-Za-z0-9-]{10,}\b"), "HIGH"),
-    # AWS secret access key assignment. Quotes are OPTIONAL around BOTH the key
-    # name and the value, and the separator may be `=` or `:` — so the `.env`,
-    # YAML, and JSON spellings of an AWS-secret-key assignment all match (key
-    # bare or quoted; value bare or quoted). The 40-char base64 value is the
-    # AWS secret-key shape.
+    # AWS secret access key assignment. The label words may be separated by spaces,
+    # underscores, or hyphens ([\s_-]*), so the .env / YAML / JSON config spellings
+    # ('aws_secret_access_key=…') AND the natural-English prose an LLM writes in a
+    # run report ('AWS Secret Access Key: …', 'Secret access key = …') all match.
+    # 'aws' and 'access' are optional. Quotes optional around the value; separator
+    # ':' or '='. The 40-char base64 value is the AWS secret-key shape.
     ("aws_secret_key_assignment",
-     re.compile(rb"aws_secret_access_key[\"']?\s*[:=]\s*[\"']?[A-Za-z0-9/+=]{40}",
+     re.compile(rb"(?:aws[\s_-]*)?secret[\s_-]*(?:access[\s_-]*)?key[\s_-]*"
+                rb"[\"']?[\s_-]*[:=][\s_-]*[\"']?[A-Za-z0-9/+=]{40}",
                 re.IGNORECASE),
      "CRITICAL"),
     # PEM certificate is NOT a secret — explicitly NOT matched.
