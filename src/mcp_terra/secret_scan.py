@@ -90,8 +90,29 @@ _CONFUSABLES: dict[str, str] = {
     "Α": "A", "Β": "B", "Ε": "E", "Ζ": "Z", "Η": "H",
     "Ι": "I", "Κ": "K", "Μ": "M", "Ν": "N", "Ο": "O",
     "Ρ": "P", "Τ": "T", "Υ": "Y", "Χ": "X",
+    # Armenian → Latin (visually-confusable subset)
+    "Օ": "O", "օ": "o", "ա": "a", "ո": "n",
+    "ս": "u", "ր": "r", "ց": "g", "Ո": "N", "Ս": "U",
+    # Small-capital / phonetic Latin letters → Latin (a convincing homoglyph set)
+    "ᴀ": "a", "ʙ": "b", "ᴄ": "c", "ᴅ": "d", "ᴇ": "e",
+    "ɢ": "g", "ʜ": "h", "ɪ": "i", "ᴊ": "j", "ᴋ": "k",
+    "ʟ": "l", "ᴍ": "m", "ɴ": "n", "ᴏ": "o", "ᴘ": "p",
+    "ʀ": "r", "ᴛ": "t", "ᴜ": "u", "ᴠ": "v", "ᴡ": "w",
+    "ʏ": "y", "ᴢ": "z",
+    # Cherokee / Lisu Latin-look-alikes (a few demonstrated confusables)
+    "Ꭺ": "A", "ꓮ": "A",
 }
 _CONFUSABLE_TABLE = {ord(k): v for k, v in _CONFUSABLES.items()}
+
+# Greek + Coptic letter ranges. These are GENUINE prose/science letters (β, γ, μ,
+# λ in 'TGFβ1', '5μM', 'HLA-DRβ1') — NOT homoglyph attacks (β does not look like
+# any [A-Za-z0-9]). The few Greek letters that ARE Latin look-alikes (ο, α, ρ, …)
+# are folded by _CONFUSABLE_TABLE above and caught by the byte-scan, so the
+# homoglyph backstop must NOT treat a residual Greek letter as suspicious.
+def _is_greek_or_coptic(ch: str) -> bool:
+    o = ord(ch)
+    return (0x0370 <= o <= 0x03FF or 0x1F00 <= o <= 0x1FFF
+            or 0x2C80 <= o <= 0x2CFF)
 
 
 # Codepoint categories stripped before scanning: zero-width / format / control /
@@ -145,18 +166,21 @@ _LATIN_EXTRAS_TABLE = {ord(k): v for k, v in _LATIN_EXTRAS.items()}
 def has_homoglyph_token_shape(text: str) -> bool:
     """True if `text` has a token-shaped run smuggling a NON-ASCII homoglyph.
 
-    A real OAuth / cloud / API token is PURE ASCII ([A-Za-z0-9_.-]). This is a
-    backstop for homoglyphs the curated fold does not map (Armenian, Cherokee,
-    small-caps/phonetic, Lisu, …). It must NOT fire on legitimate multilingual
-    prose, so it is deliberately PRECISE:
+    A real OAuth / cloud / API token is PURE ASCII ([A-Za-z0-9_.-]). The PRIMARY
+    homoglyph defense is fold_confusables + the byte-scan (it recovers a smuggled
+    token to its ASCII twin and matches the canonical secret patterns). This is a
+    SECONDARY backstop for confusable scripts the fold does not yet map. It must
+    NOT fire on legitimate multilingual prose, so it is deliberately PRECISE:
 
       • NFKD + strip combining/format collapses accented Latin (é, ü, ñ) and
         full-width forms to ASCII;
-      • the Cyrillic/Greek confusable map + a small Latin-extras map collapse the
-        remaining legitimate Latin-ish letters (α, ø, ß, …) to ASCII;
+      • the confusable map + a small Latin-extras map collapse the remaining
+        legitimate Latin-ish letters (α, ø, ß, small-caps, …) to ASCII;
+      • GENUINE Greek/Coptic science letters (β, γ, μ, λ in 'TGFβ1', '5μM') are
+        NOT homoglyph attacks and are excluded from the suspicious test;
       • a run is flagged only when it is PREDOMINANTLY ASCII (≥50% token chars),
-        carries an ASCII digit, AND still holds a non-ASCII letter — i.e. the
-        mostly-ASCII shape of a real token with a few homoglyph substitutions.
+        carries an ASCII digit, AND still holds a non-ASCII NON-Greek letter —
+        i.e. the mostly-ASCII shape of a real token with a few homoglyph subs.
         A CJK / Arabic / Devanagari summary is predominantly NON-ASCII, so it is
         never flagged (CJK has no spaces, so this precision is essential).
     """
@@ -171,8 +195,9 @@ def has_homoglyph_token_shape(text: str) -> bool:
             return False
         ascii_tok = sum(1 for c in r if c in _ASCII_TOKEN_CHARS)
         has_digit = any(c in "0123456789" for c in r)
-        has_nonascii_letter = any(ord(c) > 127 and _ud.category(c)[0] == "L"
-                                  for c in r)
+        has_nonascii_letter = any(
+            ord(c) > 127 and _ud.category(c)[0] == "L" and not _is_greek_or_coptic(c)
+            for c in r)
         return has_digit and has_nonascii_letter and ascii_tok / len(r) >= 0.5
 
     run: list[str] = []

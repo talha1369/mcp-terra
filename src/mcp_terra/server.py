@@ -3180,12 +3180,21 @@ def terra_get_workflow_metadata(namespace: str, name: str,
     # failures, sample ids/paths). In guard mode return ONLY non-data status +
     # the per-call status summary; withhold everything else. (security review finding.)
     if policy.controlled_access_enabled() and isinstance(md, dict):
+        # workflowName and the callsSummary KEYS are upstream Cromwell/WDL
+        # workflow/call names that can encode cohort/sample/consent identifiers —
+        # drop the workflow name entirely and anonymize the summary keys to
+        # task# indices, keeping the per-status counts the triager needs.
+        _summary = md.get("callsSummary")
+        _anon_summary = None
+        if isinstance(_summary, dict):
+            _anon_summary = {f"task#{_i}": _c
+                             for _i, (_k, _c) in enumerate(_summary.items())}
         md = {
             "status": md.get("status"),
-            "workflowName": md.get("workflowName"),
-            "callsSummary": md.get("callsSummary"),
+            "callsSummary": _anon_summary,
             "_controlled_access_withheld": (
-                "inputs/outputs/failures/call-detail withheld "
+                "inputs/outputs/failures/call-detail withheld + workflow name "
+                "dropped + WDL call names anonymized to task# indices "
                 "(MCP_TERRA_CONTROLLED_ACCESS); use a self-hosted model"),
         }
     return _ok(md)
@@ -3284,9 +3293,13 @@ def terra_get_workflow_logs(namespace: str, name: str,
     truncated = False          # task-count / aggregate-byte-budget limit (BREAKS iteration)
     content_truncated = False  # a single stderr was truncated (does NOT break — security review)
     bytes_used = 0
-    for call_name, shards in calls.items():
+    for _ci, (call_name, shards) in enumerate(calls.items()):
         if truncated:
             break
+        # The WDL call name is an UPSTREAM Cromwell field that can encode
+        # cohort/sample/consent identifiers — withhold it under the guard, using a
+        # stable per-workflow index so triage can still correlate shards.
+        _call_label = f"task#{_ci}" if controlled else call_name
         for sh in (shards or []):
             st = (sh or {}).get("executionStatus")
             if failed_only and st in _ok_statuses:
@@ -3295,7 +3308,7 @@ def terra_get_workflow_logs(namespace: str, name: str,
                 truncated = True
                 break
             stderr_path = sh.get("stderr")
-            entry: dict = {"call": call_name, "shard": sh.get("shardIndex"),
+            entry: dict = {"call": _call_label, "shard": sh.get("shardIndex"),
                            "status": st, "returnCode": sh.get("returnCode")}
             if controlled:
                 # Redact BOTH content and paths (paths can encode identifiers).
@@ -3341,8 +3354,9 @@ def terra_get_workflow_logs(namespace: str, name: str,
                  "content_truncated": content_truncated, "tasks": tasks}
     if controlled:
         out["_controlled_access_withheld"] = (
-            "task stderr content AND paths withheld (MCP_TERRA_CONTROLLED_ACCESS) "
-            "— statuses only; use a self-hosted / NIST-800-171 model.")
+            "task stderr content AND paths withheld + WDL call names anonymized to "
+            "task# indices (MCP_TERRA_CONTROLLED_ACCESS) — statuses only; use a "
+            "self-hosted / NIST-800-171 model.")
     return _ok(out)
 
 

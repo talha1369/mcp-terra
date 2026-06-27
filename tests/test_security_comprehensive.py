@@ -1096,6 +1096,22 @@ def _():
         if not _raises(nbr._validate_secret_strength, ValueError,
                        "".join(_rnd.choice(_W) for _ in range(8))))
     assert hexword_accepted == 0, f"{hexword_accepted}/1500 enumerable hex-word secrets accepted"
+    # hex/base32 ENCODINGS of famous/placeholder phrases must be rejected too —
+    # for base32 the floors alone do NOT reject (5-bit expansion keeps entropy
+    # high), so the decoded content is screened against the common/placeholder
+    # lists. Real generated base32 (random bytes) is unaffected.
+    import base64 as _b64
+    for _phrase in (b"correcthorsebatterystaple", b"ChangeThisSecretBeforeProd1",
+                    b"tobeornottobethatisquestion", b"iloveyou-so-much-forever-x"):
+        _b32 = _b64.b32encode(_phrase).decode().rstrip("=")
+        _hx = _phrase.hex()
+        must_raise(nbr._validate_secret_strength, ValueError, _b32)
+        must_raise(nbr._validate_secret_strength, ValueError, _hx)
+    # real random base32 secrets (b32encode of 20 random bytes) are accepted
+    b32rej = sum(1 for _ in range(3000)
+                 if _raises(nbr._validate_secret_strength, ValueError,
+                            _b64.b32encode(_secrets.token_bytes(20)).decode().rstrip("=")))
+    assert b32rej == 0, f"random base32 secrets false-rejected {b32rej}/3000"
 
 @case("R-Hardening", "result-signature verification")
 def _():
@@ -2553,11 +2569,11 @@ def _():
         "ya‌29." + B,                      # ZWNJ
         "ya﻿29." + B,                      # BOM
         "ya29." + B[:3] + "́" + B[3:],     # combining acute
-        "yձ29." + B,                       # Armenian letter
-        "yᴀ29." + B,                       # small-cap A
-        "ʏᴀ29." + B,                  # small-cap Y + A
-        "yᎪ29." + B,                       # Cherokee A
-        "yꓮ29." + B,                       # Lisu A
+        "yᴀ29." + B,                       # small-cap A → folds to 'a' (regex catches)
+        "ʏᴀ29." + B,                  # small-cap Y + A → folds to 'ya'
+        "yա29." + B,                       # Armenian ayb (U+0561) → folds to 'a'
+        "yձ29." + B,                       # Armenian DZA (unmapped) → backstop flags
+        "yन29." + B,                       # Devanagari (unmapped) → backstop flags
     ):
         must_raise(audio_summary._validate_text, audio_summary.AudioSummaryError,
                    PRE + tok + " end")
@@ -2619,14 +2635,46 @@ def _():
                 "ya​29." + B,                      # ZWSP in prefix
                 "ya‌29." + B,                      # ZWNJ
                 "ya29." + B[:3] + "́" + B[3:],     # combining acute
-                "yᴀ29." + B,                       # small-cap A
-                "yᎪ29." + B):                      # Cherokee A
+                "yᴀ29." + B,                       # small-cap A → folds to 'a'
+                "yա29." + B,                       # Armenian ayb → folds to 'a'
+                "yձ29." + B):                      # Armenian DZA (unmapped) → backstop
         must_raise(email_send._validate_inputs, email_send.EmailError,
                    f"clean subject {tok}", "body", "20260101T000000Z-abcd1234", _ack)
     # NO false positives: a digit-bearing German umlaut compound subject sends.
     email_send._validate_inputs(
         "Die Größenänderung lief 2024 gut genug für alle", "body",
         "20260101T000000Z-abcd1234", _ack)
+
+
+@case("BB-AudioSummary", "audio+email block PLAIN and homoglyphed non-ya29 secrets (AWS/GitHub); legit Greek science passes")
+def _():
+    from mcp_terra import audio_summary as _A, email_send as _E
+    _ack = "I reviewed runner.stderr line 47, the traceback shows AttributeError on cell 3."
+    PRE = "This is a sufficiently long results summary describing the analysis here today. "
+
+    def _audio_blocked(t):
+        try: _A._validate_text(t); return False
+        except _A.AudioSummaryError: return True
+
+    def _email_blocked(s):
+        try: _E._validate_inputs(s, "body", "20260101T000000Z-abcd1234", _ack); return False
+        except _E.EmailError: return True
+    # PLAIN non-ya29 secrets: email previously scanned ONLY ya29 — both channels
+    # must now block AWS/GitHub via the full secret scan.
+    plain = {"aws": "AKIAIOSFODNN7EXAMPLE", "github": "ghp_" + "a" * 36}
+    # HOMOGLYPHED, DIGIT-FREE AWS key (Armenian capital O U+0555 looks like O):
+    akia_homo = "AKIA" + "Օ" + "PQRSTUVWXYZL" + "Օ" + "MN"  # pragma: allowlist secret
+    import re as _re
+    assert not _re.search(r"AKIA[0-9A-Z]{16}", akia_homo), "must not be a raw AWS match"
+    for name, tok in {**plain, "akia_armenian": akia_homo}.items():
+        assert _audio_blocked(PRE + tok + " end"), f"audio leaked {name}"
+        assert _email_blocked(f"results {tok}"), f"email leaked {name}"
+    # NO false positive: legit lowercase-Greek scientific identifiers (β/γ/μ/λ)
+    # with digits — common nomenclature — must render in BOTH channels.
+    for ok in ("Expression of TGFβ1-2024-batch7 rose; IFNγ-clone-2024-rev3 was stable here.",
+               "Absorbance at 280nm λmax-2024 with 5μM compound and Aβ42-2024-aggregate ok."):
+        assert not _audio_blocked(ok), f"audio false-positive: {ok}"
+        assert not _email_blocked(ok[:60]), f"email false-positive: {ok}"
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -3937,18 +3985,22 @@ def _():
     orig_md = _tc.rawls_get_workflow_metadata
     orig_tok = server.auth.get_access_token
     _tc.rawls_get_workflow_metadata = lambda *a, **k: {
-        "status": "Failed", "workflowName": "wf",
+        "status": "Failed", "workflowName": "PipelineFor_SENTINEL_cohort_NA12878_GRU",  # pragma: allowlist secret
         "inputs": {"sample": "NA12878-controlled"},
         "outputs": {"x": "controlled-value"},
         "failures": [{"message": "controlled detail"}],
-        "calls": {"wf.t": [{"executionStatus": "Failed"}]}}
+        "calls": {"Wf.process_SENTINEL_cohort_NA12878_GRU": [{"executionStatus": "Failed"}]}}
     server.auth.get_access_token = lambda: "tok"
     try:
         _p._CONTROLLED_ACCESS = True
         out = server.terra_get_workflow_metadata("ns", "ws", "sub", "wf")
-        for leaked in ("controlled-value", "NA12878-controlled", "controlled detail"):
+        # values AND the upstream workflow/call NAMES must not egress
+        for leaked in ("controlled-value", "NA12878-controlled", "controlled detail",
+                       "SENTINEL_cohort", "PipelineFor", "process_"):
             assert leaked not in out, f"leaked {leaked!r}"
         assert "callsSummary" in out and "_controlled_access_withheld" in out
+        assert "task#0" in out, "WDL call name must be anonymized to a task# index"
+        assert "workflowName" not in out, "workflowName (upstream free text) must be dropped"
     finally:
         _p._CONTROLLED_ACCESS = saved
         _tc.rawls_get_workflow_metadata = orig_md
@@ -4118,7 +4170,37 @@ def _():
         _p._CONTROLLED_ACCESS = True
         out = server.terra_get_workflow_logs("ns", "ws", "sub", "wf")
         assert "withheld: controlled-access" in out and "_controlled_access_withheld" in out
-        assert "wf.t" in out, "task call/status/path still returned"
+        # WDL call name must be ANONYMIZED (it can encode cohort/sample ids), but
+        # a stable index is kept so shards can still be correlated for triage.
+        assert "task#0" in out and "wf.t" not in out, "call name must be anonymized under guard"
+        assert '"status": "Failed"' in out, "shard status still returned"
+    finally:
+        _p._CONTROLLED_ACCESS = saved
+        _tc.rawls_get_workflow_metadata, server.auth.get_access_token = orig_md, orig_tok
+        _tc.rawls_get_workspace = orig_ws
+
+
+@case("CC-WorkflowLogs", "controlled mode anonymizes a SENTINEL-bearing WDL call name")
+def _():
+    from mcp_terra import policy as _p
+    saved = _p._CONTROLLED_ACCESS
+    orig_md, orig_tok = _tc.rawls_get_workflow_metadata, server.auth.get_access_token
+    orig_ws = _tc.rawls_get_workspace
+    _md = {"status": "Failed", "calls": {"WdlWf.SENTINEL_cohort_NA12878": [
+        {"executionStatus": "Failed", "shardIndex": 0, "returnCode": 1,
+         "stderr": "gs://fc-secure-x/exec/stderr"}]}}
+    _tc.rawls_get_workflow_metadata = lambda *a, **k: _md
+    _tc.rawls_get_workspace = lambda *a, **k: {"workspace": {"bucketName": "fc-secure-x"}}
+    server.auth.get_access_token = lambda: "tok"
+    try:
+        _p._CONTROLLED_ACCESS = True
+        out = server.terra_get_workflow_logs("ns", "ws", "sub", "wf")
+        assert "SENTINEL_cohort_NA12878" not in out, "WDL call name leaked the cohort id!"
+        assert "task#0" in out, "call name must be anonymized to a task# index"
+        # guard OFF returns the real call name for triage
+        _p._CONTROLLED_ACCESS = False
+        out2 = server.terra_get_workflow_logs("ns", "ws", "sub", "wf")
+        assert "WdlWf.SENTINEL_cohort_NA12878" in out2, "guard-OFF must return the real call name"
     finally:
         _p._CONTROLLED_ACCESS = saved
         _tc.rawls_get_workflow_metadata, server.auth.get_access_token = orig_md, orig_tok

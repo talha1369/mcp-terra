@@ -104,6 +104,25 @@ def _canonical_bytes(spec: dict) -> bytes:
     return json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
+# Well-known / common-password substrings and placeholder/template stems. Checked
+# against the raw secret AND (when a hex/base32 secret decodes to printable text)
+# against the DECODED content, so an encoded famous/placeholder phrase is caught
+# in any encoding. Module-scope so both screens share one list.
+_SECRET_COMMON = (
+    "correcthorsebatterystaple", "tobeornottobe", "thequickbrownfox",
+    "password", "passw0rd", "letmein", "qwerty", "iloveyou", "admin",
+    "welcome", "dragon", "monkey", "abc123", "trustno1", "changeme",
+    "superman", "baseball", "football", "starwars", "whatever",
+)
+_SECRET_PLACEHOLDER = (
+    "changethis", "changethe", "replacewith", "replaceme", "replacethis",
+    "putyour", "insertyour", "insertsecret", "yoursecret", "yourkey",
+    "yourown", "yourpassword", "examplesecret", "examplekey", "placeholder",
+    "supersecret", "donotshare", "secrethere", "valuehere", "fillthisin",
+    "tobereplaced", "notarealsecret",
+)
+
+
 def _validate_secret_strength(secret) -> None:
     """Refuse weak/low-entropy secrets.
 
@@ -151,25 +170,36 @@ def _validate_secret_strength(secret) -> None:
     else:
         _alpha = 0
     _fmt_strong = bool(_alpha) and n * _math.log2(_alpha) >= 128.0
-    # A hex/base32 string that DECODES to mostly-printable ASCII is a hex-encoded
-    # human phrase/password (rockyou-class keyspace), NOT random bytes: random
-    # token_hex decodes to ~37% printable, a hex-encoded phrase to ~100%. Deny the
-    # strong-format exemption for those so they fall back to the full entropy
-    # floors below (which reject them); real openssl-rand-hex / token_hex / base32
-    # output is unaffected. Undecodable (e.g. odd-length hex) → also deny.
+    # A hex/base32 string that DECODES to mostly-printable ASCII is an ENCODING of
+    # human text (rockyou-class keyspace), NOT random bytes: random token_hex
+    # decodes to ~37% printable, an encoded phrase to ~100%. For HEX, denying the
+    # exemption is enough (the hex string itself then fails the Shannon floor); for
+    # BASE32 it is NOT (base32's 5-bit expansion keeps the string high-entropy and
+    # it clears the floors), so we must also screen the DECODED content for the
+    # famous/placeholder phrases — catching e.g. base32('correcthorsebatterystaple')
+    # in ANY encoding. Real openssl-rand-hex / token_hex / base32 output is
+    # unaffected. Undecodable (e.g. odd-length hex) → deny the exemption.
     if _fmt_strong:
+        _decoded = None
         try:
             if _alpha == 16:
                 _decoded = bytes.fromhex(secret)
             else:
                 import base64 as _b64
                 _decoded = _b64.b32decode(secret + "=" * ((8 - len(secret) % 8) % 8))
-            _printable = (sum(1 for _b in _decoded if 0x20 <= _b <= 0x7e) / len(_decoded)
-                          if _decoded else 0.0)
-            if _printable >= 0.70:
-                _fmt_strong = False
-        except ValueError:   # binascii.Error subclasses ValueError
+        except ValueError:   # binascii.Error subclasses ValueError; odd-length hex
             _fmt_strong = False
+        if _decoded:
+            _printable = sum(1 for _b in _decoded if 0x20 <= _b <= 0x7e) / len(_decoded)
+            if _printable >= 0.70:
+                _fmt_strong = False   # encoded text, not random bytes → no exemption
+                _dec_low = _decoded.decode("latin-1").lower()
+                for _w in _SECRET_COMMON + _SECRET_PLACEHOLDER:
+                    if _w in _dec_low:
+                        raise ValueError(
+                            f"MCP_TERRA_RUNNER_SECRET is a hex/base32 encoding of a "
+                            f"weak/known phrase ({_w!r} after decoding) — use python "
+                            f"-c 'import secrets; print(secrets.token_urlsafe(32))'.")
     # Character-diversity floor: ≥12 unique for a general secret; a recognized
     # strong-format key draws from a smaller alphabet, so a lower floor is
     # correct. It is set to 11 (not lower): a real token_hex(16) clears it
@@ -262,13 +292,7 @@ def _validate_secret_strength(secret) -> None:
     # (above all the xkcd "correct horse battery staple") and common passwords
     # that appear in any targeted guess list. Always prefer the generated token.
     _low = secret.lower()
-    _COMMON = (
-        "correcthorsebatterystaple", "tobeornottobe", "thequickbrownfox",
-        "password", "passw0rd", "letmein", "qwerty", "iloveyou", "admin",
-        "welcome", "dragon", "monkey", "abc123", "trustno1", "changeme",
-        "superman", "baseball", "football", "starwars", "whatever",
-    )
-    for _w in _COMMON:
+    for _w in _SECRET_COMMON:
         if _w in _low:
             raise ValueError(
                 f"MCP_TERRA_RUNNER_SECRET contains a well-known/common secret "
@@ -280,14 +304,7 @@ def _validate_secret_strength(secret) -> None:
     # "ChangeThisSecretBeforeProduction"). A compromised secret defeats the whole
     # HMAC defense, so reject the common template stems. None of these substrings
     # occur in token_urlsafe output, so screening them is free (0 false-rejects).
-    _PLACEHOLDER = (
-        "changethis", "changethe", "replacewith", "replaceme", "replacethis",
-        "putyour", "insertyour", "insertsecret", "yoursecret", "yourkey",
-        "yourown", "yourpassword", "examplesecret", "examplekey", "placeholder",
-        "supersecret", "donotshare", "secrethere", "valuehere", "fillthisin",
-        "tobereplaced", "notarealsecret",
-    )
-    for _w in _PLACEHOLDER:
+    for _w in _SECRET_PLACEHOLDER:
         if _w in _low:
             raise ValueError(
                 f"MCP_TERRA_RUNNER_SECRET looks like an unmodified placeholder / "
