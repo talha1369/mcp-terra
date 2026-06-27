@@ -283,7 +283,12 @@ def has_homoglyph_token_shape(text: str) -> bool:
         # A residual (post-fold) letter is a homoglyph SUSPECT unless it is:
         #  • a genuine-science Greek letter (δ θ λ μ…, allow-listed); or
         #  • a WIDE/ideographic letter (Han/Hiragana/Katakana/Hangul, EAW W/F —
-        #    not [A-Za-z] look-alikes; glued to Latin gene-IDs in CJK prose).
+        #    not [A-Za-z] look-alikes; glued to Latin gene-IDs in CJK prose); or
+        #  • a conjoining HANGUL JAMO. A precomposed Hangul syllable is EAW='W',
+        #    but the NFKD this function runs first DECOMPOSES it into jamo whose
+        #    medial/final pieces are EAW='N' — so the W/F test alone wrongly flags
+        #    a Korean word glued into a Latin identifier. Jamo are distinct Korean
+        #    shapes (no Latin look-alikes), so exempting their blocks is safe.
         # We do NOT name-exempt 'LATIN …' letters: that was the R15 bypass — IPA
         # alpha ɑ and small-capital Q ꞯ carry 'LATIN …' names yet render as a/Q.
         # Instead the ASCII-resembling extended-Latin/IPA letters are FOLDED to
@@ -295,7 +300,11 @@ def has_homoglyph_token_shape(text: str) -> bool:
         # non-prose phonetic letter); flagging them is the intended defense in
         # depth. Cross-script confusables (Cyrillic/Armenian/Coptic/…) likewise
         # remain suspects — the actual smuggling vector.
-        return (ord(c) > 127 and _ud.category(c)[0] == "L"
+        _o = ord(c)
+        if (0x1100 <= _o <= 0x11FF or 0x3130 <= _o <= 0x318F
+                or 0xA960 <= _o <= 0xA97F or 0xD7B0 <= _o <= 0xD7FF):
+            return False                      # conjoining Hangul jamo (NFKD of 가-힣)
+        return (_o > 127 and _ud.category(c)[0] == "L"
                 and c not in _GREEK_SCIENCE
                 and _ud.east_asian_width(c) not in ("W", "F"))
 
@@ -369,12 +378,36 @@ def scan_bytes(blob: bytes, source: str = "<bytes>") -> list[dict]:
 # glue onto the secret). The patterns stay distinctive (ya29. / AKIA / ghp_ /
 # xox / PEM / aws_secret), so dropping the boundaries adds negligible FP risk.
 _DENSE_PATTERNS = [
-    (name, re.compile(pat.pattern.replace(rb"\b", b"").replace(b" ", b""), pat.flags), sev)
+    (name,
+     re.compile(pat.pattern.replace(rb"\b", b"").replace(b" ", b"").replace(rb"|ASIA", b""),
+                pat.flags),
+     sev)
     # \b boundaries removed AND literal spaces removed — the dense scan runs on a
     # WHITESPACE-COLLAPSED string, so a multi-word pattern (the PEM header, the
     # only one with required internal spaces) must drop its spaces too, else a
-    # space-split PEM header would slip the dense pass.
+    # space-split PEM header would slip the dense pass. The AWS 'ASIA' alternative
+    # is dropped here: without the \b boundary it would match an all-caps word like
+    # 'ASIA PACIFIC REGION COHORT…' once whitespace is collapsed. 'AKIA' (not an
+    # English word) is kept; contiguous ASIA keys are still caught by the raw scan.
     for name, pat, sev in _PATTERNS
+]
+# BARE-alphanumeric variants — for scanning a form with EVERY non-[A-Za-z0-9] char
+# removed (incl. the token-charset chars '_' and '-'), so a plaintext secret split
+# by '_' between every character re-contiguates. ONLY patterns that stay DISTINCTIVE
+# with their separators gone are included: the literal AWS access-key ID 'AKIA' + 16
+# (AKIA is not an English word) and the fine-grained GitHub PAT 'github_pat_' + 82
+# (→ 'githubpat' + 82). DELIBERATELY EXCLUDED as false-positive-prone once bare:
+#   • ghp_ classic → 'ghp' + 36 matches any 'ghp' substring in glued prose;
+#   • ASIA (STS) → 'ASIA' + 16 matches all-caps prose containing 'ASIA…';
+#   • ya29 → its dot is the distinguisher (dropping it matches 'Maya29…');
+#   • PEM → dashless 'BEGINPRIVATEKEY' matches the phrase 'begin private key';
+#   • aws_secret value → needs +/=.
+# Those split forms are still covered by punct/alnum_dense for every separator that
+# is NOT itself a token-body char; only a '_'-between-every-char split of those
+# specific secrets is an accepted residual (an exotic, visibly-tampered form).
+_BARE_PATTERNS = [
+    ("aws_access_key_id", re.compile(rb"AKIA[0-9A-Z]{16}"), "CRITICAL"),
+    ("github_pat", re.compile(rb"githubpat[A-Za-z0-9]{82}"), "HIGH"),
 ]
 
 
@@ -408,6 +441,43 @@ def scan_egress(text: str) -> list[dict]:
                 hits.append({"pattern": name, "severity": sev,
                              "source": "egress-dense", "offset": m.start(),
                              "context": f"…[REDACTED—{name}]…"})
+    # PUNCTUATION-split PLAINTEXT secret: a secret split by a non-whitespace
+    # separator BETWEEN its characters ('AKIA.IOSF.ODNN…', 'g-h-p-_a…') is kept
+    # intact by `dense` (which only collapses whitespace) but is still ONE
+    # whitespace token, so we re-contiguate PER TOKEN. Per-token (not a global
+    # strip) is essential to avoid false positives: a global strip glues
+    # neighbouring prose words, letting a short word like 'ASIA'/'Maya29'/'github
+    # pat' acquire a 16+ char body from its neighbours and match. A real secret
+    # rebuilds to >=18 chars, so short prose tokens are skipped entirely. Each
+    # rebuilt token is scanned with the boundary-relaxed _DENSE_PATTERNS (ya29
+    # keeps its required '.', unaffected) plus the bare-literal _BARE_PATTERNS for
+    # AKIA / fine-grained github_pat (whose '_' separators are also stripped).
+    for _tok in fold.split():
+        if len(_tok) < 18:                       # real secret rebuilds to >=18
+            continue
+        _forms = set()
+        for _strip in (r"[^A-Za-z0-9+/=_-]", r"[^A-Za-z0-9_]"):
+            _f = re.sub(_strip, "", _tok)
+            if len(_f) >= 18:
+                _forms.add(_f)
+        for _f in _forms:
+            _fb = _f.encode("utf-8", "replace")
+            for name, pat, sev in _DENSE_PATTERNS:
+                if pat.search(_fb):
+                    hits.append({"pattern": name, "severity": sev,
+                                 "source": "egress-tokensplit", "offset": 0,
+                                 "context": f"…[REDACTED—{name}]…"})
+        _bare = re.sub(r"[^A-Za-z0-9]", "", _tok)   # strip '_' and '-' too
+        if len(_bare) >= 18:
+            _bb = _bare.encode("utf-8", "replace")
+            for name, pat, sev in _BARE_PATTERNS:
+                if pat.search(_bb):
+                    hits.append({"pattern": name, "severity": sev,
+                                 "source": "egress-tokensplit", "offset": 0,
+                                 "context": f"…[REDACTED—{name}]…"})
+    # `punct_dense` (base64 alphabet kept) feeds the DECODE pass below: an ENCODED
+    # secret split by whitespace OR punctuation re-contiguates here for decoding.
+    punct_dense = re.sub(r"[^A-Za-z0-9+/=_-]", "", fold)
     # Fold-tolerant PEM-FRAME backstop. The literal private_key_header pattern needs
     # the exact ASCII '-----BEGIN … PRIVATE KEY-----'; a homoglyph in a keyword that
     # the per-glyph fold did not map (e.g. Cherokee Ꮐ U+13C0 → 'G' in BEGIN) breaks
@@ -445,7 +515,7 @@ def scan_egress(text: str) -> list[dict]:
     # offsets re-align the secret even when prose chars glue to it, and decoding
     # glued prose yields random bytes that match no anchored pattern (no false
     # positive). Shared `_seen` decodes a blob appearing in multiple forms once.
-    punct_dense = re.sub(r"[^A-Za-z0-9+/=_-]", "", fold)
+    # (`punct_dense` was built above for the punctuation-collapsed anchored scan.)
     _seen: set = set()
     _total = 0
     for _src in (fold, dense, punct_dense):

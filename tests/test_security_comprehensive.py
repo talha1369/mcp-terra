@@ -2917,6 +2917,32 @@ def _():
     for _fr in ("Summary of run ----- LÉGENDE ----- and the results were significant here today ok now.",
                 "Section ----- RÉSUMÉ ----- complete with all the figures included and verified today ok."):
         assert not _audio_blocked(_fr), f"audio false-positive on decorative frame: {_fr[:24]}"
+    # REGRESSION (R18): a PLAINTEXT secret split by a non-whitespace separator
+    # between its chars is ONE whitespace token, re-contiguated per-token and caught
+    # (without gluing neighbouring prose, which would false-positive). The auditor's
+    # confirmed cases: AKIA by '.', ',', single mid-token '.', '_', '/'; ghp by ','.
+    _akia = "AKIAIOSFODNN7EXAMPLE"
+    for _sep in (".", ",", "/", "_", "-", "•", ";", ":"):
+        assert _email_blocked("Results token " + _sep.join(list(_akia)) + " end"), \
+            f"email leaked {_sep!r}-split AKIA"
+        assert _audio_blocked(PRE + "value " + _sep.join(list(_akia)) + " end here now."), \
+            f"audio leaked {_sep!r}-split AKIA"
+    assert _email_blocked("Results: AKIAIOSFODNN.7EXAMPLE7Q here"), "email leaked single-mid AKIA"
+    assert _email_blocked("key " + ",".join(list("ghp_" + "a" * 36)) + " end"), "email leaked comma-split ghp"
+    assert _email_blocked("note -----BEGIN•RSA•PRIVATE•KEY----- end"), "email leaked bullet-split PEM"
+    # NO false positive (R18): per-token avoids prose-gluing, so an all-caps heading
+    # 'ASIA …', 'github pat', 'Maya 29 …', and long hyphenated identifiers render.
+    for _ok in ("ASIA PACIFIC REGION COHORT BASELINE DATA TWENTY TWENTYFOUR ANALYSIS RESULTS SUMMARY NOW.",
+                "We began the private key exchange and the github pat workflow ran across all replicates today.",
+                "Maya 29 samples with single-cell-RNA-seq-analysis-pipeline-v2024-baseline-corrected-results here."):
+        assert not _audio_blocked(_ok), f"audio false-positive (R18 per-token glue): {_ok[:24]}"
+        assert not _email_blocked(_ok[:60]), f"email false-positive (R18 per-token glue): {_ok[:24]}"
+    # REGRESSION (R18): a Korean (Hangul) syllable glued into a Latin identifier must
+    # RENDER — NFKD decomposes Hangul to EAW='N' jamo, which are now exempt.
+    for _ko in ("Analysis complete. The 유전자Expression levels in the treatment arm were elevated today here now.",
+                "The controlGroup군comparison2024 cohort and baselineMeasurement후followup were reproducible here today."):
+        assert not _audio_blocked(_ko), f"audio false-positive on Korean Hangul: {_ko[:24]}"
+        assert not _email_blocked(_ko[:55]), f"email false-positive on Korean Hangul: {_ko[:24]}"
     # NO false positive: a legit SHA-256 hash (64 hex) in a summary decodes to
     # random bytes (no secret pattern) — must render.
     import hashlib as _hl
