@@ -131,16 +131,21 @@ _SECRET_WALK_LINES = (
 
 
 def _secret_alnum_lower(s):
-    """Lowercase + strip non-alnum — so a famous phrase is matched whether typed
-    contiguously ('correcthorsebatterystaple') or spaced/punctuated ('correct
-    horse battery staple')."""
+    """Lowercase, then strip whitespace/punctuation but KEEP the token separators
+    `_` and `-` — so a famous phrase is matched whether typed contiguously
+    ('correcthorsebatterystaple') or space/punctuation-separated ('correct horse
+    battery staple'), WITHOUT gluing the `_`/`-` of a real token_urlsafe value
+    (which would otherwise manufacture false matches like 'ad_min' → 'admin')."""
     import re as _r
-    return _r.sub(r"[^a-z0-9]", "", s.lower())
+    return _r.sub(r"[^a-z0-9_-]", "", s.lower())
 
 
 def _secret_common_hit(s):
-    """Return the first common/placeholder phrase found in s (alnum-normalized),
-    or None. Shared by the raw-secret check and the decoded-content screen."""
+    """Return the first common/placeholder phrase found in s (normalized), or
+    None. Shared by the raw-secret check and the decoded-content screen. (Short
+    common words may still appear by chance in a high-entropy token at a ~1e-6
+    rate — an irreducible property of substring screening; callers that sweep
+    many generated tokens tolerate that floor rather than asserting strict zero.)"""
     _norm = _secret_alnum_lower(s)
     for _w in _SECRET_COMMON + _SECRET_PLACEHOLDER:
         if _w in _norm:
@@ -227,8 +232,8 @@ def _validate_secret_strength(secret, _depth: int = 0) -> None:
     if _depth == 0:
         if _re_fmt.fullmatch(r"[0-9a-fA-F]+", _core):
             _alpha = 16        # hex (openssl rand -hex, secrets.token_hex)
-        elif _re_fmt.fullmatch(r"[A-Z2-7]+", _core):
-            _alpha = 32        # RFC 4648 base32
+        elif _re_fmt.fullmatch(r"[A-Za-z2-7]+", _core):
+            _alpha = 32        # RFC 4648 base32 (case-INSENSITIVE: lower/mixed too)
     _fmt_strong = bool(_alpha) and len(_core) * _math.log2(_alpha) >= 128.0
     # A hex/base32 string that DECODES to mostly-printable ASCII is an ENCODING of
     # human text (rockyou-class keyspace), NOT random bytes: random token_hex
@@ -251,7 +256,11 @@ def _validate_secret_strength(secret, _depth: int = 0) -> None:
                 _decoded = bytes.fromhex(_core)
             else:
                 import base64 as _b64
-                _decoded = _b64.b32decode(_core + "=" * ((8 - len(_core) % 8) % 8))
+                # casefold=True so lower/mixed-case base32 decodes (RFC 4648 is
+                # case-insensitive; an attacker must not dodge the screen by
+                # lower-casing the wrapper).
+                _decoded = _b64.b32decode(_core + "=" * ((8 - len(_core) % 8) % 8),
+                                          casefold=True)
         except ValueError:   # binascii.Error subclasses ValueError; odd-length hex
             _fmt_strong = False
         if _decoded:
@@ -279,6 +288,25 @@ def _validate_secret_strength(secret, _depth: int = 0) -> None:
                     "MCP_TERRA_RUNNER_SECRET is a hex/base32 encoding of a "
                     "predictable walk/repeated pattern. Use python -c "
                     "'import secrets; print(secrets.token_urlsafe(32))'.")
+            # If the decode is ENCODED TEXT — either mostly-printable, OR its
+            # non-printable bytes are uniform PADDING (≤2 distinct values, i.e. a
+            # NUL/control pad or interleave) — then `_squeezed` IS the effective
+            # secret. Apply the FULL policy (length/diversity/entropy) to it, so an
+            # encoded SHORT/low-diversity phrase is rejected exactly as if typed
+            # (closing the length-floor bypass). A real random key is NEITHER
+            # mostly-printable NOR uniform-padded (its non-printable bytes are
+            # diverse), so it is never wrongly rejected.
+            _np = bytes(b for b in _decoded if not 0x20 <= b <= 0x7e)
+            _printable_ratio = (len(_decoded) - len(_np)) / len(_decoded)
+            if _squeezed and (_printable_ratio >= 0.85
+                              or (_np and len(set(_np)) <= 2)):
+                try:
+                    _validate_secret_strength(_squeezed, _depth=1)
+                except ValueError as _e:
+                    raise ValueError(
+                        f"MCP_TERRA_RUNNER_SECRET is a hex/base32 encoding of a "
+                        f"weak secret ({_e}). Use python -c "
+                        f"'import secrets; print(secrets.token_urlsafe(32))'.")
             for _rb in _runs:
                 if len(_rb) >= 16:
                     _fmt_strong = False  # encodes human text, not random key bytes

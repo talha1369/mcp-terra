@@ -313,7 +313,11 @@ def scan_bytes(blob: bytes, source: str = "<bytes>") -> list[dict]:
 # glue onto the secret). The patterns stay distinctive (ya29. / AKIA / ghp_ /
 # xox / PEM / aws_secret), so dropping the boundaries adds negligible FP risk.
 _DENSE_PATTERNS = [
-    (name, re.compile(pat.pattern.replace(rb"\b", b""), pat.flags), sev)
+    (name, re.compile(pat.pattern.replace(rb"\b", b"").replace(b" ", b""), pat.flags), sev)
+    # \b boundaries removed AND literal spaces removed — the dense scan runs on a
+    # WHITESPACE-COLLAPSED string, so a multi-word pattern (the PEM header, the
+    # only one with required internal spaces) must drop its spaces too, else a
+    # space-split PEM header would slip the dense pass.
     for name, pat, sev in _PATTERNS
 ]
 
@@ -325,11 +329,11 @@ def scan_egress(text: str) -> list[dict]:
 
       • raw, NFKC-normalized, and confusable-folded (+ invisible/combining-
         stripped) forms scanned with the anchored patterns;
-      • a WHITESPACE-COLLAPSED fold scanned with boundary-relaxed patterns, so a
-        secret split by an inserted space/newline re-contiguates;
-      • a homoglyph-aware PEM-frame check: a real `-----…-----` key header is pure
-        ASCII, so a frame whose interior carries a non-ASCII letter (and folds to
-        a BEGIN/PRIVATE/KEY header) is a smuggled private-key header.
+      • a WHITESPACE-COLLAPSED fold scanned with boundary-relaxed AND space-
+        stripped patterns, so a secret split by an inserted space/newline (incl. a
+        spaced PEM header) re-contiguates. A homoglyph-smuggled PEM header is
+        already recovered by the confusable fold + the contiguous PEM pattern, so
+        no separate (false-positive-prone) frame heuristic is needed.
 
     The homoglyph token backstop (has_homoglyph_token_shape) is complementary and
     called separately by the egress validators.
@@ -348,14 +352,6 @@ def scan_egress(text: str) -> list[dict]:
                 hits.append({"pattern": name, "severity": sev,
                              "source": "egress-dense", "offset": m.start(),
                              "context": f"…[REDACTED—{name}]…"})
-    for m in re.finditer(r"-{4,}[^\n]{0,80}?-{4,}", text):
-        seg = m.group(0)
-        if any(ord(c) > 127 and _ud.category(c)[0] == "L" for c in seg):
-            _up = fold_confusables(seg).upper()
-            if "BEGIN" in _up or "KEY" in _up or "PRIVATE" in _up or "END" in _up:
-                hits.append({"pattern": "private_key_header", "severity": "CRITICAL",
-                             "source": "egress-pem-homoglyph", "offset": m.start(),
-                             "context": "…[REDACTED—private_key_header]…"})
     return hits
 
 

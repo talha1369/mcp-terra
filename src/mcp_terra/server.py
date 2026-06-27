@@ -43,6 +43,7 @@ tc.abort_check = lambda: bool(
 from . import notebook_runner as nbr
 from . import fetch as ft
 from . import email_send
+from . import secret_scan
 from . import bug_triager
 from . import workflow_triager
 from . import cheap_llm
@@ -1173,6 +1174,15 @@ def terra_upload_to_bucket(local_path: str, bucket_uri: str,
     # bucket_object_exists() above is INSUFFICIENT for prefix URIs.
     if recursive:
         local_root = _os.path.abspath(local_path)
+        # recursive=True requires a DIRECTORY. On a regular file the recursive
+        # verify (os.walk) is a no-op and would report success unverified — and
+        # this must be refused BEFORE _pre / bk.upload_file so a refused call
+        # never mutates GCS. (security review.) Use recursive=False for a file.
+        if not _os.path.isdir(local_root):
+            raise safety.SafetyError(
+                f"recursive=True requires a directory, but {local_path!r} is a "
+                f"regular file — re-upload it with recursive=False so its content "
+                f"hash is verified.")
         if _os.path.isdir(local_root):
             _topdir = _os.path.basename(local_root)
             for dirpath, _dirs, files in _os.walk(local_root):
@@ -1251,16 +1261,8 @@ def terra_upload_to_bucket(local_path: str, bucket_uri: str,
                 f"does not match your local file (a raced `gsutil cp -n` skip, or a "
                 f"wrong-content same-size object) — refusing to report success.")
     else:
-        # recursive verification walks the local DIRECTORY tree. If local_path is
-        # a regular file, os.walk yields NOTHING, _missing stays 0, and we would
-        # report success WITHOUT verifying the uploaded object (a raced cp -n skip
-        # or wrong object goes undetected). Refuse: a single file must use
-        # recursive=False so it goes through the single-file content-hash verify.
-        if not _os.path.isdir(local_path):
-            raise safety.SafetyError(
-                f"recursive=True requires a directory, but {local_path!r} is a "
-                f"regular file — re-upload it with recursive=False so its content "
-                f"hash is verified.")
+        # (recursive=True on a regular file is already refused up-front, BEFORE
+        # the upload, so local_path here is guaranteed a directory.)
         # recursive: verify EACH local file against ITS OWN destination object
         # (matched by relative-path suffix) by CONTENT hash — not size, not global
         # set membership. A raced skip leaves the wrong content at that exact URI.
@@ -3996,15 +3998,22 @@ def terra_render_audio_summary(job_id: str, bucket_uri: str,
             "local `say` fallback works with no setup."
         )
     # voice_name is an outbound field (goes to the TTS API) AND is logged below by
-    # _pre — validate it to a strict Cloud-TTS voice-id shape BEFORE _pre so an
-    # arbitrary/secret-shaped value can neither be logged nor sent. (security
-    # review.) Empty = backend default.
-    if voice_name and not re.fullmatch(
-            r"[A-Za-z]{2,3}-[A-Za-z]{2,3}-[A-Za-z0-9]+(?:-[A-Za-z0-9]+){0,3}",
-            voice_name):
-        raise ValueError(
-            "voice_name must be a Cloud TTS voice id like 'en-US-Studio-O' "
-            "(letters/digits/hyphens only).")
+    # _pre. Validate it BEFORE _pre against a strict Cloud-TTS voice-id ALLOWLIST
+    # (a fixed set of known voice FAMILIES + a short variant), so an arbitrary or
+    # secret-shaped value (e.g. 'en-US-AKIA…' / 'en-US-xoxb-…') can neither be
+    # logged nor sent — a loose syntax regex is NOT enough. Also secret-scan it as
+    # an extra layer. (security review.) Empty = backend default.
+    if voice_name:
+        _voice_ok = re.fullmatch(
+            r"[a-z]{2,3}-[A-Z]{2}-"
+            r"(?:Standard|Wavenet|Neural2|Studio|News|Polyglot|Journey|Casual|"
+            r"Chirp[0-9A-Za-z]{0,8})-[A-Za-z0-9]{1,3}",
+            voice_name)
+        if (not _voice_ok or secret_scan.scan_egress(voice_name)
+                or secret_scan.has_homoglyph_token_shape(voice_name)):
+            raise ValueError(
+                "voice_name must be a supported Cloud TTS voice id like "
+                "'en-US-Studio-O' / 'en-GB-Wavenet-A' (family + variant only).")
 
     _pre("terra_render_audio_summary", WRITE_SAFE,
          f"job={job_id} text_len={len(summary_text)} "
