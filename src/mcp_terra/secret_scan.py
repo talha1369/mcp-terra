@@ -446,7 +446,14 @@ _DENSE_PATTERNS = [
     # is dropped here: without the \b boundary it would match an all-caps word like
     # 'ASIA PACIFIC REGION COHORT…' once whitespace is collapsed. 'AKIA' (not an
     # English word) is kept; contiguous ASIA keys are still caught by the raw scan.
+    # EXCLUDE aws_secret_key_assignment: its only signal is the common English words
+    # 'secret'+'key' + a 40-char run, and collapsing whitespace glues ordinary prose
+    # after 'secret key:' into a 40-char [A-Za-z0-9/+=] run → a FALSE POSITIVE on
+    # benign report text. A genuine AWS secret value is 40 CONTIGUOUS chars, already
+    # caught by the raw/NFKC/fold scan and (for a homoglyphed label) the fuzzy
+    # AWS-label matcher; the dense pass adds no real detection here.
     for name, pat, sev in _PATTERNS
+    if name != "aws_secret_key_assignment"
 ]
 # RELAXED split-detection patterns — each self-identifying prefix with its internal
 # distinguisher dropped (ya29's '.', ghp's '_', slack's '-', the dashes/spaces of

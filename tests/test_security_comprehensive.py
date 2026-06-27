@@ -2521,6 +2521,14 @@ def _():
     # NO false positive: 'secret'/'key' in ordinary prose (no 40-char value) renders
     assert not secret_scan.scan_egress(
         "The secret to success is the key insight reproduced across replicates today.")
+    # NO false positive (R27): a benign 'secret key: <prose>' sentence whose words
+    # collapse (after whitespace removal) into a >=40-char run must NOT trip the AWS
+    # value matcher — that pattern is excluded from the whitespace-collapsed dense
+    # scan (a genuine AWS value is 40 CONTIGUOUS chars, caught by the raw/fold scan).
+    for _fp in ("The secret key: comparing treated versus control revealed a strong dose dependent response here.",
+                "Secret key: reproducibility improved dramatically after we fixed the normalization step today.",
+                "The secret access key: understanding the batch effect was essential to these results here today."):
+        assert not secret_scan.scan_egress(_fp), f"false positive on benign 'secret key:' prose: {_fp[:30]}"
 
 @case("Y-SecretScan", "PEM private-key header blocks upload")
 def _():
