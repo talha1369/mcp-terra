@@ -352,7 +352,61 @@ def scan_egress(text: str) -> list[dict]:
                 hits.append({"pattern": name, "severity": sev,
                              "source": "egress-dense", "offset": m.start(),
                              "context": f"…[REDACTED—{name}]…"})
+    # DECODE pass: an agent could hex/base32/base64-encode a secret so the raw
+    # scanner misses it but the email recipient / TTS listener trivially decodes
+    # it. Decode plausible encoded blobs and scan the decoded bytes with the same
+    # anchored patterns. Decoding ordinary text/hashes yields random bytes that
+    # match no anchored pattern, so this adds no false positive. Bounded to keep
+    # it cheap on large summaries.
+    _seen: set = set()
+    for _m in re.finditer(r"[A-Za-z0-9+/=_-]{24,}", fold):
+        _b = _m.group(0)
+        if _b in _seen:
+            continue
+        _seen.add(_b)
+        if len(_seen) > 200 or len(_b) > 100000:
+            if len(_seen) > 200:
+                break
+            continue
+        for _dec in _try_decode(_b):
+            if _dec:
+                hits += scan_bytes(_dec, "egress-decoded")
     return hits
+
+
+def _try_decode(blob: str) -> list[bytes]:
+    """Return decoded-byte candidates for hex / base64 / base64url / base32
+    interpretations of `blob` (only those long enough to plausibly hold a
+    secret). Failures are skipped. Used by scan_egress to catch ENCODED secrets."""
+    import base64 as _b64
+    import binascii as _ba
+    out: list[bytes] = []
+    b = blob.encode("ascii", "ignore")
+    _hx = re.sub(rb"[^0-9a-fA-F]", b"", b)
+    if len(_hx) >= 40 and len(_hx) % 2 == 0:
+        try:
+            out.append(bytes.fromhex(_hx.decode("ascii")))
+        except ValueError:
+            pass
+    _b64s = re.sub(rb"[^A-Za-z0-9+/]", b"", b)
+    if len(_b64s) >= 24:
+        try:
+            out.append(_b64.b64decode(_b64s + b"=" * (-len(_b64s) % 4)))
+        except (ValueError, _ba.Error):
+            pass
+    _b64u = re.sub(rb"[^A-Za-z0-9_-]", b"", b)
+    if len(_b64u) >= 24:
+        try:
+            out.append(_b64.urlsafe_b64decode(_b64u + b"=" * (-len(_b64u) % 4)))
+        except (ValueError, _ba.Error):
+            pass
+    _b32 = re.sub(rb"[^A-Za-z2-7]", b"", b).upper()
+    if len(_b32) >= 32:
+        try:
+            out.append(_b64.b32decode(_b32 + b"=" * (-len(_b32) % 8)))
+        except (ValueError, _ba.Error):
+            pass
+    return out
 
 
 def scan_path(path: str | Path) -> list[dict]:

@@ -141,14 +141,22 @@ def _secret_alnum_lower(s):
 
 
 def _secret_common_hit(s):
-    """Return the first common/placeholder phrase found in s (normalized), or
-    None. Shared by the raw-secret check and the decoded-content screen. (Short
-    common words may still appear by chance in a high-entropy token at a ~1e-6
-    rate — an irreducible property of substring screening; callers that sweep
-    many generated tokens tolerate that floor rather than asserting strict zero.)"""
-    _norm = _secret_alnum_lower(s)
+    """Return the first common/placeholder phrase found in s, or None. Checks TWO
+    normalizations: `_norm` keeps the token separators `_`/`-` (so a real
+    token_urlsafe value is never glued into a false match), and `_glued` removes
+    them too (so a DASH/UNDERSCORE-separated famous phrase — the canonical written
+    xkcd 'correct-horse-battery-staple' — is caught). The glued form is only used
+    for constants ≥ 8 chars: those long multi-word strings do not occur as glued
+    substrings of high-entropy tokens, so removing `_`/`-` for them adds no false
+    positive, while the short common passwords stay keep-`_`/`-` only.
+    (A short word may still appear by chance in a high-entropy token at a ~1e-6
+    rate — an irreducible substring-screen floor; sweep tests tolerate it.)"""
+    import re as _r
+    _low = s.lower()
+    _norm = _secret_alnum_lower(s)              # keeps _ and -
+    _glued = _r.sub(r"[^a-z0-9]", "", _low)     # strips _ and - too
     for _w in _SECRET_COMMON + _SECRET_PLACEHOLDER:
-        if _w in _norm:
+        if _w in _norm or (len(_w) >= 8 and _w in _glued):
             return _w
     return None
 

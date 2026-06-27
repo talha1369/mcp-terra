@@ -1093,7 +1093,12 @@ def _():
                  # SPACED/punctuated famous passphrase (the actual xkcd spelling)
                  # — caught via alnum-normalization, not just contiguous match:
                  "correct horse battery staple 1234567890",  # pragma: allowlist secret
-                 "Change This Secret Before Production!!"):   # pragma: allowlist secret
+                 "Change This Secret Before Production!!",    # pragma: allowlist secret
+                 # DASH/UNDERSCORE-separated famous phrase (the canonical written
+                 # xkcd form) — caught via the glued-form check for long constants:
+                 "correct-horse-battery-staple-xyz1",   # pragma: allowlist secret
+                 "correct_horse_battery_staple_xyz1",   # pragma: allowlist secret
+                 "do-not-share-this-super-secret-7Q9z"):  # pragma: allowlist secret
         must_raise(nbr._validate_secret_strength, ValueError, weak)
     # base32/hex of a SPACED famous phrase, and a NUL-INTERLEAVED walk / repeated
     # word, must all be rejected (the squeeze screen runs the structural checks):
@@ -2821,6 +2826,22 @@ def _():
     split = "token ya29.A0ARrdaM FAKEBODYxxxxxxxxxxxxxxxx output"
     assert _audio_blocked(PRE + split), "audio leaked whitespace-split ya29"
     assert _email_blocked(split), "email leaked whitespace-split ya29"
+    # an ENCODED secret (hex / base64 / base64url / base32 of a ya29 token) must
+    # be caught by the decode pass — a recipient/listener trivially decodes it.
+    import base64 as _b64e
+    _tok = "ya29.A0ARrdaM" + "x" * 30
+    for _enc in (_tok.encode().hex(),
+                 _b64e.b64encode(_tok.encode()).decode(),
+                 _b64e.urlsafe_b64encode(_tok.encode()).decode(),
+                 _b64e.b32encode(_tok.encode()).decode()):
+        assert _audio_blocked(PRE + "result " + _enc + " done"), f"audio leaked encoded secret {_enc[:12]}"
+        assert _email_blocked("result " + _enc + " done"), f"email leaked encoded secret {_enc[:12]}"
+    # NO false positive: a legit SHA-256 hash (64 hex) in a summary decodes to
+    # random bytes (no secret pattern) — must render.
+    import hashlib as _hl
+    _withhash = PRE + "run hash " + _hl.sha256(b"x").hexdigest() + " completed fine here today now."
+    assert not _audio_blocked(_withhash), "audio false-positive on a SHA-256 hash"
+    assert not _email_blocked(_withhash[:60]), "email false-positive on a SHA-256 hash"
     # NO false positive: Russian/Cyrillic biomedical prose with HYPHENATED Latin
     # technical terms (Latin head '-' Cyrillic suffix, no inline substitution) —
     # ubiquitous in real summaries — must render in BOTH channels.
@@ -5422,6 +5443,33 @@ def _():
     for bad in ("en-US-AKIAIOSFODNN7EXAMPLE", "en-US-xoxb-AAAAAAAAAA",  # pragma: allowlist secret
                 "; rm -rf /", "en-US-Studio-O; evil"):
         assert not _voice_allowed(bad), f"secret/garbage voice accepted: {bad}"
+
+
+@case("CC-ControlledAccessGuard", "lock DENIAL paths withhold the locked workspace identifiers in controlled mode")
+def _():
+    # A refused wrong-workspace/project/bucket request must NOT disclose the
+    # LOCKED namespace/name/project/bucket in controlled mode (the denial path is
+    # an egress channel too). Guard OFF, the error is informative.
+    from mcp_terra import policy as _p
+    saved, olock = _p._CONTROLLED_ACCESS, _p.resolve_locked_workspace
+    SENT = {"namespace": "ns_sensitive", "name": "ws_sensitive",
+            "googleProject": "proj-sensitive-id", "bucketName": "fc-secure-sensitivebkt"}
+    _p.resolve_locked_workspace = lambda: SENT
+    _sentinels = ("ns_sensitive", "ws_sensitive", "proj-sensitive-id", "sensitivebkt")
+    try:
+        _p._CONTROLLED_ACCESS = True
+        for fn in (lambda: _p.assert_workspace_allowed("other_ns", "other_ws"),
+                   lambda: _p.assert_project_allowed("other-proj"),
+                   lambda: _p.assert_bucket_allowed("gs://other-bucket/x")):
+            e = must_raise(fn, _p.PolicyError)
+            for s in _sentinels:
+                assert s not in str(e), f"controlled denial leaked locked id {s!r}: {e}"
+        # guard OFF: the error names the locked workspace (operator convenience)
+        _p._CONTROLLED_ACCESS = False
+        e2 = must_raise(lambda: _p.assert_project_allowed("other-proj"), _p.PolicyError)
+        assert "proj-sensitive-id" in str(e2), "guard-OFF error should name the locked project"
+    finally:
+        _p._CONTROLLED_ACCESS, _p.resolve_locked_workspace = saved, olock
 
 
 @case("CC-ControlledAccessGuard", "terra_health withholds lock/bucket/IAM principals (sentinel) in controlled mode")

@@ -727,12 +727,24 @@ def resolve_locked_workspace() -> dict | None:
         return _LOCKED
 
 
+# In controlled-access mode the DENIAL path must not disclose the locked
+# workspace identifiers (namespace/name/project/bucket) — those are exactly the
+# identifiers the guard withholds on success paths, and a refused wrong-target
+# request would otherwise leak them. Raise a generic out-of-lock error instead.
+_LOCK_DENIED_GENERIC = (
+    "request target is outside the workspace this MCP is locked to "
+    "(MCP_TERRA_WORKSPACE); refused. Locked-workspace identifiers withheld "
+    "(MCP_TERRA_CONTROLLED_ACCESS).")
+
+
 def assert_workspace_allowed(namespace: str, name: str) -> None:
     """Refuse if the lock is set and the requested workspace isn't it."""
     lock = resolve_locked_workspace()
     if lock is None:
         return  # open mode, all workspaces allowed via Terra ACL
     if namespace != lock["namespace"] or name != lock["name"]:
+        if controlled_access_enabled():
+            raise PolicyError(_LOCK_DENIED_GENERIC)
         raise PolicyError(
             f"MCP locked to workspace {lock['namespace']}/{lock['name']} via "
             f"MCP_TERRA_WORKSPACE. Refusing to access {namespace}/{name}."
@@ -745,6 +757,8 @@ def assert_project_allowed(google_project: str) -> None:
     if lock is None:
         return
     if google_project != lock["googleProject"]:
+        if controlled_access_enabled():
+            raise PolicyError(_LOCK_DENIED_GENERIC)
         raise PolicyError(
             f"MCP locked to project {lock['googleProject']} (workspace "
             f"{lock['namespace']}/{lock['name']}). Refusing to access "
@@ -761,6 +775,8 @@ def assert_bucket_allowed(gs_uri: str) -> None:
         raise PolicyError(f"bucket URI must start with gs://; got {gs_uri!r}")
     bucket_name = gs_uri[5:].split("/", 1)[0]
     if bucket_name != lock["bucketName"]:
+        if controlled_access_enabled():
+            raise PolicyError(_LOCK_DENIED_GENERIC)
         raise PolicyError(
             f"MCP locked to bucket {lock['bucketName']} (workspace "
             f"{lock['namespace']}/{lock['name']}). Refusing to access bucket "
