@@ -216,10 +216,30 @@ def _validate_secret_strength(secret, _depth: int = 0) -> None:
             f"Generate with: python -c "
             f"'import secrets; print(secrets.token_urlsafe(32))'"
         )
-    n = len(secret)
-    unique = len(set(secret))
     import math as _math
     import re as _re_fmt
+    # A generated CSPRNG token (token_urlsafe/hex/base32/base64 — the only formats
+    # the SOP/installer steer to) contains NO whitespace and has NO long run of
+    # consecutive lowercase letters (case/digit/symbol breaks them up). A typed
+    # passphrase has both. Reject either — applied to the RAW secret AND, via the
+    # decoded-screen recursion (_screen_encoded → _validate_secret_strength), to a
+    # secret that is a base64/base32/hex ENCODING of a passphrase. This closes the
+    # dictionary-phrase bypass (e.g. 'lorem ipsum dolor sit amet consectetur' and
+    # its encodings) without rejecting any real generated token.
+    if any(c.isspace() for c in secret):
+        raise ValueError(
+            "MCP_TERRA_RUNNER_SECRET contains whitespace — it looks like a "
+            "passphrase, not a generated token. Use python -c "
+            "'import secrets; print(secrets.token_urlsafe(32))'."
+        )
+    if _re_fmt.search(r"[a-z]{18,}", secret):
+        raise ValueError(
+            "MCP_TERRA_RUNNER_SECRET has a long run of lowercase letters — it "
+            "looks like a word/passphrase, not a generated token. Use python -c "
+            "'import secrets; print(secrets.token_urlsafe(32))'."
+        )
+    n = len(secret)
+    unique = len(set(secret))
     # Recognize strong small-alphabet generator FORMATS up front. The per-char
     # diversity / Shannon floors below assume a large alphabet; they structurally
     # penalize hex (16 symbols, max 4.0 bits/char) and base32 (32, max 5.0),

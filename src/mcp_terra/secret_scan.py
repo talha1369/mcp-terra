@@ -391,23 +391,20 @@ _DENSE_PATTERNS = [
     # English word) is kept; contiguous ASIA keys are still caught by the raw scan.
     for name, pat, sev in _PATTERNS
 ]
-# BARE-alphanumeric variants — for scanning a form with EVERY non-[A-Za-z0-9] char
-# removed (incl. the token-charset chars '_' and '-'), so a plaintext secret split
-# by '_' between every character re-contiguates. ONLY patterns that stay DISTINCTIVE
-# with their separators gone are included: the literal AWS access-key ID 'AKIA' + 16
-# (AKIA is not an English word) and the fine-grained GitHub PAT 'github_pat_' + 82
-# (→ 'githubpat' + 82). DELIBERATELY EXCLUDED as false-positive-prone once bare:
-#   • ghp_ classic → 'ghp' + 36 matches any 'ghp' substring in glued prose;
-#   • ASIA (STS) → 'ASIA' + 16 matches all-caps prose containing 'ASIA…';
-#   • ya29 → its dot is the distinguisher (dropping it matches 'Maya29…');
-#   • PEM → dashless 'BEGINPRIVATEKEY' matches the phrase 'begin private key';
-#   • aws_secret value → needs +/=.
-# Those split forms are still covered by punct/alnum_dense for every separator that
-# is NOT itself a token-body char; only a '_'-between-every-char split of those
-# specific secrets is an accepted residual (an exotic, visibly-tampered form).
-_BARE_PATTERNS = [
-    ("aws_access_key_id", re.compile(rb"AKIA[0-9A-Z]{16}"), "CRITICAL"),
-    ("github_pat", re.compile(rb"githubpat[A-Za-z0-9]{82}"), "HIGH"),
+# RELAXED split-detection patterns — each self-identifying prefix with its internal
+# distinguisher dropped (ya29's '.', ghp's '_', slack's '-', the dashes/spaces of
+# PEM). These are applied ONLY to re-contiguated candidates that are already known
+# to be a SECRET-SHAPED structure — a single whitespace TOKEN stripped of its
+# separators, or a "one separator between every character" run that has been
+# collapsed — NEVER to globally-glued prose. In those contexts the relaxations are
+# false-positive-safe (ordinary prose is neither a single long token nor a per-char
+# separated run). 'AKIA'/'ASIA' both included (a collapsed 'A S I A …' run is a
+# genuine split key, not the all-caps word 'ASIA' which is not per-char separated).
+_SPLIT_PATTERNS = [
+    ("aws_access_key_id", re.compile(rb"(?:AKIA|ASIA)[0-9A-Z]{16}"), "CRITICAL"),
+    ("google_oauth_token", re.compile(rb"ya29[A-Za-z0-9_-]{20,}"), "CRITICAL"),
+    ("github_pat", re.compile(rb"ghp[A-Za-z0-9]{36}|githubpat[A-Za-z0-9]{82}"), "HIGH"),
+    ("slack_token", re.compile(rb"xox[abprs][A-Za-z0-9]{10,}"), "HIGH"),
 ]
 
 
@@ -470,11 +467,26 @@ def scan_egress(text: str) -> list[dict]:
         _bare = re.sub(r"[^A-Za-z0-9]", "", _tok)   # strip '_' and '-' too
         if len(_bare) >= 18:
             _bb = _bare.encode("utf-8", "replace")
-            for name, pat, sev in _BARE_PATTERNS:
+            for name, pat, sev in _SPLIT_PATTERNS:    # ya29/ghp/slack distinguisher dropped
                 if pat.search(_bb):
                     hits.append({"pattern": name, "severity": sev,
                                  "source": "egress-tokensplit", "offset": 0,
                                  "context": f"…[REDACTED—{name}]…"})
+    # "One separator between every character" exfil ('A S I A …', 'A.K.I.A…',
+    # 'g_h_p_…') that SPANS whitespace (so the per-token pass above cannot rejoin
+    # it): a run of single chars each followed by the SAME single separator. Real
+    # prose has MULTI-char words between separators, so it does not match this
+    # structure → no false positive. Collapse the separator and scan the result
+    # with the relaxed split patterns (safe: only a genuine per-char run reaches
+    # here). The backreference \1 pins one consistent separator (incl. '_'/'-').
+    for _m in re.finditer(r"[A-Za-z0-9]([^A-Za-z0-9])(?:[A-Za-z0-9]\1){15,}", fold):
+        _collapsed = _m.group(0).replace(_m.group(1), "")
+        _cb = _collapsed.encode("utf-8", "replace")
+        for name, pat, sev in _SPLIT_PATTERNS:
+            if pat.search(_cb):
+                hits.append({"pattern": name, "severity": sev,
+                             "source": "egress-charsplit", "offset": _m.start(),
+                             "context": f"…[REDACTED—{name}]…"})
     # `punct_dense` (base64 alphabet kept) feeds the DECODE pass below: an ENCODED
     # secret split by whitespace OR punctuation re-contiguates here for decoding.
     punct_dense = re.sub(r"[^A-Za-z0-9+/=_-]", "", fold)

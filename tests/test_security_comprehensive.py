@@ -1118,6 +1118,20 @@ def _():
                   if _raises(nbr._validate_secret_strength, ValueError,
                              _b642.b64encode(_secrets.token_bytes(24)).decode()))
     assert _b64rej < 30, f"random base64 secrets broadly false-rejected {_b64rej}/3000"
+    # REGRESSION (Codex r14): a dictionary PASSPHRASE must be rejected as the runner
+    # HMAC secret — raw (it contains whitespace), no-space concatenated (it has a
+    # long lowercase-letter run), and base64/base32/base64url ENCODED (the decoded
+    # screen recurses into the same validator). A generated token has neither trait.
+    _phrase = "lorem ipsum dolor sit amet consectetur"
+    must_raise(nbr._validate_secret_strength, ValueError, _phrase)
+    must_raise(nbr._validate_secret_strength, ValueError, _phrase.replace(" ", ""))
+    must_raise(nbr._validate_secret_strength, ValueError, _b642.b64encode(_phrase.encode()).decode())
+    must_raise(nbr._validate_secret_strength, ValueError, _b642.b32encode(_phrase.encode()).decode())
+    must_raise(nbr._validate_secret_strength, ValueError, _b642.urlsafe_b64encode(_phrase.encode()).decode())
+    # generated tokens (no whitespace, no long lowercase run) still pass
+    _wsrej = sum(1 for _ in range(3000)
+                 if _raises(nbr._validate_secret_strength, ValueError, _secrets.token_urlsafe(32)))
+    assert _wsrej == 0, f"token_urlsafe false-rejected by whitespace/lowercase-run gate {_wsrej}/3000"
     # REGRESSION (R15): a base64-encoded phrase whose ciphertext happens to be a
     # valid base32 alphabet (no 0/1/8/9/+/) must NOT be mis-classified as base32 and
     # routed to a garbage base32 decode that passes — every applicable decoding is
@@ -2943,6 +2957,28 @@ def _():
                 "The controlGroup군comparison2024 cohort and baselineMeasurement후followup were reproducible here today."):
         assert not _audio_blocked(_ko), f"audio false-positive on Korean Hangul: {_ko[:24]}"
         assert not _email_blocked(_ko[:55]), f"email false-positive on Korean Hangul: {_ko[:24]}"
+    # REGRESSION (Codex r14): 'one separator between every character' exfil of a
+    # self-identifying credential — space-per-char 'A S I A …'/'A K I A …', the ya29
+    # token with a dot between every body char, and '_'.join('ghp_'+...) — must be
+    # caught. A token-internal split stays one whitespace token (per-token bare
+    # scan); a space-per-char split spans tokens (consistent-separator char-run
+    # collapse). The ASIA STS prefix is covered too.
+    _asia = "ASIA" + "IOSFODNN7EXAMPLE"[:16]  # pragma: allowlist secret
+    _akia = "AKIA" + "IOSFODNN7EXAMPLE"[:16]  # pragma: allowlist secret
+    assert _email_blocked("Results " + " ".join(list(_asia)) + " end"), "email leaked space-per-char ASIA"
+    assert _email_blocked("Results " + " ".join(list(_akia)) + " end"), "email leaked space-per-char AKIA"
+    assert _audio_blocked(PRE + "key " + " ".join(list(_akia)) + " end here now."), "audio leaked space-per-char AKIA"
+    _ya = "ya29.A0ARrdaM" + "x" * 30
+    assert _email_blocked("token ya29." + ".".join(list("A0ARrdaM" + "x" * 30)) + " end"), "email leaked ya29 dot-per-char body"
+    assert _email_blocked("token " + ".".join(list(_ya)) + " end"), "email leaked fully dot-split ya29"
+    assert _email_blocked("key " + "_".join(list("ghp_" + "a" * 36)) + " end"), "email leaked '_'-join ghp"
+    # NO false positive (Codex r14): a single-letter list ('layers a b c d e f …'),
+    # dotted coordinates ('x.y.z.w'), and all-caps prose must render — a collapsed
+    # per-char run that does not spell a credential prefix is not a hit.
+    for _ok in ("The model used layers a b c d e f g h i j k l m n o p q r s t for the ablation study today here.",
+                "Coordinates x.y.z.w and points p.q.r.s.t.u.v were plotted and the figure saved to disk fine today here."):
+        assert not _audio_blocked(_ok), f"audio false-positive on per-char list: {_ok[:24]}"
+        assert not _email_blocked(_ok[:60]), f"email false-positive on per-char list: {_ok[:24]}"
     # NO false positive: a legit SHA-256 hash (64 hex) in a summary decodes to
     # random bytes (no secret pattern) — must render.
     import hashlib as _hl
