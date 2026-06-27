@@ -2806,9 +2806,15 @@ def terra_health() -> str:
 
 def _assert_workspace_allowed(namespace: str, name: str) -> None:
     """Refuse if the MCP is locked to a DIFFERENT workspace (defense in depth
-    alongside the bucket lock)."""
+    alongside the bucket lock). Under MCP_TERRA_CONTROLLED_ACCESS the refusal is
+    GENERIC — it must not echo the locked namespace/name (operator-chosen strings
+    that can encode cohort/consent identifiers) nor the requested target, so a
+    prompt-injected agent cannot use this denial path as a workspace-id oracle
+    (mirrors policy.assert_workspace_allowed)."""
     locked = policy.get_locked_workspace_id()
     if locked is not None and (namespace, name) != tuple(locked):
+        if policy.controlled_access_enabled():
+            raise PermissionError(policy._LOCK_DENIED_GENERIC)
         raise PermissionError(
             f"MCP is locked to workspace {locked[0]}/{locked[1]} "
             f"(MCP_TERRA_WORKSPACE); refused {namespace}/{name}.")

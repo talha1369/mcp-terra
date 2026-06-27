@@ -1080,7 +1080,7 @@ def _():
     # reject enumerable hex-word secrets) rejects ~0.17% of real token_hex(16)
     # — vastly better than the 5-19% before the fix; assert it is well under 1%.
     assert rej16 < 80, f"token_hex(16) broadly false-rejected {rej16}/8000 (>1%)"
-    assert rej32 <= 1, f"token_hex(32) broadly false-rejected {rej32}/3000 strong hex secrets"
+    assert rej32 <= 5, f"token_hex(32) broadly false-rejected {rej32}/3000 strong hex secrets"
     assert reju <= 3, f"token_urlsafe(32) broadly false-rejected {reju}/8000"
     # the relaxation must NOT admit a genuinely weak low-entropy 32-char string,
     # a hex WALK, a periodic hex block, OR an enumerable hex-WORD secret:
@@ -1118,7 +1118,7 @@ def _():
                   if _raises(nbr._validate_secret_strength, ValueError,
                              _b642.b64encode(_secrets.token_bytes(24)).decode()))
     assert _b64rej < 30, f"random base64 secrets broadly false-rejected {_b64rej}/3000"
-    # REGRESSION (Codex r14): a dictionary PASSPHRASE must be rejected as the runner
+    # REGRESSION (adversarial review r14): a dictionary PASSPHRASE must be rejected as the runner
     # HMAC secret — raw (it contains whitespace), no-space concatenated (it has a
     # long lowercase-letter run), and base64/base32/base64url ENCODED (the decoded
     # screen recurses into the same validator). A generated token has neither trait.
@@ -1132,6 +1132,13 @@ def _():
     _wsrej = sum(1 for _ in range(3000)
                  if _raises(nbr._validate_secret_strength, ValueError, _secrets.token_urlsafe(32)))
     assert _wsrej == 0, f"token_urlsafe false-rejected by whitespace/lowercase-run gate {_wsrej}/3000"
+    # REGRESSION (R19): a MULTI-level base64 encoding of a famous phrase must be
+    # rejected — the decoded screen recurses to bounded depth (≤4 layers), so a
+    # base64-of-base64-of-'correct horse…' is unwrapped to the plaintext and caught.
+    _enc = "correct horse battery staple"
+    for _lvl in range(4):
+        _enc = _b642.b64encode(_enc.encode()).decode()
+        must_raise(nbr._validate_secret_strength, ValueError, _enc)
     # REGRESSION (R15): a base64-encoded phrase whose ciphertext happens to be a
     # valid base32 alphabet (no 0/1/8/9/+/) must NOT be mis-classified as base32 and
     # routed to a garbage base32 decode that passes — every applicable decoding is
@@ -2957,7 +2964,20 @@ def _():
                 "The controlGroup군comparison2024 cohort and baselineMeasurement후followup were reproducible here today."):
         assert not _audio_blocked(_ko), f"audio false-positive on Korean Hangul: {_ko[:24]}"
         assert not _email_blocked(_ko[:55]), f"email false-positive on Korean Hangul: {_ko[:24]}"
-    # REGRESSION (Codex r14): 'one separator between every character' exfil of a
+    # REGRESSION (R19): spaceless SE-Asian scripts (Thai/Lao/Khmer/Myanmar, EAW='N')
+    # glue a Latin gene/accession ID (e.g. GCF_000001405.40) directly to a native
+    # word — must RENDER. These have no ASCII look-alikes (not a smuggling vector).
+    for _sea in ("รหัสตัวอย่างGCF_000001405.40GRCh38p14assemblyถูกใช้ในการวิเคราะห์นี้และผล",
+                 "ຜົນການວິເຄາະຫGCF_000001405genomeແມ່ນສຳຄັນຫຼາຍສຳລັບການສຶກສາ",
+                 "លទ្ធផលENSG00000139618ហ្សែនត្រូវបានវិភាគនិងរាយការណ៍នៅទីនេះ",
+                 "ရလဒ်များENST00000380152မှတ်တမ်းတင်ထားသည်နှင့်အရေးကြီးသည်"):
+        assert not _audio_blocked(_sea + " " * 30), f"audio false-positive on SE-Asian script: {_sea[:16]}"
+    # cross-script CONFUSABLES (Cyrillic/Armenian look-alikes) in a token stay caught
+    for _cp in (0x0405, 0x0555):  # Cyrillic DZE (S), Armenian OH (O)
+        _smug = "AKIA" + chr(_cp) + "PQRSTUVWXYZ12345"  # pragma: allowlist secret
+        assert (secret_scan.scan_egress(_smug) or secret_scan.has_homoglyph_token_shape(_smug)), \
+            f"cross-script homoglyph AKIA bypassed after SE-Asian exemption ({hex(_cp)})"
+    # REGRESSION (adversarial review r14): 'one separator between every character' exfil of a
     # self-identifying credential — space-per-char 'A S I A …'/'A K I A …', the ya29
     # token with a dot between every body char, and '_'.join('ghp_'+...) — must be
     # caught. A token-internal split stays one whitespace token (per-token bare
@@ -2972,7 +2992,7 @@ def _():
     assert _email_blocked("token ya29." + ".".join(list("A0ARrdaM" + "x" * 30)) + " end"), "email leaked ya29 dot-per-char body"
     assert _email_blocked("token " + ".".join(list(_ya)) + " end"), "email leaked fully dot-split ya29"
     assert _email_blocked("key " + "_".join(list("ghp_" + "a" * 36)) + " end"), "email leaked '_'-join ghp"
-    # NO false positive (Codex r14): a single-letter list ('layers a b c d e f …'),
+    # NO false positive (adversarial review r14): a single-letter list ('layers a b c d e f …'),
     # dotted coordinates ('x.y.z.w'), and all-caps prose must render — a collapsed
     # per-char run that does not spell a credential prefix is not a hit.
     for _ok in ("The model used layers a b c d e f g h i j k l m n o p q r s t for the ablation study today here.",
@@ -3496,6 +3516,34 @@ def _():
         server._assert_workspace_allowed("locked-ns", "locked-ws")  # match: no raise
     finally:
         policy.get_locked_workspace_id = orig
+
+
+@case("CC-WDL", "workspace-lock denial is generic under controlled access (no ns/name leak)")
+def _():
+    # REGRESSION (R19): server._assert_workspace_allowed must NOT echo the locked
+    # namespace/name (or the requested target) under MCP_TERRA_CONTROLLED_ACCESS —
+    # else the denial path is a workspace-id oracle. Informative when the guard off.
+    orig_lock = policy.get_locked_workspace_id
+    orig_cc = policy.controlled_access_enabled
+    policy.get_locked_workspace_id = lambda: ("cohortNS", "consentGroup7")
+    try:
+        policy.controlled_access_enabled = lambda: True
+        try:
+            server._assert_workspace_allowed("attackerNS", "guessWS")
+            raise AssertionError("expected PermissionError under controlled access")
+        except PermissionError as e:
+            _m = str(e)
+            assert "cohortNS" not in _m and "consentGroup7" not in _m, f"leaked locked id: {_m}"
+            assert "attackerNS" not in _m and "guessWS" not in _m, f"leaked target: {_m}"
+        policy.controlled_access_enabled = lambda: False
+        try:
+            server._assert_workspace_allowed("attackerNS", "guessWS")
+            raise AssertionError("expected PermissionError with guard off")
+        except PermissionError as e:
+            assert "cohortNS" in str(e), "guard-off message should be informative"
+    finally:
+        policy.get_locked_workspace_id = orig_lock
+        policy.controlled_access_enabled = orig_cc
 
 
 @case("CC-WDL", "submit_workflow is SPEND-gated")

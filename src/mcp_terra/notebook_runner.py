@@ -308,7 +308,7 @@ def _validate_secret_strength(secret, _depth: int = 0) -> None:
         _found = bool(_sq) and (_ratio >= 0.85 or (_np and len(set(_np)) <= 2))
         if _found:
             try:
-                _validate_secret_strength(_sq, _depth=1)
+                _validate_secret_strength(_sq, _depth=_depth + 1)
             except ValueError as _e:
                 raise ValueError(
                     f"MCP_TERRA_RUNNER_SECRET is an encoding of a weak secret "
@@ -318,7 +318,7 @@ def _validate_secret_strength(secret, _depth: int = 0) -> None:
             if len(_rb) >= 16:
                 _found = True
                 try:
-                    _validate_secret_strength(_rb.decode("ascii"), _depth=1)
+                    _validate_secret_strength(_rb.decode("ascii"), _depth=_depth + 1)
                 except ValueError as _e:
                     raise ValueError(
                         f"MCP_TERRA_RUNNER_SECRET is an encoding of a weak secret "
@@ -331,7 +331,11 @@ def _validate_secret_strength(secret, _depth: int = 0) -> None:
     # user might use to "make a phrase look random") and screen the decoded bytes.
     # token_urlsafe is base64url but decodes to ~37% scattered-printable random
     # bytes, so _screen_encoded returns False / does not raise → no false-reject.
-    if _depth == 0:
+    # Runs up to _depth 3 (≤4 encoding layers) so a MULTI-level encoding of a weak
+    # phrase (base64-of-base64-of-'correct horse…') is still decoded down to the
+    # plaintext and rejected; the recursion is bounded and the format EXEMPTION is
+    # still granted only at _depth 0 (decoded inner text gets the full floors).
+    if _depth <= 3:
         import base64 as _b64
         # Try EVERY applicable decoding, NOT the first-matching branch. The alphabets
         # OVERLAP (a base64 string with no 0/1/8/9/+/ is also valid base32; hex is a

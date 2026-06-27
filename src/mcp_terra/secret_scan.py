@@ -304,6 +304,16 @@ def has_homoglyph_token_shape(text: str) -> bool:
         if (0x1100 <= _o <= 0x11FF or 0x3130 <= _o <= 0x318F
                 or 0xA960 <= _o <= 0xA97F or 0xD7B0 <= _o <= 0xD7FF):
             return False                      # conjoining Hangul jamo (NFKD of 가-힣)
+        # Spaceless / space-optional SE-Asian scripts (Thai, Lao, Khmer, Myanmar)
+        # are written without inter-word spaces, so a Latin gene/accession ID (e.g.
+        # GCF_000001405.40) glues directly to a native word — but their letters are
+        # EAW='N' (narrow) so the W/F test does not exempt them. They are distinct
+        # native shapes with NO ASCII look-alikes (not a smuggling vector), exactly
+        # like the CJK/jamo rationale, so exempt their blocks to avoid refusing a
+        # legitimate non-English researcher's summary.
+        if (0x0E00 <= _o <= 0x0E7F or 0x0E80 <= _o <= 0x0EFF      # Thai, Lao
+                or 0x1000 <= _o <= 0x109F or 0x1780 <= _o <= 0x17FF):  # Myanmar, Khmer
+            return False
         return (_o > 127 and _ud.category(c)[0] == "L"
                 and c not in _GREEK_SCIENCE
                 and _ud.east_asian_width(c) not in ("W", "F"))
