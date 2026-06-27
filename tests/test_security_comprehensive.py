@@ -3080,6 +3080,18 @@ def _():
                 "The controlGroup군comparison2024 cohort and baselineMeasurement후followup were reproducible here today."):
         assert not _audio_blocked(_ko), f"audio false-positive on Korean Hangul: {_ko[:24]}"
         assert not _email_blocked(_ko[:55]), f"email false-positive on Korean Hangul: {_ko[:24]}"
+    # REGRESSION (R29): UPPERCASE African/Azerbaijani extended-Latin letters (Ə Ɓ Ɗ
+    # Ɔ Ɛ Ɠ …) appear word-initially (hence capitalized) and must fold like their
+    # lowercase forms, so a CamelCase non-English filename/label in a summary renders
+    # (the capitals are derived programmatically from the lowercase fold entries).
+    for _ne in ("The output filename GenomAnaliziƏsasNəticələr2024Final was written to the bucket here today.",
+                "Hausa report: sample ƊayaƁatandcomparisonRESULTS2024 was processed without errors across reps.",
+                "Akan analysis ƆpeningƐdwumaResults2024Summary completed and the figures were saved to disk today."):
+        assert not _audio_blocked(_ne), f"audio false-positive on uppercase extended-Latin: {_ne[:30]}"
+        assert not _email_blocked(_ne[:60]), f"email false-positive on uppercase extended-Latin: {_ne[:30]}"
+    # science-Greek capitals must STILL be unfolded (not treated as Latin homoglyphs)
+    for _gc in (0x03A3, 0x0393, 0x03A9):  # Σ Γ Ω
+        assert secret_scan.fold_confusables(chr(_gc)) == chr(_gc), f"science-Greek cap {hex(_gc)} wrongly folded"
     # REGRESSION (R19): spaceless SE-Asian scripts (Thai/Lao/Khmer/Myanmar, EAW='N')
     # glue a Latin gene/accession ID (e.g. GCF_000001405.40) directly to a native
     # word — must RENDER. These have no ASCII look-alikes (not a smuggling vector).

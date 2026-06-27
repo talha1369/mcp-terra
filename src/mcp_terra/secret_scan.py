@@ -226,6 +226,17 @@ for _cp, _lat in _COPTIC_CONFUSABLES.items():
     _CONFUSABLE_TABLE[_cp + 1] = _lat.lower()  # lowercase (Coptic pairs are cap, cap+1)
 for _cp, _lat in _EXTLATIN_CONFUSABLES.items():
     _CONFUSABLE_TABLE.setdefault(_cp, _lat)  # don't override a curated mapping
+    # Also fold the UPPERCASE counterpart to the same ASCII letter (uppercased):
+    # African/Azerbaijani extended-Latin letters appear word-INITIALLY, hence
+    # capitalized (Hausa Ɗaya/Ɓata, Azerbaijani Ə-initial words, Akan Ɔ/Ɛ), and a
+    # capital landing inside a CamelCase ≥16-char token would otherwise be an
+    # unfolded residual → a false rejection of legit non-English prose. Derived
+    # programmatically (only for this extended-Latin block, NOT the science-Greek
+    # map whose capitals Γ/Σ/Ω must stay unfolded) so future lowercase additions
+    # never reintroduce the asymmetry. Folding only HELPS the byte-scan too.
+    _uc = chr(_cp).upper()
+    if len(_uc) == 1 and ord(_uc) > 127:
+        _CONFUSABLE_TABLE.setdefault(ord(_uc), _lat.upper())
 
 # GENUINE science Greek letters that are NOT Latin look-alikes (δ θ λ ξ π σ …),
 # excluded from the homoglyph backstop so 'TGFβ1' / 'λmax-2024' / 'δ13C' / a
