@@ -410,6 +410,10 @@ _DENSE_PATTERNS = [
 # false-positive-safe (ordinary prose is neither a single long token nor a per-char
 # separated run). 'AKIA'/'ASIA' both included (a collapsed 'A S I A …' run is a
 # genuine split key, not the all-caps word 'ASIA' which is not per-char separated).
+# The hex/base64/base64url/base32 candidate alphabet — used to decide whether a
+# decoded blob is itself plausibly ANOTHER encoded layer (recursive decode pass).
+_ENC_ALPHABET = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=_-")  # pragma: allowlist secret
 _SPLIT_PATTERNS = [
     ("aws_access_key_id", re.compile(rb"(?:AKIA|ASIA)[0-9A-Z]{16}"), "CRITICAL"),
     ("google_oauth_token", re.compile(rb"ya29[A-Za-z0-9_-]{20,}"), "CRITICAL"),
@@ -538,23 +542,47 @@ def scan_egress(text: str) -> list[dict]:
     # glued prose yields random bytes that match no anchored pattern (no false
     # positive). Shared `_seen` decodes a blob appearing in multiple forms once.
     # (`punct_dense` was built above for the punctuation-collapsed anchored scan.)
+    # RECURSE to a bounded depth: an agent that knows to base64-encode a secret
+    # equally knows to encode it TWICE (the recipient just decodes twice), so a
+    # single-layer decode leaks a MULTI-level-encoded credential. After decoding a
+    # candidate, if the result is itself a mostly-encoding-alphabet printable string
+    # (i.e. plausibly another encoded layer), re-feed it for another round — up to
+    # `_MAX_DECODE_DEPTH`, sharing `_seen` and the volume guard so cost stays
+    # bounded and fail-closed. Random/text decodes are non-printable or not
+    # alphabet-dense, so they terminate immediately → no false positive. (Mirrors
+    # the runner-secret validator's multi-level decoded-passphrase screen.)
     _seen: set = set()
     _total = 0
-    for _src in (fold, dense, punct_dense):
+    _MAX_DECODE_DEPTH = 3
+    _work = [(_src, 0) for _src in (fold, dense, punct_dense)]
+    while _work:
+        _src, _depth = _work.pop()
         for _m in re.finditer(r"[A-Za-z0-9+/=_-]{24,}", _src):
             _b = _m.group(0)
             if _b in _seen or len(_b) > 200000:
                 continue
             _seen.add(_b)
             for _dec in _try_decode(_b):
-                if _dec:
-                    _total += len(_dec)
-                    hits += scan_bytes(_dec, "egress-decoded")
-            if _total > 4_000_000:   # pathological encoded volume → refuse (fail closed)
-                hits.append({"pattern": "egress_decode_volume", "severity": "HIGH",
-                             "source": "egress", "offset": 0,
-                             "context": "…[REDACTED—excessive encoded content]…"})
-                return hits
+                if not _dec:
+                    continue
+                _total += len(_dec)
+                hits += scan_bytes(_dec, "egress-decoded")
+                if _total > 4_000_000:   # pathological volume → refuse (fail closed)
+                    hits.append({"pattern": "egress_decode_volume", "severity": "HIGH",
+                                 "source": "egress", "offset": 0,
+                                 "context": "…[REDACTED—excessive encoded content]…"})
+                    return hits
+                if _depth < _MAX_DECODE_DEPTH:
+                    try:
+                        _dtext = _dec.decode("ascii")
+                    except UnicodeDecodeError:
+                        continue                 # non-ASCII bytes → not another layer
+                    # only recurse on an alphabet-DENSE printable string (an encoded
+                    # layer is ~100% [A-Za-z0-9+/=_-]); random/text decodes are not,
+                    # so they terminate the recursion (no FP, bounded cost).
+                    if (len(_dtext) >= 24
+                            and sum(c in _ENC_ALPHABET for c in _dtext) >= 0.9 * len(_dtext)):
+                        _work.append((_dtext, _depth + 1))
     return hits
 
 

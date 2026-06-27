@@ -2880,6 +2880,25 @@ def _():
                  _b64e.b32encode(_tok.encode()).decode()):
         assert _audio_blocked(PRE + "result " + _enc + " done"), f"audio leaked encoded secret {_enc[:12]}"
         assert _email_blocked("result " + _enc + " done"), f"email leaked encoded secret {_enc[:12]}"
+    # REGRESSION (R20): a MULTI-layer encoding (double/triple base64, or mixed
+    # hex/base32 over base64) of a self-identifying credential must be caught — the
+    # egress decode pass recurses to bounded depth, mirroring the runner validator.
+    for _sec3 in (_tok, "AKIAIOSFODNN7EXAMPLE", "ghp_" + "A" * 36):
+        _e3 = _sec3
+        for _lvl in range(4):
+            _e3 = _b64e.b64encode(_e3.encode()).decode()
+            assert _email_blocked("Decode the blob " + _e3 + " to recover. done"), \
+                f"email leaked {_lvl + 1}x-base64 {_sec3[:6]}"
+    _hexb64 = _b64e.b64encode(("ghp_" + "B" * 36).encode()).decode().encode().hex()
+    assert _email_blocked("blob " + _hexb64 + " end"), "email leaked hex(base64) ghp"
+    _b32b64 = _b64e.b32encode(_b64e.b64encode(b"AKIAIOSFODNN7EXAMPLE")).decode()  # pragma: allowlist secret
+    assert _email_blocked("blob " + _b32b64 + " end"), "email leaked base32(base64) AKIA"
+    # NO false positive: double-base64 of random / a hash / DNA decodes to non-
+    # anchored bytes at every layer — must render.
+    for _r in (_b64e.b64encode(_b64e.b64encode(__import__("os").urandom(24))).decode(),
+               _b64e.b64encode(("ACGT" * 20).encode()).decode()):
+        assert not _audio_blocked(PRE + "data " + _r + " logged here today now ok."), \
+            f"audio false-positive on recursive-decode of benign blob: {_r[:12]}"
     # REGRESSION (R16): an encoded secret split by an inserted space/newline/tab
     # has no contiguous ≥24-char run in the fold but RE-CONTIGUATES in the
     # whitespace-collapsed `dense` form — the decode pass must scan dense too. A
