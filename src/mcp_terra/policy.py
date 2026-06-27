@@ -22,6 +22,7 @@ import collections
 import contextlib
 import datetime
 import hashlib
+import decimal
 import hmac
 import json
 import math
@@ -127,6 +128,26 @@ def session_margin_sec() -> int:
     return max(60, min(m, 3600))
 
 
+def _is_positive_underflow(raw) -> bool:
+    """True if ``raw`` is a positive magnitude that float-underflows to exactly
+    0.0 — both the exponent form ('5e-400') AND a plain decimal ('0.000…01').
+
+    Uses Decimal for an EXACT magnitude check: the older float(mantissa-split)
+    heuristic missed non-exponent decimals (float('0.000…01') and float of the
+    pre-'e' substring are both 0.0), silently disabling a spend control the user
+    set. A literal zero ('0', '0.0', '0e5', '-0') is NOT an underflow.
+    """
+    try:
+        if float(raw) != 0.0:
+            return False
+    except (TypeError, ValueError):
+        return False
+    try:
+        return decimal.Decimal(str(raw).strip()) > 0
+    except (decimal.InvalidOperation, ValueError, TypeError):
+        return False
+
+
 def _spend_env_dollars(var: str, *, malformed_code: str, nonfinite_code: str,
                        what: str) -> float:
     """Parse a spend-control dollar/rate env var, FAILING CLOSED.
@@ -157,19 +178,13 @@ def _spend_env_dollars(var: str, *, malformed_code: str, nonfinite_code: str,
     # (e.g. '5e-400') parses finite but becomes exactly 0.0 — silently disabling
     # the control the user thought they set. A literal zero ('0', '0.0', '0e5')
     # or a negative value is still allowed to mean "off" (clamped below).
-    if v == 0.0:
-        _mant = raw.lower().split("e")[0]
-        try:
-            _mant_positive = float(_mant) > 0.0
-        except (TypeError, ValueError):
-            _mant_positive = False
-        if _mant_positive:
-            raise PolicyError(
-                f"{var} ({raw!r}) is a positive value too small to represent "
-                f"(underflows to 0); refusing rather than silently disabling the "
-                f"{what}.",
-                code=nonfinite_code,
-                user_action_required=f"set {var} to a normal finite amount, or unset it")
+    if _is_positive_underflow(raw):
+        raise PolicyError(
+            f"{var} ({raw!r}) is a positive value too small to represent "
+            f"(underflows to 0); refusing rather than silently disabling the "
+            f"{what}.",
+            code=nonfinite_code,
+            user_action_required=f"set {var} to a normal finite amount, or unset it")
     return max(0.0, v)
 
 

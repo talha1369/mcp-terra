@@ -594,8 +594,14 @@ def versioned_name(path: str, method: str = "timestamp") -> str:
     if method not in ("timestamp", "bak"):
         raise SafetyError(f"versioned_name method must be 'timestamp' or 'bak'; "
                           f"got {method!r}")
+    # A short random token after the timestamp makes every versioned name UNIQUE
+    # per call, so two concurrent versionings of the same object in the same
+    # second cannot collide on the destination — the move can never clobber an
+    # existing backup (closes the precheck→rename TOCTOU).
+    import secrets as _secrets
+    _uniq = _secrets.token_hex(3)
     ts = _iso_timestamp()
-    marker = ts if method == "timestamp" else f"BAK.{ts}"
+    marker = f"{ts}.{_uniq}" if method == "timestamp" else f"BAK.{ts}.{_uniq}"
     if "/" in path:
         head, tail = path.rsplit("/", 1)
         head += "/"
@@ -625,7 +631,24 @@ def version_existing_local(target: Path, method: str = "timestamp") -> Path:
             f"versioned name {versioned!r} already exists — refusing to overwrite. "
             f"Move or rename it manually outside the MCP."
         )
-    target.rename(versioned)
+    # Atomic NO-CLOBBER move: os.link refuses (FileExistsError) if the versioned
+    # name already exists, closing the precheck→rename TOCTOU that Path.rename
+    # would silently clobber on POSIX. Fall back to a guarded rename only where
+    # hardlinks are unsupported (then re-check existence right before the rename).
+    try:
+        os.link(target, versioned)
+        target.unlink()
+    except FileExistsError:
+        raise SafetyError(
+            f"versioned name {versioned!r} already exists — refusing to overwrite. "
+            f"Move or rename it manually outside the MCP."
+        )
+    except OSError:
+        if versioned.exists():
+            raise SafetyError(
+                f"versioned name {versioned!r} already exists — refusing to overwrite."
+            )
+        target.rename(versioned)
     _audit("version_existing_local", "WRITE-SAFE-RENAME",
            f"{target} → {versioned}  (method={method})")
     return versioned
@@ -783,7 +806,12 @@ def version_existing_bucket(gs_uri: str, method: str = "timestamp") -> str:
             f"versioned URI {versioned!r} already exists — refusing to overwrite. "
             f"Move or rename it manually outside the MCP."
         )
-    # gsutil mv = server-side rename (atomic enough). Data preserved at versioned name.
+    # gsutil mv = server-side rename; data preserved at the versioned name. The
+    # versioned name carries a per-call random token (see versioned_name), so the
+    # destination is unique and cannot pre-exist from a concurrent versioning of
+    # the same object — the move can never clobber an existing backup. (gsutil has
+    # no rm in this codebase by design, so a cp+rm no-clobber sequence is not an
+    # option; the unique destination is the no-clobber guarantee.)
     bk._run_gsutil(["mv", gs_uri, versioned], timeout=300.0)
     _audit("version_existing_bucket", "WRITE-SAFE-RENAME",
            f"{gs_uri} → {versioned}  (method={method})")

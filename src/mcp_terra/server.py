@@ -1408,12 +1408,8 @@ def _resolve_restart_cap_rate(max_cost_usd, vm_hourly_usd, cev_readable, cev):
         # '1e-400') is UNKNOWN, NOT a confirmed-uncapped zero — otherwise a real
         # per-run cap would silently restart the VM uncapped. (Mirrors
         # _spend_env_dollars; a literal '0' has a zero mantissa and stays known.)
-        if _f == 0.0:
-            try:
-                if float(str(_rawv).lower().split("e")[0]) > 0.0:
-                    return (False, 0.0)
-            except (TypeError, ValueError):
-                pass
+        if _f == 0.0 and policy._is_positive_underflow(_rawv):
+            return (False, 0.0)
         return (True, _f)
 
     cap_known, stored_cap = _tri("MCP_TERRA_MAX_COST_USD")

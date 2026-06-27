@@ -485,6 +485,36 @@ def _():
     # Invalid method
     must_raise(safety.versioned_name, safety.SafetyError, "foo.py", method="invalid")
 
+@case("G-Edge", "version_existing: unique backup names + no-clobber move (local)")
+def _():
+    import tempfile
+    import pathlib
+    # (a) UNIQUENESS: two calls for the same input must differ (per-call random
+    # token) so concurrent versionings of one object cannot collide on the dest.
+    a = safety.versioned_name("foo.py")
+    b = safety.versioned_name("foo.py")
+    assert a != b and a.endswith(".py") and b.endswith(".py"), "versioned names must be unique"
+    a2 = safety.versioned_name("gs://x/y/foo.py", method="bak")
+    b2 = safety.versioned_name("gs://x/y/foo.py", method="bak")
+    assert a2 != b2 and ".BAK." in a2, "bucket versioned names must be unique"
+    # (b) FUNCTIONAL move: original gone, content preserved at the versioned name.
+    d = pathlib.Path(tempfile.mkdtemp())
+    f = d / "nb.ipynb"; f.write_text("ORIGINAL")
+    v = safety.version_existing_local(f, method="bak")
+    assert not f.exists() and pathlib.Path(v).read_text() == "ORIGINAL"
+    # (c) NO-CLOBBER: if the versioned name already exists, REFUSE — never
+    # overwrite a backup or delete the source.
+    f2 = d / "nb2.ipynb"; f2.write_text("NEW")
+    fixed = d / "nb2.BAK.fixed.ipynb"; fixed.write_text("PRECIOUS")
+    _orig = safety.versioned_name
+    try:
+        safety.versioned_name = lambda *a, **k: str(fixed)
+        must_raise(safety.version_existing_local, safety.SafetyError, f2, method="bak")
+    finally:
+        safety.versioned_name = _orig
+    assert fixed.read_text() == "PRECIOUS", "existing backup must be untouched (no-clobber)"
+    assert f2.read_text() == "NEW", "source must remain when versioning refuses"
+
 @case("G-Edge", "Path(None) handled")
 def _():
     must_raise(safety.safe_local_read_path, (safety.SafetyError, TypeError), None)
@@ -955,6 +985,31 @@ def _():
     must_raise(nbr.sign_spec, ValueError, spec, "a" * 32)
     # 32 chars, only 4 unique → still fails
     must_raise(nbr.sign_spec, ValueError, spec, "abcd" * 8)
+
+@case("R-Hardening", "get_runner_secret enforces FULL strength (not just length) before any VM launch")
+def _():
+    import os as _os
+    from mcp_terra import notebook_runner as nbr
+    saved = _os.environ.get("MCP_TERRA_RUNNER_SECRET")
+    savedf = _os.environ.get("MCP_TERRA_RUNNER_SECRET_FILE")
+    try:
+        _os.environ.pop("MCP_TERRA_RUNNER_SECRET_FILE", None)
+        # length-OK (>=16) but WEAK secrets reach terra_create_runtime /
+        # terra_start_runner_on_vm via get_runner_secret; the runner verifies HMACs
+        # with this key, so it must enforce the FULL policy (>=32, >=12 unique,
+        # entropy), not just a 16-char floor — else a co-member can guess it.
+        for weak in ("a" * 20, "abcd" * 5, "x" * 31):   # short / low-unique / 31-char
+            _os.environ["MCP_TERRA_RUNNER_SECRET"] = weak
+            must_raise(nbr.get_runner_secret, RuntimeError)
+        # a strong secret passes
+        import secrets as _secrets
+        strong = _secrets.token_urlsafe(32)
+        _os.environ["MCP_TERRA_RUNNER_SECRET"] = strong
+        assert nbr.get_runner_secret() == strong
+    finally:
+        for k, v in (("MCP_TERRA_RUNNER_SECRET", saved), ("MCP_TERRA_RUNNER_SECRET_FILE", savedf)):
+            if v is None: _os.environ.pop(k, None)
+            else: _os.environ[k] = v
 
 @case("R-Hardening", "result-signature verification")
 def _():
@@ -5584,16 +5639,20 @@ def _():
         _os.environ["MCP_TERRA_VM_HOURLY_USD"] = "free"
         must_raise(policy.vm_hourly_usd, policy.PolicyError)
         _os.environ.pop("MCP_TERRA_VM_HOURLY_USD", None)
-        # float UNDERFLOW of a positive magnitude (e.g. '5e-400' → exactly 0.0)
-        # must FAIL CLOSED, not silently disable the control. Literal zero and
-        # negatives still mean "off" (clamp), and a tiny-but-representable
-        # subnormal stays a (useless but non-zero) positive value.
-        for val in ("5e-400", "1e-400", "9e-999"):
+        # float UNDERFLOW of a positive magnitude must FAIL CLOSED, not silently
+        # disable the control — in BOTH the exponent form ('5e-400') AND a plain
+        # NON-EXPONENT decimal ('0.000…01'), which the old float(mantissa-split)
+        # guard missed (float of the pre-'e' substring was 0.0). Literal zero and
+        # negatives still mean "off" (clamp); a representable tiny positive stays.
+        for val in ("5e-400", "1e-400", "9e-999", "0." + "0" * 400 + "1", "." + "0" * 350 + "9"):
             _os.environ["MCP_TERRA_MAX_COST_USD"] = val
             must_raise(policy.max_cost_usd, policy.PolicyError)
-        for off in ("0", "0.0", "0e5", "-1", "-5e-400"):
+        for off in ("0", "0.0", "0e5", "0.000", "-1", "-5e-400"):
             _os.environ["MCP_TERRA_MAX_COST_USD"] = off
             assert policy.max_cost_usd() == 0.0, "literal-zero/negative must clamp to off: %s" % off
+        # a representable tiny positive (1e-300) is NOT an underflow → kept, not raised
+        _os.environ["MCP_TERRA_MAX_COST_USD"] = "1e-300"
+        assert policy.max_cost_usd() > 0.0, "representable tiny positive must not be rejected"
         _os.environ.pop("MCP_TERRA_MAX_COST_USD", None)
         # unset / empty / whitespace are still a legit "off" → 0.0, never raise
         _os.environ.pop("MCP_TERRA_BUDGET_USD", None)

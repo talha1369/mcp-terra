@@ -217,11 +217,15 @@ def get_runner_secret() -> str:
             "and set both this env var (in the MCP) AND the same value in "
             "the runner script's env on the Terra VM."
         )
-    if len(secret) < 16:
-        raise RuntimeError(
-            f"MCP_TERRA_RUNNER_SECRET is only {len(secret)} chars; minimum 16. "
-            f"Refusing to use a weak secret."
-        )
+    # Enforce the FULL strength policy (≥32 chars, ≥12 unique, entropy) — NOT just
+    # a length floor. terra_create_runtime / terra_start_runner_on_vm call this
+    # before installing/launching the on-VM runner, and the runner verifies HMACs
+    # with this key; a weak key lets a workspace co-member guess it and sign job
+    # specs the runner will execute. Same bar as install.sh.
+    try:
+        _validate_secret_strength(secret)
+    except ValueError as _e:
+        raise RuntimeError(f"MCP_TERRA_RUNNER_SECRET is too weak: {_e}") from _e
     return secret
 
 
