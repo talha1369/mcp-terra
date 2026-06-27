@@ -62,7 +62,7 @@
 
   <!-- arrows: labels CENTERED over each arrow span, well clear of the boxes -->
   <path class="arr" d="M252,158 H340" marker-end="url(#ah)"/>
-  <text x="296" y="149" class="mono lbl" text-anchor="middle">MCP stdio</text>
+  <text x="296" y="149" class="mono lbl" text-anchor="middle">MCP (stdio)</text>
 
   <path class="arr" d="M644,129 H864" marker-end="url(#ah)"/>
   <text x="754" y="120" class="mono lbl" text-anchor="middle">gcloud OAuth · user identity</text>
