@@ -179,13 +179,17 @@ def _validate_secret_strength(secret, _depth: int = 0) -> None:
     # A hex/base32 string that DECODES to mostly-printable ASCII is an ENCODING of
     # human text (rockyou-class keyspace), NOT random bytes: random token_hex
     # decodes to ~37% printable, an encoded phrase to ~100%. When that happens we
-    # deny the format exemption AND validate the DECODED plaintext as the effective
-    # secret with the FULL strength policy (length/unique/entropy/walk/periodicity/
-    # common/placeholder) — so an encoded weak/famous/walk/short phrase is rejected
-    # in ANY encoding, just like typing it would be (denying the exemption alone is
-    # a no-op for base32, whose 5-bit expansion keeps the wrapper high-entropy).
-    # Real openssl-rand-hex / token_hex / base32 output decodes to random bytes
-    # (~37% printable) and is unaffected. Undecodable (e.g. odd-length hex) → deny.
+    # deny the format exemption AND validate the encoded human text as the effective
+    # secret — so an encoded weak/famous/walk/short phrase is rejected in ANY
+    # encoding, just like typing it would be (denying the exemption alone is a
+    # no-op for base32, whose 5-bit expansion keeps the wrapper high-entropy).
+    # We do NOT use a whole-string printable RATIO (an attacker dilutes it by
+    # zero-padding a phrase to a cipher block size). Instead we extract the
+    # CONTIGUOUS printable runs from the decoded bytes: a real encoded phrase is a
+    # long printable run even when NUL/control-padded, while a random key
+    # (~37% printable, scattered) has no long run. Each long run is validated with
+    # the FULL strength policy, and every run is screened for famous/placeholder
+    # phrases. Undecodable (e.g. odd-length hex) → deny.
     if _fmt_strong:
         _decoded = None
         try:
@@ -197,19 +201,24 @@ def _validate_secret_strength(secret, _depth: int = 0) -> None:
         except ValueError:   # binascii.Error subclasses ValueError; odd-length hex
             _fmt_strong = False
         if _decoded:
-            _printable = sum(1 for _b in _decoded if 0x20 <= _b <= 0x7e) / len(_decoded)
-            # Encoded human text is ~100% printable; random bytes ~37%. Use a HIGH
-            # threshold (0.85) so a real generated key whose random bytes happen to
-            # be mostly-printable is not mistaken for an encoded phrase.
-            if _printable >= 0.85:
-                _fmt_strong = False   # encoded text, not random bytes → no exemption
-                try:
-                    _validate_secret_strength(_decoded.decode("latin-1"), _depth=1)
-                except ValueError as _e:
+            _runs = _re_fmt.findall(rb"[\x20-\x7e]{8,}", _decoded)
+            _joined_low = b" ".join(_runs).decode("ascii", "replace").lower()
+            for _w in _SECRET_COMMON + _SECRET_PLACEHOLDER:
+                if _w in _joined_low:
                     raise ValueError(
-                        f"MCP_TERRA_RUNNER_SECRET is a hex/base32 encoding of a weak "
-                        f"secret ({_e}). Use python -c "
+                        f"MCP_TERRA_RUNNER_SECRET is a hex/base32 encoding of a "
+                        f"weak/known phrase ({_w!r} after decoding). Use python -c "
                         f"'import secrets; print(secrets.token_urlsafe(32))'.")
+            for _rb in _runs:
+                if len(_rb) >= 16:
+                    _fmt_strong = False  # encodes human text, not random key bytes
+                    try:
+                        _validate_secret_strength(_rb.decode("ascii"), _depth=1)
+                    except ValueError as _e:
+                        raise ValueError(
+                            f"MCP_TERRA_RUNNER_SECRET is a hex/base32 encoding of a "
+                            f"weak secret ({_e}). Use python -c "
+                            f"'import secrets; print(secrets.token_urlsafe(32))'.")
     # Character-diversity floor: ≥12 unique for a general secret; a recognized
     # strong-format key draws from a smaller alphabet, so a lower floor is
     # correct. It is set to 11 (not lower): a real token_hex(16) clears it

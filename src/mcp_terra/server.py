@@ -2501,8 +2501,19 @@ def terra_send_run_report_email(subject: str, body: str, job_id: str,
     back to writing an .eml file under ~/.mcp-terra/reports/ (mode 0o600)
     and returning the path for manual delivery.
     """
+    # SECRET SCAN BEFORE THE AUDIT (security review): _pre() writes its detail to
+    # the policy audit log + stderr. A subject/body/ack carrying a secret (AWS /
+    # GitHub / Slack / PEM / ya29, plain or homoglyph-smuggled) must be refused
+    # BEFORE it can be logged, and the audit detail itself must be content-free.
+    try:
+        email_send._validate_inputs(subject, body, job_id, verification_acknowledgment)
+    except email_send.EmailError as e:
+        raise PermissionError(safety.sanitize_output(str(e)))
+    import hashlib as _hl
+    _subj_sha8 = _hl.sha256(subject.encode("utf-8", "replace")).hexdigest()[:8]
     _pre("terra_send_run_report_email", WRITE_SAFE,
-         f"job={job_id} subject={subject[:80]!r} attach_audio={attach_audio}")
+         f"job={job_id} subject_len={len(subject)} subject_sha8={_subj_sha8} "
+         f"attach_audio={attach_audio}")
 
     # Optionally attach the run's OWN audio explainer. The path is derived from
     # job_id + the locked bucket and fixed to summary.{m4a,mp3} — the agent

@@ -1100,17 +1100,24 @@ def _():
     # rejected — denying the format exemption is a no-op for base32 (5-bit
     # expansion keeps the wrapper high-entropy), so the DECODED plaintext is
     # validated with the FULL policy; PADDED base32 must not slip past the format
-    # regex either. (Codex + audit pass-8 findings.)
+    # regex either, and NUL/control padding must not dilute the screen.
     import base64 as _b64
     for _phrase in (b"correcthorsebatterystaple", b"ChangeThisSecretBeforeProd1",
                     b"tobeornottobethatisquestion", b"abcdefghijklmnopqrstuvwx",
-                    b"ChangeThisSecret"):
+                    b"ChangeThisSecret", b"password123", b"iloveyou2024"):
         for _enc in (_b64.b32encode(_phrase).decode(),              # PADDED base32
                      _b64.b32encode(_phrase).decode().rstrip("="),  # unpadded base32
                      _phrase.hex()):                                # hex
             must_raise(nbr._validate_secret_strength, ValueError, _enc)
-    # real random (padded) base32 secrets are NOT broadly rejected — only the
-    # ~1e-4 case where random bytes happen to decode mostly-printable.
+        # NUL/control PADDING (zero-pad-to-block-size KDF pattern) must NOT dilute
+        # the screen — the printable run is extracted regardless of overall ratio.
+        for _blk in (16, 24, 32):
+            _padded = _phrase.ljust(((len(_phrase) + _blk - 1) // _blk) * _blk, b"\x00")
+            must_raise(nbr._validate_secret_strength, ValueError,
+                       _b64.b32encode(_padded).decode())
+            must_raise(nbr._validate_secret_strength, ValueError, _padded.hex())
+    # real random (padded) base32 secrets are NOT broadly rejected (random bytes
+    # have no long contiguous printable run).
     b32rej = sum(1 for _ in range(3000)
                  if _raises(nbr._validate_secret_strength, ValueError,
                             _b64.b32encode(_secrets.token_bytes(16)).decode()))
@@ -1148,9 +1155,9 @@ def _():
 
 @case("R-Hardening", "runner ENFORCES secret-strength at startup (trust boundary, not just MCP-side)")
 def _():
-    # Codex finding: the runner is the HMAC trust boundary; a manually/legacy-
-    # started runner with a weak secret lets a co-member forge signed specs. The
-    # rendered runner must embed the REAL strength validator and fail closed.
+    # The runner is the HMAC trust boundary; a manually/legacy-started runner
+    # with a weak secret lets a co-member forge signed specs. The rendered runner
+    # must embed the REAL strength validator and fail closed.
     import os as _os
     import re as _re
     import secrets as _secrets
@@ -2355,6 +2362,19 @@ def _():
     hits = secret_scan.scan_bytes(b"export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n")
     assert any(h["pattern"] == "aws_access_key_id" for h in hits)
 
+@case("Y-SecretScan", "AWS secret access key blocks upload — quoted, UNQUOTED, and ':' separator")
+def _():
+    from mcp_terra import secret_scan
+    KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"  # pragma: allowlist secret
+    for line in (
+        f'AWS_SECRET_ACCESS_KEY="{KEY}"',            # quoted
+        f"AWS_SECRET_ACCESS_KEY={KEY}",              # UNQUOTED .env (was missed)
+        f"aws_secret_access_key: {KEY}",             # YAML ':' separator
+    ):
+        hits = secret_scan.scan_bytes(line.encode())
+        assert any(h["pattern"] == "aws_secret_key_assignment" for h in hits), \
+            f"missed AWS secret key in: {line[:32]!r}"
+
 @case("Y-SecretScan", "PEM private-key header blocks upload")
 def _():
     from mcp_terra import secret_scan
@@ -2702,12 +2722,23 @@ def _():
     for name, tok in {**plain, "akia_armenian": akia_homo}.items():
         assert _audio_blocked(PRE + tok + " end"), f"audio leaked {name}"
         assert _email_blocked(f"results {tok}"), f"email leaked {name}"
-    # Greek look-alike letters smuggled INSIDE a token body (χ→x, ε→e, τ→t) must
-    # still be CAUGHT (they fold to Latin so the byte-scan recovers the token).
-    for gtok in ("ya29." + "A" * 5 + "χ" + "A" * 18,
-                 "ya29." + "A" * 5 + "ε" + "A" * 18):
-        assert _audio_blocked(PRE + gtok + " end"), f"audio leaked greek-token {gtok!r}"
-        assert _email_blocked(f"results {gtok}"), f"email leaked greek-token {gtok!r}"
+    # Greek look-alike letters smuggled INSIDE a token body (χ→x, ε→e, lunate
+    # sigma ϲ→c) fold to Latin so the byte-scan recovers the token. Coptic
+    # capitals (Ⲣ/P …) and a digit-free homoglyph are caught by the script-
+    # agnostic backstop (no ASCII-digit requirement). All must be CAUGHT.
+    homo_secrets = (
+        "ya29." + "A" * 5 + "χ" + "A" * 18,        # Greek chi in body
+        "ya29." + "A" * 5 + "ϲ" + "A" * 18,        # Greek lunate sigma in body
+        "ghp_" + "Ⲣ" * 4 + "a" * 32,               # Coptic capitals, DIGIT-FREE
+        "AKIA" + "Օ" + "PQRSTUVWXYZL" + "Օ" + "MN",  # Armenian O, DIGIT-FREE  # pragma: allowlist secret
+    )
+    for gtok in homo_secrets:
+        assert _audio_blocked(PRE + gtok + " end"), f"audio leaked homoglyph {gtok!r}"
+        assert _email_blocked(f"results {gtok}"), f"email leaked homoglyph {gtok!r}"
+    # legit AWS secret-key assignment UNQUOTED (.env style) must be blocked too
+    aws_env = "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"  # pragma: allowlist secret
+    assert _audio_blocked(PRE + aws_env + " end"), "audio leaked unquoted AWS secret key"
+    assert _email_blocked("results " + aws_env), "email leaked unquoted AWS secret key"
     # NO false positive: legit lowercase-Greek scientific identifiers (β/γ/μ/λ/δ/σ)
     # with digits — common nomenclature — must render in BOTH channels.
     for ok in ("Expression of TGFβ1-2024-batch7 rose; IFNγ-clone-2024-rev3 was stable here.",
@@ -2721,6 +2752,21 @@ def _():
            "有意な結果であり今後の研究に重要である。")
     assert not _audio_blocked(cjk), "audio false-positive on CJK+glued Latin gene-ID"
     assert not _email_blocked("Result summary " + cjk[:12]), "email false-positive on CJK"
+
+
+@case("BB-AudioSummary", "send_run_report_email secret-scans BEFORE _pre and audits content-free")
+def _():
+    # A secret-bearing subject must be refused BEFORE _pre() writes it to the
+    # audit log/stderr, and the audit detail must carry a hash/length — not the
+    # raw subject text. (Source-level: the behavioral path needs SMTP/auth.)
+    import inspect as _insp
+    src = _insp.getsource(server.terra_send_run_report_email)
+    i_validate = src.index("_validate_inputs(")
+    i_pre = src.index('_pre("terra_send_run_report_email"')
+    assert i_validate < i_pre, "secret scan (_validate_inputs) must run BEFORE _pre()"
+    # the audit detail must NOT include the raw subject; only a length + hash
+    assert "subject={subject" not in src and "subject[:80]" not in src
+    assert "subject_len=" in src and "subject_sha8=" in src
 
 
 # ──────────────────────────────────────────────────────────────────────────

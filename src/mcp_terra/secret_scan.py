@@ -39,9 +39,11 @@ _PATTERNS: list[tuple[str, re.Pattern[bytes], str]] = [
     # Slack bot/user tokens.
     ("slack_token",
      re.compile(rb"\bxox[abprs]-[A-Za-z0-9-]{10,}\b"), "HIGH"),
-    # Generic "AKIAI…secretKey =" assignment style (best-effort).
+    # AWS secret access key assignment. Quotes are OPTIONAL (common `.env` style
+    # `AWS_SECRET_ACCESS_KEY=wJalr…` is unquoted) and the separator may be `=` or
+    # `:` (YAML/JSON). The 40-char base64 value is the AWS secret-key shape.
     ("aws_secret_key_assignment",
-     re.compile(rb"aws_secret_access_key\s*=\s*['\"][A-Za-z0-9/+=]{40}['\"]",
+     re.compile(rb"aws_secret_access_key\s*[:=]\s*[\"']?[A-Za-z0-9/+=]{40}",
                 re.IGNORECASE),
      "CRITICAL"),
     # PEM certificate is NOT a secret — explicitly NOT matched.
@@ -105,18 +107,26 @@ _CONFUSABLES: dict[str, str] = {
     "ʏ": "y", "ᴢ": "z",
     # Cherokee / Lisu Latin-look-alikes (a few demonstrated confusables)
     "Ꭺ": "A", "ꓮ": "A",
+    # Greek/Coptic symbol-variant Latin look-alikes: lunate sigma ϲ/Ϲ and final
+    # sigma ς render as 'c', lunate epsilon ϵ as 'e', beta symbol ϐ as 'b', rho
+    # symbol ϱ as 'p' — fold so the byte-scan recovers a token using them.
+    "ϲ": "c", "Ϲ": "C", "ς": "c", "ϵ": "e", "ϐ": "b", "ϱ": "p",
 }
 _CONFUSABLE_TABLE = {ord(k): v for k, v in _CONFUSABLES.items()}
 
-# Greek + Coptic letter ranges. These are GENUINE prose/science letters (β, γ, μ,
-# λ in 'TGFβ1', '5μM', 'HLA-DRβ1') — NOT homoglyph attacks (β does not look like
-# any [A-Za-z0-9]). The few Greek letters that ARE Latin look-alikes (ο, α, ρ, …)
-# are folded by _CONFUSABLE_TABLE above and caught by the byte-scan, so the
-# homoglyph backstop must NOT treat a residual Greek letter as suspicious.
-def _is_greek_or_coptic(ch: str) -> bool:
-    o = ord(ch)
-    return (0x0370 <= o <= 0x03FF or 0x1F00 <= o <= 0x1FFF
-            or 0x2C80 <= o <= 0x2CFF)
+# GENUINE science Greek letters that are NOT Latin look-alikes (δ θ λ ξ π σ …),
+# excluded from the homoglyph backstop so 'TGFβ1' / 'λmax-2024' / 'δ13C' / a
+# 'σ-factor' render. The Latin-LOOK-ALIKE Greek (α β ε ο ρ τ χ μ … and lunate
+# sigma ϲ) are instead MAPPED to ASCII by _CONFUSABLE_TABLE above, so they fold
+# and are caught by the byte-scan — they are deliberately NOT in this set.
+# Coptic is NOT here: its capitals are pure Latin look-alikes, so the backstop
+# must still flag them. This is an explicit allow-set, NOT a whole-block range,
+# precisely so a Latin-look-alike inside the Greek/Coptic blocks is never excused.
+_GREEK_SCIENCE = frozenset(
+    "δθλξπσφψζ"        # lowercase non-look-alike (α β γ ε η ι κ μ ν ο ρ τ υ χ ω
+                       #   and ς are mapped → not residual → not needed here)
+    "ΓΔΘΛΞΠΣΦΨΩ"       # uppercase non-look-alike
+    "ϑϕϖϰ")            # math symbol variants (theta/phi/pi/kappa symbols)
 
 
 # Codepoint categories stripped before scanning: zero-width / format / control /
@@ -180,13 +190,14 @@ def has_homoglyph_token_shape(text: str) -> bool:
         full-width forms to ASCII;
       • the confusable map + a small Latin-extras map collapse the remaining
         legitimate Latin-ish letters (α, ø, ß, small-caps, …) to ASCII;
-      • GENUINE Greek/Coptic science letters (β, γ, μ, λ in 'TGFβ1', '5μM') are
-        NOT homoglyph attacks and are excluded from the suspicious test;
-      • a run is flagged only when it is PREDOMINANTLY ASCII (≥50% token chars),
-        carries an ASCII digit, AND still holds a non-ASCII NON-Greek letter —
-        i.e. the mostly-ASCII shape of a real token with a few homoglyph subs.
-        A CJK / Arabic / Devanagari summary is predominantly NON-ASCII, so it is
-        never flagged (CJK has no spaces, so this precision is essential).
+      • GENUINE science Greek letters (δ θ λ μ … in 'TGFβ1', '5μM', 'λmax') are
+        allow-listed (NOT the whole Greek/Coptic block, so a Latin-look-alike
+        like lunate sigma or a Coptic capital is still caught);
+      • a run is flagged when it is PREDOMINANTLY ASCII (≥50% token chars) and
+        still holds a suspect non-ASCII letter — the mostly-ASCII shape of a real
+        token with homoglyph substitutions. Script-AGNOSTIC: no per-script map is
+        required to catch a smuggled letter. CJK/Arabic/Devanagari prose is
+        predominantly NON-ASCII (or ideographic-excluded), so it is never flagged.
     """
     import unicodedata as _ud
     t = _ud.normalize("NFKD", text)
@@ -195,23 +206,30 @@ def has_homoglyph_token_shape(text: str) -> bool:
     t = t.translate(_CONFUSABLE_TABLE).translate(_LATIN_EXTRAS_TABLE)
 
     def _suspect(c: str) -> bool:
-        # A residual letter counts as a homoglyph SUSPECT only if it is a
-        # narrow, non-Greek, non-ideographic letter. Greek/Coptic are genuine
-        # science notation (β, μ, λ); WIDE/ideographic letters (Han, Hiragana,
-        # Katakana, Hangul — East_Asian_Width W/F) are NOT [A-Za-z] look-alikes
-        # and appear glued to Latin gene-IDs in CJK research prose, so excluding
-        # them prevents a false positive on legitimate CJK summaries.
+        # A residual letter is a homoglyph SUSPECT unless it is a genuine-science
+        # Greek letter (δ θ λ μ…, allow-listed) or a WIDE/ideographic letter
+        # (Han/Hiragana/Katakana/Hangul, East_Asian_Width W/F — NOT [A-Za-z]
+        # look-alikes; they appear glued to Latin gene-IDs in CJK research prose).
+        # Everything else non-ASCII left after NFKD + the confusable/Latin-extras
+        # folds (Cyrillic/Greek/Armenian/Coptic/small-caps/… look-alikes) is
+        # treated as a smuggled homoglyph — this is script-AGNOSTIC, so an
+        # unmapped Latin-look-alike from ANY script is still caught.
         return (ord(c) > 127 and _ud.category(c)[0] == "L"
-                and not _is_greek_or_coptic(c)
+                and c not in _GREEK_SCIENCE
                 and _ud.east_asian_width(c) not in ("W", "F"))
 
     def _flag(r: str) -> bool:
+        # A real OAuth/cloud token is PURE ASCII, so a predominantly-ASCII
+        # (≥50%) run of >=16 token chars that still holds a suspect non-ASCII
+        # letter is a homoglyph-smuggled token shape. No ASCII-digit requirement:
+        # digit-free secrets (AWS AKIA, GitHub/Slack/PEM signatures) must be
+        # caught too, and the legit cases a digit-gate used to protect (accented
+        # Latin, German umlaut compounds, CJK) are already handled by NFKD-collapse
+        # + the EAW/Greek-science exclusions above.
         if len(r) < 16:
             return False
         ascii_tok = sum(1 for c in r if c in _ASCII_TOKEN_CHARS)
-        has_digit = any(c in "0123456789" for c in r)
-        has_nonascii_letter = any(_suspect(c) for c in r)
-        return has_digit and has_nonascii_letter and ascii_tok / len(r) >= 0.5
+        return any(_suspect(c) for c in r) and ascii_tok / len(r) >= 0.5
 
     run: list[str] = []
     for ch in t:
