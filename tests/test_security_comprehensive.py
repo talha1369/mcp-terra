@@ -4742,20 +4742,16 @@ def _():
     import tempfile
     from mcp_terra import policy as _p, bucket as _bk2
     SENTINEL = "gs://fc-secure-x/NA12878-secret/out.bam"
-    import hashlib as _hl3
-    import base64 as _b64_3
     o_up, o_safe, o_exist, o_run = (_bk2.upload_file, safety.safe_bucket_uri,
                                     safety.bucket_object_exists, _bk2._run_gsutil)
-    _payload = b"clean upload payload, no secrets\n"
-    _exp_md5 = _b64_3.b64encode(_hl3.md5(_payload).digest()).decode()
     _bk2.upload_file = lambda *a, **k: f"Copying file://x [Content-Type=...]\n{SENTINEL}\n"
     safety.safe_bucket_uri = lambda u: u
     safety.bucket_object_exists = lambda u: False
-    # stub the read-back stat to report OUR bytes landed (md5 match) so the new
-    # upload-verification passes; this test is about the controlled-mode ACK.
-    _bk2._run_gsutil = lambda args, **k: f"Hash (md5):  {_exp_md5}\nContent-Length: {len(_payload)}\n"
+    # both the local `gsutil hash` and the dest `gsutil stat` return the SAME
+    # content hashes, so the read-back verify passes; this test is about the ACK.
+    _bk2._run_gsutil = lambda args, **k: "Hash (crc32c):\t\tAAAAAA==\nHash (md5):\t\tBBBBBB==\n"
     fd, tmp = tempfile.mkstemp(suffix=".txt")
-    _os.write(fd, _payload)
+    _os.write(fd, b"clean upload payload, no secrets\n")
     _os.close(fd)
     restore = _write_guards_on(_p)
     try:
@@ -4778,9 +4774,14 @@ def _():
     _bk2.upload_file = lambda *a, **k: "Copying file://x\n"
     safety.safe_bucket_uri = lambda u: u
     safety.bucket_object_exists = lambda u: False
-    # simulate a raced `cp -n` skip: the destination holds DIFFERENT bytes than our
-    # local file (md5 + size both mismatch) → verification must FAIL CLOSED.
-    _bk2._run_gsutil = lambda args, **k: "Hash (md5):  ZZZZtamperedZZZZ==\nContent-Length: 999999\n"
+    # simulate a raced `cp -n` skip: the local `gsutil hash` and the dest `gsutil
+    # stat` return DIFFERENT content hashes (md5 AND crc32c) → verification must
+    # FAIL CLOSED, even though the destination object exists.
+    def _run_mismatch(args, **k):
+        if args and args[0] == "hash":
+            return "Hash (crc32c):\t\tLOCALAAAA==\nHash (md5):\t\tLOCALBBBB==\n"
+        return "Hash (crc32c):\t\tDESTZZZZ==\nHash (md5):\t\tDESTYYYY==\n"
+    _bk2._run_gsutil = _run_mismatch
     fd, tmp = tempfile.mkstemp(suffix=".ipynb")
     _os.write(fd, b"the fixed notebook the agent thinks it uploaded\n")
     _os.close(fd)
