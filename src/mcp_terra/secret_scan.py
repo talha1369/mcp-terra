@@ -232,16 +232,21 @@ def has_homoglyph_token_shape(text: str) -> bool:
     fold = orig.translate(_CONFUSABLE_TABLE).translate(_LATIN_EXTRAS_TABLE)
 
     def _suspect(c: str) -> bool:
-        # A residual letter is a homoglyph SUSPECT unless it is a genuine-science
-        # Greek letter (δ θ λ μ…, allow-listed) or a WIDE/ideographic letter
-        # (Han/Hiragana/Katakana/Hangul, East_Asian_Width W/F — NOT [A-Za-z]
-        # look-alikes; they appear glued to Latin gene-IDs in CJK research prose).
-        # Everything else non-ASCII left after NFKD + the confusable/Latin-extras
-        # folds (Cyrillic/Greek/Armenian/Coptic/small-caps/… look-alikes) is a
-        # smuggled-homoglyph candidate — script-AGNOSTIC.
+        # A residual letter is a homoglyph SUSPECT unless it is:
+        #  • a genuine-science Greek letter (δ θ λ μ…, allow-listed); or
+        #  • a WIDE/ideographic letter (Han/Hiragana/Katakana/Hangul, EAW W/F —
+        #    not [A-Za-z] look-alikes; glued to Latin gene-IDs in CJK prose); or
+        #  • a LATIN-script letter (Unicode name starts 'LATIN') — these are legit
+        #    extended-Latin orthography (Azerbaijani schwa ə, Hausa/Fula hook
+        #    letters ɓ/ɗ/ɛ/ɔ, accented letters) that have no ASCII decomposition;
+        #    the Latin-script letters that ARE homoglyph vectors (small-caps,
+        #    phonetic) are already mapped by the fold, so they never reach here.
+        # Cross-script confusables (Cyrillic/Armenian/Coptic/… not in the fold)
+        # remain suspects — that is the actual smuggling vector.
         return (ord(c) > 127 and _ud.category(c)[0] == "L"
                 and c not in _GREEK_SCIENCE
-                and _ud.east_asian_width(c) not in ("W", "F"))
+                and _ud.east_asian_width(c) not in ("W", "F")
+                and not _ud.name(c, "").startswith("LATIN"))
 
     def _is_run_char(c: str) -> bool:
         return (c in _ASCII_TOKEN_CHARS
@@ -358,54 +363,69 @@ def scan_egress(text: str) -> list[dict]:
     # anchored patterns. Decoding ordinary text/hashes yields random bytes that
     # match no anchored pattern, so this adds no false positive. Bounded to keep
     # it cheap on large summaries.
+    # Process EVERY distinct candidate (no count cap that an attacker could push
+    # the real secret past with junk fillers — that was a bypass). The input is
+    # already length-bounded by the callers (audio ≤4000 chars, email ≤64 KiB);
+    # bound the total decoded volume and FAIL CLOSED on pathological volume.
     _seen: set = set()
+    _total = 0
     for _m in re.finditer(r"[A-Za-z0-9+/=_-]{24,}", fold):
         _b = _m.group(0)
-        if _b in _seen:
+        if _b in _seen or len(_b) > 200000:
             continue
         _seen.add(_b)
-        if len(_seen) > 200 or len(_b) > 100000:
-            if len(_seen) > 200:
-                break
-            continue
         for _dec in _try_decode(_b):
             if _dec:
+                _total += len(_dec)
                 hits += scan_bytes(_dec, "egress-decoded")
+        if _total > 4_000_000:   # pathological encoded volume → refuse (fail closed)
+            hits.append({"pattern": "egress_decode_volume", "severity": "HIGH",
+                         "source": "egress", "offset": 0,
+                         "context": "…[REDACTED—excessive encoded content]…"})
+            break
     return hits
 
 
 def _try_decode(blob: str) -> list[bytes]:
     """Return decoded-byte candidates for hex / base64 / base64url / base32
-    interpretations of `blob` (only those long enough to plausibly hold a
-    secret). Failures are skipped. Used by scan_egress to catch ENCODED secrets."""
+    interpretations of `blob`. For each encoding, also tries the alignment offsets
+    a glued prefix (e.g. `key=<base64>`) would introduce — so an encoded secret
+    glued to a preceding word/key still decodes. Failures are skipped."""
     import base64 as _b64
     import binascii as _ba
     out: list[bytes] = []
     b = blob.encode("ascii", "ignore")
     _hx = re.sub(rb"[^0-9a-fA-F]", b"", b)
-    if len(_hx) >= 40 and len(_hx) % 2 == 0:
-        try:
-            out.append(bytes.fromhex(_hx.decode("ascii")))
-        except ValueError:
-            pass
+    for _off in (0, 1):                       # even-length alignment
+        _s = _hx[_off:]
+        if len(_s) >= 40 and len(_s) % 2 == 0:
+            try:
+                out.append(bytes.fromhex(_s.decode("ascii")))
+            except ValueError:
+                pass
     _b64s = re.sub(rb"[^A-Za-z0-9+/]", b"", b)
-    if len(_b64s) >= 24:
-        try:
-            out.append(_b64.b64decode(_b64s + b"=" * (-len(_b64s) % 4)))
-        except (ValueError, _ba.Error):
-            pass
     _b64u = re.sub(rb"[^A-Za-z0-9_-]", b"", b)
-    if len(_b64u) >= 24:
-        try:
-            out.append(_b64.urlsafe_b64decode(_b64u + b"=" * (-len(_b64u) % 4)))
-        except (ValueError, _ba.Error):
-            pass
+    for _off in range(4):                      # base64 is 4-char aligned
+        _s = _b64s[_off:]
+        if len(_s) >= 24:
+            try:
+                out.append(_b64.b64decode(_s + b"=" * (-len(_s) % 4)))
+            except (ValueError, _ba.Error):
+                pass
+        _su = _b64u[_off:]
+        if len(_su) >= 24:
+            try:
+                out.append(_b64.urlsafe_b64decode(_su + b"=" * (-len(_su) % 4)))
+            except (ValueError, _ba.Error):
+                pass
     _b32 = re.sub(rb"[^A-Za-z2-7]", b"", b).upper()
-    if len(_b32) >= 32:
-        try:
-            out.append(_b64.b32decode(_b32 + b"=" * (-len(_b32) % 8)))
-        except (ValueError, _ba.Error):
-            pass
+    for _off in range(8):                      # base32 is 8-char aligned
+        _s = _b32[_off:]
+        if len(_s) >= 32:
+            try:
+                out.append(_b64.b32decode(_s + b"=" * (-len(_s) % 8)))
+            except (ValueError, _ba.Error):
+                pass
     return out
 
 

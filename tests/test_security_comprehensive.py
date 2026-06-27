@@ -1105,6 +1105,19 @@ def _():
     import base64 as _b642
     must_raise(nbr._validate_secret_strength, ValueError,
                _b642.b32encode(b"correct horse battery staple 1234").decode())
+    # BASE64 / BASE64URL of a famous/placeholder phrase must ALSO be rejected
+    # (sibling of hex/base32) — while real token_urlsafe (base64url random) passes.
+    for _ph in (b"correct horse battery staple!!!!", b"ChangeThisSecretBeforeProduction",
+                b"to be or not to be that is quest"):
+        must_raise(nbr._validate_secret_strength, ValueError,
+                   _b642.b64encode(_ph).decode())
+        must_raise(nbr._validate_secret_strength, ValueError,
+                   _b642.urlsafe_b64encode(_ph).decode())
+    # real random base64 / base64url secrets are NOT broadly rejected
+    _b64rej = sum(1 for _ in range(3000)
+                  if _raises(nbr._validate_secret_strength, ValueError,
+                             _b642.b64encode(_secrets.token_bytes(24)).decode()))
+    assert _b64rej < 30, f"random base64 secrets broadly false-rejected {_b64rej}/3000"
 
     def _nul_interleave(_b, _grp):
         _o = bytearray()
@@ -2836,12 +2849,26 @@ def _():
                  _b64e.b32encode(_tok.encode()).decode()):
         assert _audio_blocked(PRE + "result " + _enc + " done"), f"audio leaked encoded secret {_enc[:12]}"
         assert _email_blocked("result " + _enc + " done"), f"email leaked encoded secret {_enc[:12]}"
+    # GLUED to a preceding key/word (key=<b64>, JSON "k":"<b64>") must still be
+    # caught (decode alignment offsets), and a JUNK-FILLER prefix must NOT disable
+    # the decode pass for a real secret after it.
+    _eb = _b64e.b64encode(_tok.encode()).decode()
+    for _glue in ("key=" + _eb, 'id_' + _eb, '{"k":"' + _eb + '"}'):
+        assert _email_blocked("config " + _glue), f"email leaked glued encoded secret {_glue[:10]}"
+    _junk = " ".join(_b64e.b64encode(__import__("os").urandom(18)).decode() for _ in range(250))
+    assert _email_blocked(_junk + " " + _eb), "email leaked encoded secret after junk fillers"
     # NO false positive: a legit SHA-256 hash (64 hex) in a summary decodes to
     # random bytes (no secret pattern) — must render.
     import hashlib as _hl
     _withhash = PRE + "run hash " + _hl.sha256(b"x").hexdigest() + " completed fine here today now."
     assert not _audio_blocked(_withhash), "audio false-positive on a SHA-256 hash"
     assert not _email_blocked(_withhash[:60]), "email false-positive on a SHA-256 hash"
+    # NO false positive: extended-Latin orthography (Azerbaijani schwa ə, Hausa
+    # hook ɓ/ɗ) — legitimate Latin-script summaries — must render in BOTH channels.
+    for _ok in ("Gen ifadəsi analizinin nəticələri ümumiləşdirilmişdir və əhəmiyyətlidir bu gün burada.",
+                "Sakamakon binciken samfurori 2024 ɓatacce ne kuma ɗimbin kayan an gama da kyau a nan."):
+        assert not _audio_blocked(_ok), f"audio false-positive on extended-Latin: {_ok[:24]}"
+        assert not _email_blocked(_ok[:50]), f"email false-positive on extended-Latin: {_ok[:24]}"
     # NO false positive: Russian/Cyrillic biomedical prose with HYPHENATED Latin
     # technical terms (Latin head '-' Cyrillic suffix, no inline substitution) —
     # ubiquitous in real summaries — must render in BOTH channels.
