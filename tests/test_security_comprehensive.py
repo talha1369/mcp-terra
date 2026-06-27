@@ -2518,6 +2518,17 @@ def _():
         _idx = _lbl.index(_w) + _w.index(_lc)
         _hl = _lbl[:_idx] + chr(_cp) + _lbl[_idx + 1:] + KEY
         assert secret_scan.scan_egress(_hl), f"missed {_lc}->{hex(_cp)} label-homoglyph AWS secret"
+    # REGRESSION (R28): TWO homoglyphs in ONE keyword (key→ⱪeү: U+2C6A + U+04AF;
+    # secret→ꜱeꮯret: U+A731 + U+ABAF) must still be caught — the label matcher now
+    # tolerates homoglyphs up to the MINORITY of each keyword's letters (majority
+    # exact), so a pure-foreign run still can't match but multi-homoglyph does.
+    for _ml in ("AWS Secret Access " + chr(0x2C6A) + "e" + chr(0x04AF) + ": " + KEY,
+                "AWS " + chr(0xA731) + "e" + chr(0xABAF) + "ret access key: " + KEY):
+        assert secret_scan.scan_egress(_ml), f"missed 2-homoglyph label AWS secret: {_ml[:18]!r}"
+    # NO false positive: 'commit key:'/'the key:' + a 40-char value with NO 'secret'
+    # word must render (the label requires both 'secret' AND 'key').
+    assert not secret_scan.scan_egress(
+        "The git commit key: 11f6ad8ec52a2984abaafd7c3b6e8de026b482204 was tagged for release today.")
     # NO false positive: 'secret'/'key' in ordinary prose (no 40-char value) renders
     assert not secret_scan.scan_egress(
         "The secret to success is the key insight reproduced across replicates today.")

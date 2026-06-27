@@ -64,23 +64,52 @@ _PATTERNS: list[tuple[str, re.Pattern[bytes], str]] = [
 # word cannot match (it has no exact keyword letters) — closing the whole label-
 # homoglyph class for ALL codepoints without per-glyph enumeration, FP-free.
 _LABEL_SENTINEL = "\x01"
+# A value-side anchor: ':' or '=' (with optional quotes/separators) then a 40-char
+# AWS-secret-shaped run. The label is matched fuzzily BEFORE this anchor.
+_AWS_VALUE_ANCHOR = re.compile(r"[:=][\"'\s\x01_-]{0,3}[\"']?[A-Za-z0-9/+=]{40}")
 
 
-def _fuzzy_kw(word: str) -> str:
-    """Regex matching `word` exactly, or with exactly ONE letter replaced by the
-    homoglyph sentinel — i.e. one cross-script homoglyph anywhere in the keyword."""
-    import re as _re
-    alts = [_re.escape(word)]
-    for _i in range(len(word)):
-        alts.append(_re.escape(word[:_i]) + _LABEL_SENTINEL + _re.escape(word[_i + 1:]))
-    return "(?:" + "|".join(alts) + ")"
+def _fuzzy_kw_in(hay: str, word: str) -> bool:
+    """True if `word` occurs in `hay` (a non-ASCII→sentinel skeleton) where each
+    position is the EXACT ASCII keyword letter OR a sentinel (a homoglyph), and a
+    MAJORITY of positions are exact (>= ceil(len/2)). Requiring majority-exact means
+    a pure-foreign run (all sentinels, zero exact keyword letters) can NEVER match,
+    so this is false-positive-free, while ANY NUMBER of homoglyphs up to the minority
+    is tolerated — closing the multi-homoglyph-per-keyword bypass that a fixed
+    '<=1 sentinel' rule left open for short words like 'key'."""
+    _L = len(word)
+    _max_sent = _L - max(1, _L // 2)          # key(3)→2, secret(6)→3, access(6)→3
+    for _i in range(len(hay) - _L + 1):
+        _sent = 0
+        _bad = False
+        for _j in range(_L):
+            _h = hay[_i + _j]
+            if _h == word[_j]:
+                continue
+            if _h == _LABEL_SENTINEL:
+                _sent += 1
+                if _sent > _max_sent:
+                    _bad = True
+                    break
+            else:
+                _bad = True
+                break
+        if not _bad:
+            return True
+    return False
 
 
-_AWS_LABEL_FUZZY = re.compile(
-    _fuzzy_kw("secret") + r"[\s_\x01-]{0,4}"
-    + r"(?:" + _fuzzy_kw("access") + r"[\s_\x01-]{0,4})?"
-    + _fuzzy_kw("key") + r"[\"'\s_\x01-]*[:=][\s_\x01-]*[\"']?[A-Za-z0-9/+=]{40}",
-    re.IGNORECASE)
+def _aws_secret_label_present(skel: str) -> bool:
+    """Homoglyph-robust AWS-secret-label detector over a non-ASCII→sentinel skeleton:
+    a 'secret … key : <40-char value>' label where each keyword may carry homoglyphs
+    up to the minority of its letters. The AWS secret VALUE has no self-identifying
+    prefix, so this label is its only signal; tolerating multiple homoglyphs per
+    keyword closes the class for any script/codepoint."""
+    for _m in _AWS_VALUE_ANCHOR.finditer(skel):
+        _ctx = skel[max(0, _m.start() - 28):_m.start()]   # label region before :/=
+        if _fuzzy_kw_in(_ctx, "key") and _fuzzy_kw_in(_ctx, "secret"):
+            return True
+    return False
 
 _MAX_SCAN_BYTES = 8 * 1024 * 1024   # 8 MiB cap on per-file scan
 
@@ -562,8 +591,10 @@ def scan_egress(text: str) -> list[dict]:
     # label (≤1 homoglyph per keyword). Closes the label-homoglyph class for ANY
     # codepoint (ꜱecret / ⱪey / Cherokee / small-cap / …) without per-glyph
     # enumeration; a pure-foreign word can't match (no exact keyword letters).
-    _label_skel = re.sub(r"[^\x00-\x7f]", _LABEL_SENTINEL, fold)
-    if _AWS_LABEL_FUZZY.search(_label_skel):
+    # lower-case so the case-sensitive fuzzy keyword match is effectively
+    # case-insensitive ('Secret'/'KEY' → secret/key); the value class is unaffected.
+    _label_skel = re.sub(r"[^\x00-\x7f]", _LABEL_SENTINEL, fold).lower()
+    if _aws_secret_label_present(_label_skel):
         hits.append({"pattern": "aws_secret_key_assignment", "severity": "CRITICAL",
                      "source": "egress-label-fuzzy", "offset": 0,
                      "context": "…[REDACTED—aws_secret_key_assignment]…"})
