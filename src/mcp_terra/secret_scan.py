@@ -81,10 +81,14 @@ class SensitiveDataFound(Exception):
 # closes that bypass. Curated to the [A-Za-z] confusables (token alphabets are
 # [A-Za-z0-9_-]); digits/_/- have no common cross-script confusable worth folding.
 _CONFUSABLES: dict[str, str] = {
-    # Cyrillic lowercase → Latin
+    # Cyrillic lowercase → Latin. The te/ka/em/ve letters (U+0442 т, U+043A к,
+    # U+043C м, U+0432 в) render like Latin t/k/m/b and were MISSING (only their
+    # uppercase Т/К/М/В were mapped), so a single one substituted into a secret
+    # LABEL word ('secreт', 'кey') defeated the byte-scan while the value egressed.
     "а": "a", "е": "e", "о": "o", "р": "p", "с": "c",
     "у": "y", "х": "x", "ѕ": "s", "і": "i", "ј": "j",
     "ԁ": "d", "һ": "h", "ԛ": "q", "ӏ": "l", "ɡ": "g",
+    "т": "t", "к": "k", "м": "m", "в": "b",
     # Cyrillic uppercase → Latin
     "А": "A", "В": "B", "Е": "E", "К": "K", "М": "M",
     "Н": "H", "О": "O", "Р": "P", "С": "C", "Т": "T",

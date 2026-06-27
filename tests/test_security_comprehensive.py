@@ -2492,6 +2492,12 @@ def _():
     for _ok in ("The secret key was rotated and the run finished cleanly here today now ok fine.",
                 "Key findings: expression was elevated across all replicates and verified here today ok."):
         assert not secret_scan.scan_bytes(_ok.encode()), f"false positive on key-mention prose: {_ok[:24]}"
+    # REGRESSION (R25): a single lowercase Cyrillic homoglyph in the LABEL
+    # ('secreт'=te U+0442, 'кey'=ka U+043A) — the egress scan FOLDS it to the ASCII
+    # label so the anchored pattern fires (scan_egress, not raw scan_bytes).
+    for _clabel in ("AWS secreт access key: " + KEY,
+                    "AWS secret access кey: " + KEY):
+        assert secret_scan.scan_egress(_clabel), f"missed Cyrillic-label AWS secret: {_clabel[:20]!r}"
 
 @case("Y-SecretScan", "PEM private-key header blocks upload")
 def _():
