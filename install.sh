@@ -12,7 +12,8 @@
 #   3. Installs the package + pinned deps into THAT venv
 #   4. Generates a runner secret (or reuses an existing ~/.mcp-terra/runner_secret)
 #   5. Verifies you have access to the Terra workspace (Rawls lookup)
-#   6. Registers the MCP via `claude mcp add` with the venv python + all env vars
+#   6. Registers the MCP via `claude mcp add` (venv python + workspace/secret
+#      config, plus any MCP_TERRA_SLACK_*/SMTP_* notification vars you exported)
 #   7. Confirms the MCP shows ✔ Connected
 #
 # Does NOT do:
@@ -223,6 +224,33 @@ fi
 BUCKET="$("$VENV_PY" -c "import json,sys; print(json.load(open(sys.argv[1]))['workspace']['bucketName'])" "$TMPF")"
 ok "Workspace bucket: gs://$BUCKET"
 
+# ── 5a. Optional notification config (Slack + email) ───────────────────────
+# Notifications are OPTIONAL. If you EXPORT any of these before running the
+# installer, we propagate them to BOTH config.env (plugin launcher) and the
+# `claude mcp add` registration so the report email + audio + Slack actually
+# fire. Unset ⇒ email falls back to a local .eml under ~/.mcp-terra/reports/ and
+# Slack is skipped. (Add or change them later per README "Notifications".)
+NOTIFY_KEYS="MCP_TERRA_SLACK_WEBHOOK MCP_TERRA_SLACK_BOT_TOKEN MCP_TERRA_SLACK_CHANNEL \
+MCP_TERRA_SMTP_HOST MCP_TERRA_SMTP_PORT MCP_TERRA_SMTP_USER MCP_TERRA_SMTP_PASS \
+MCP_TERRA_SMTP_FROM MCP_TERRA_SMTP_RELAY MCP_TERRA_SMTP_STARTTLS MCP_TERRA_EMAIL_RECIPIENT_OVERRIDE"
+NOTIFY_ENV_ARGS=()
+NOTIFY_CONFIG_LINES=""
+_nset=0
+for _nk in $NOTIFY_KEYS; do
+  _nv="$(printenv "$_nk" 2>/dev/null || true)"
+  if [ -n "$_nv" ]; then
+    NOTIFY_ENV_ARGS+=( -e "$_nk=$_nv" )
+    NOTIFY_CONFIG_LINES="${NOTIFY_CONFIG_LINES}${_nk}=${_nv}
+"
+    _nset=$((_nset + 1))
+  fi
+done
+if [ "$_nset" -gt 0 ]; then
+  ok "Including $_nset notification var(s) (Slack/SMTP) in the registration"
+else
+  info "No Slack/SMTP vars exported — notifications optional (email ⇒ local .eml; Slack skipped). See README."
+fi
+
 # ── 5b. Shared config.env (sourced by the plugin launcher) ─────────────────
 # Robust PATH so the MCP subprocess finds gcloud regardless of how Claude Code
 # is launched (Dock/Spotlight on macOS strip the shell PATH).
@@ -240,6 +268,9 @@ MCP_TERRA_RUNNER_SECRET_FILE=$SECRET_FILE
 PATH=$MCP_PATH
 HOME=$HOME
 EOF
+# Append any exported notification vars (Slack/SMTP) so the plugin launcher,
+# which only exports allowlisted keys, can carry them too.
+[ -n "$NOTIFY_CONFIG_LINES" ] && printf '%s' "$NOTIFY_CONFIG_LINES" >> "$CONFIG_FILE"
 chmod 600 "$CONFIG_FILE"
 ok "Wrote $CONFIG_FILE (mode 0600)"
 
@@ -275,6 +306,8 @@ MCP_PATH="$(dirname "$GCLOUD"):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 # the `claude mcp add` argv would expose it via `ps` and persist it in the MCP
 # env config. The server reads MCP_TERRA_RUNNER_SECRET_FILE (a 0600 file) at
 # runtime; the secret value never appears in argv or any config.
+# ${arr[@]+"${arr[@]}"} expands to nothing when the array is empty WITHOUT
+# tripping `set -u` on macOS bash 3.2 (a bare "${arr[@]}" would error there).
 "$CLAUDE_BIN" mcp add terra \
   -s user \
   -e "MCP_TERRA_ALLOW_WRITES=1" \
@@ -282,6 +315,7 @@ MCP_PATH="$(dirname "$GCLOUD"):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
   -e "MCP_TERRA_RUNNER_SECRET_FILE=$SECRET_FILE" \
   -e "PATH=$MCP_PATH" \
   -e "HOME=$HOME" \
+  ${NOTIFY_ENV_ARGS[@]+"${NOTIFY_ENV_ARGS[@]}"} \
   -- "$VENV_PY" -m mcp_terra.server >/dev/null \
   || fail "claude mcp add failed"
 ok "Registered (user scope) → claude mcp list"

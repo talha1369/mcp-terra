@@ -1,5 +1,7 @@
 {
-  "terra": {
-    "command": "${CLAUDE_PLUGIN_ROOT}/scripts/terra-mcp-launch.sh"
+  "mcpServers": {
+    "terra": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/scripts/terra-mcp-launch.sh"
+    }
   }
 }

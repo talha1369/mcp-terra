@@ -1338,6 +1338,12 @@ def _():
     # must never fail open
     assert "MCP_TERRA_BUDGET_USD" in sh and "MCP_TERRA_BUDGET_WINDOW_DAYS" in sh, \
         "launcher drops the rolling-budget keys"
+    # the notification keys MUST be allowlisted too: the README tells plugin users
+    # to put Slack/SMTP secrets in config.env, so dropping them silently disables
+    # the headline email + audio + Slack feature.
+    for _k in ("MCP_TERRA_SLACK_BOT_TOKEN", "MCP_TERRA_SLACK_CHANNEL", "MCP_TERRA_SLACK_WEBHOOK",
+               "MCP_TERRA_SMTP_HOST", "MCP_TERRA_SMTP_PORT", "MCP_TERRA_SMTP_USER", "MCP_TERRA_SMTP_PASS"):
+        assert _k in sh, f"launcher drops notification key {_k} (config.env setup would silently fail)"
 
 @case("CC-Hardening", "start_runner_on_vm binds the heartbeat to the requested runtime")
 def _():
@@ -1369,6 +1375,29 @@ def _():
     sh = (REPO_ROOT / "install.sh").read_text()
     assert "MCP_TERRA_RUNNER_SECRET_FILE=$SECRET_FILE" in sh
     assert '-e "MCP_TERRA_RUNNER_SECRET=$RUNNER_SECRET"' not in sh, "raw secret still on argv"
+
+@case("CC-Hardening", "plugin .mcp.json is valid and uses the mcpServers schema")
+def _():
+    import json
+    raw = (REPO_ROOT / ".mcp.json").read_text()
+    d = json.loads(raw)   # must be valid JSON
+    # Claude Code requires a top-level mcpServers record; a bare {"terra": {...}}
+    # fails to parse ("mcpServers: expected record, received undefined") and the
+    # whole plugin install silently provides no MCP.
+    assert "mcpServers" in d and isinstance(d["mcpServers"], dict), \
+        ".mcp.json missing the mcpServers wrapper — plugin install will not parse"
+    assert "terra" in d["mcpServers"], ".mcp.json does not define the terra server"
+    assert "command" in d["mcpServers"]["terra"]
+
+@case("CC-Hardening", "install.sh propagates exported Slack/SMTP vars (config.env + registration)")
+def _():
+    sh = (REPO_ROOT / "install.sh").read_text()
+    # notifications are the headline feature; a fresh install must carry them when
+    # the user exported them, into BOTH the plugin config.env and `claude mcp add`.
+    assert "NOTIFY_KEYS" in sh and "NOTIFY_ENV_ARGS" in sh
+    assert 'NOTIFY_ENV_ARGS[@]+"${NOTIFY_ENV_ARGS[@]}"' in sh, \
+        "must use the bash-3.2-safe empty-array expansion (macOS default bash)"
+    assert "MCP_TERRA_SLACK_BOT_TOKEN" in sh and "MCP_TERRA_SMTP_HOST" in sh
 
 @case("CC-Hardening", "terra_client redacts the file-backed runner secret too")
 def _():
