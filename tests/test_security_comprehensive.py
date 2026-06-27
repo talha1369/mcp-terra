@@ -1338,6 +1338,14 @@ def _():
     # must never fail open
     assert "MCP_TERRA_BUDGET_USD" in sh and "MCP_TERRA_BUDGET_WINDOW_DAYS" in sh, \
         "launcher drops the rolling-budget keys"
+    # the file-stat checks must be GNU-first (`stat -c` before `stat -f`): on Linux
+    # `stat -f` is --file-system and prints fs info to stdout while exiting nonzero,
+    # which pollutes the captured value and makes the owner/mode check wrongly
+    # REFUSE a valid config.env (the launcher silently provides no MCP on Linux).
+    assert sh.index("stat -c '%u'") < sh.index("stat -f '%u'"), \
+        "launcher owner check must use GNU `stat -c` BEFORE BSD `stat -f` (else Linux fail-refuse)"
+    assert sh.index("stat -c '%a'") < sh.index("stat -f '%Lp'"), \
+        "launcher mode check must use GNU `stat -c` BEFORE BSD `stat -f` (else Linux fail-refuse)"
     # EXECUTABLE: the notification keys must actually be EXPORTED by the launcher,
     # not merely appear somewhere in the file (a key surviving in a comment would
     # satisfy a bare substring). Run the REAL launcher against a config.env that
@@ -1396,6 +1404,12 @@ def _():
     sh = (REPO_ROOT / "install.sh").read_text()
     assert "MCP_TERRA_RUNNER_SECRET_FILE=$SECRET_FILE" in sh
     assert '-e "MCP_TERRA_RUNNER_SECRET=$RUNNER_SECRET"' not in sh, "raw secret still on argv"
+    # the secret-reuse stat checks must be GNU-first (`stat -c` before `stat -f`):
+    # BSD-first wrongly refuses a valid existing secret on a Linux re-install.
+    assert sh.index("stat -c '%u'") < sh.index("stat -f '%u'"), \
+        "install.sh owner check must use GNU `stat -c` BEFORE BSD `stat -f` (Linux fail)"
+    assert sh.index("stat -c '%a'") < sh.index("stat -f '%Lp'"), \
+        "install.sh mode check must use GNU `stat -c` BEFORE BSD `stat -f` (Linux fail)"
 
 @case("CC-Hardening", "plugin .mcp.json is valid and uses the mcpServers schema")
 def _():

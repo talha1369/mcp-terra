@@ -31,9 +31,12 @@ fi
 # containing shell syntax cannot execute on launch.
 [ -L "$CFG" ] && { echo "[mcp-terra] $CFG is a symlink — refusing." >&2; exit 1; }
 [ -f "$CFG" ] || { echo "[mcp-terra] $CFG is not a regular file — refusing." >&2; exit 1; }
-_own="$(stat -f '%u' "$CFG" 2>/dev/null || stat -c '%u' "$CFG" 2>/dev/null || echo -1)"
+_own="$(stat -c '%u' "$CFG" 2>/dev/null || stat -f '%u' "$CFG" 2>/dev/null || echo -1)"
 [ "$_own" = "$(id -u)" ] || { echo "[mcp-terra] $CFG not owned by you — refusing." >&2; exit 1; }
-_mode="$(stat -f '%Lp' "$CFG" 2>/dev/null || stat -c '%a' "$CFG" 2>/dev/null || echo 000)"
+# GNU stat (-c) FIRST, then BSD stat (-f): on Linux `stat -f` means --file-system
+# and prints fs info to stdout while exiting nonzero, which would pollute the
+# captured value; GNU-first avoids that and BSD-first stays correct on macOS.
+_mode="$(stat -c '%a' "$CFG" 2>/dev/null || stat -f '%Lp' "$CFG" 2>/dev/null || echo 000)"
 case "$_mode" in
   600|400) : ;;
   *) echo "[mcp-terra] $CFG must be mode 0600 (is $_mode) — refusing." >&2; exit 1 ;;

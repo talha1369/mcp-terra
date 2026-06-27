@@ -171,10 +171,12 @@ if [ -e "$SECRET_FILE" ] && [ -s "$SECRET_FILE" ]; then
   [ -L "$SECRET_FILE" ] && fail "$SECRET_FILE is a symlink — refusing (move it aside)."
   [ -f "$SECRET_FILE" ] || fail "$SECRET_FILE is not a regular file — refusing."
   # Owner == current user
-  _own="$(stat -f '%u' "$SECRET_FILE" 2>/dev/null || stat -c '%u' "$SECRET_FILE" 2>/dev/null || echo -1)"
+  # GNU stat (-c) FIRST, then BSD (-f): on Linux `stat -f` is --file-system and
+  # pollutes stdout while exiting nonzero, so BSD-first would mis-read the owner.
+  _own="$(stat -c '%u' "$SECRET_FILE" 2>/dev/null || stat -f '%u' "$SECRET_FILE" 2>/dev/null || echo -1)"
   [ "$_own" = "$(id -u)" ] || fail "$SECRET_FILE is not owned by you (uid $_own) — refusing."
   # Perms must be 0600 (no group/other). Tighten if looser; never widen.
-  _mode="$(stat -f '%Lp' "$SECRET_FILE" 2>/dev/null || stat -c '%a' "$SECRET_FILE" 2>/dev/null || echo 000)"
+  _mode="$(stat -c '%a' "$SECRET_FILE" 2>/dev/null || stat -f '%Lp' "$SECRET_FILE" 2>/dev/null || echo 000)"
   case "$_mode" in
     600) : ;;
     *) chmod 600 "$SECRET_FILE" && info "tightened $SECRET_FILE to mode 0600 (was $_mode)" ;;
