@@ -1015,8 +1015,8 @@ def _():
             "abcdefghijklmnopqrstuvwxyzABCDEF",        # alphabet WALK: 32 unique + high Shannon, yet guessable
             "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef",        # descending-class walk
             "0123456789ABCDEFGHIJKLMNOPQRSTUV",        # digit-then-alpha walk (32 unique)
-            "qwertyuiopasdfghjklzxcvbnm123456",        # QWERTY keyboard walk (not codepoint-adjacent)
-            "asdfghjklqwertyuiopzxcvbnm098765",        # mixed keyboard-row walk
+            "qwertyuiopasdfghjklzxcvbnm123456",        # QWERTY walk  # pragma: allowlist secret
+            "asdfghjklqwertyuiopzxcvbnm098765",        # mixed-row walk  # pragma: allowlist secret
         ):
             _os.environ["MCP_TERRA_RUNNER_SECRET"] = weak
             must_raise(nbr.get_runner_secret, RuntimeError)
@@ -4793,6 +4793,55 @@ def _():
         (_bk2.upload_file, safety.safe_bucket_uri, safety.bucket_object_exists,
          _bk2._run_gsutil) = o_up, o_safe, o_exist, o_run
         _os.unlink(tmp)
+
+@case("CC-Hardening", "terra_upload_to_bucket recursive verify is per-object content-hash (fail closed on mismatch/missing)")
+def _():
+    import os as _os
+    import tempfile
+    from mcp_terra import policy as _p, bucket as _bk2
+    d = tempfile.mkdtemp()
+    base = _os.path.join(d, "mydir"); _os.makedirs(_os.path.join(base, "sub"))
+    open(_os.path.join(base, "b.txt"), "w").write("bbb")
+    open(_os.path.join(base, "sub", "a.txt"), "w").write("aaa")
+    BUCKET = "gs://fc-secure-x/out/"
+    crc = {"b.txt": "CRCbbb==", "a.txt": "CRCaaa=="}
+    md5 = {"b.txt": "MD5bbb==", "a.txt": "MD5aaa=="}
+    state = {"good": True, "drop_a": False}
+
+    def _manifest():
+        lines = [f"{BUCKET}mydir/b.txt:", f"  Hash (crc32c):  {crc['b.txt']}", f"  Hash (md5):  {md5['b.txt']}"]
+        if not state["drop_a"]:
+            _ac = crc["a.txt"] if state["good"] else "WRONGcrc=="
+            _am = md5["a.txt"] if state["good"] else "WRONGmd5=="
+            lines += [f"{BUCKET}mydir/sub/a.txt:", f"  Hash (crc32c):  {_ac}", f"  Hash (md5):  {_am}"]
+        return "\n".join(lines) + "\n"
+
+    def _run(args, **k):
+        if args and args[0] == "ls":
+            return _manifest()
+        if args and args[0] == "hash":
+            _bn = _os.path.basename(args[-1])
+            return f"Hash (crc32c):  {crc[_bn]}\nHash (md5):  {md5[_bn]}\n"
+        return ""
+    o = (_bk2.upload_file, _bk2._run_gsutil, safety.safe_bucket_uri, safety.bucket_object_exists)
+    _bk2.upload_file = lambda *a, **k: "Copying...\n"
+    _bk2._run_gsutil = _run
+    safety.safe_bucket_uri = lambda u: u
+    safety.bucket_object_exists = lambda u: False
+    restore = _write_guards_on(_p)
+    try:
+        # all objects match their local file -> success (no raise)
+        state["good"] = True; state["drop_a"] = False
+        server.terra_upload_to_bucket(base, BUCKET, recursive=True)
+        # one object content-mismatched (a raced overwrite at its URI) -> FAIL CLOSED
+        state["good"] = False
+        must_raise(server.terra_upload_to_bucket, safety.SafetyError, base, BUCKET, recursive=True)
+        # one object MISSING from the destination (a raced cp -n skip) -> FAIL CLOSED
+        state["good"] = True; state["drop_a"] = True
+        must_raise(server.terra_upload_to_bucket, safety.SafetyError, base, BUCKET, recursive=True)
+    finally:
+        restore()
+        _bk2.upload_file, _bk2._run_gsutil, safety.safe_bucket_uri, safety.bucket_object_exists = o
 
 
 @case("CC-ControlledAccessGuard", "terra_health withholds lock/bucket/IAM principals (sentinel) in controlled mode")
