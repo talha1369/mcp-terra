@@ -697,16 +697,18 @@ def scan_egress(text: str) -> list[dict]:
                                  "context": "…[REDACTED—excessive encoded content]…"})
                     return hits
                 if _depth < _MAX_DECODE_DEPTH:
-                    try:
-                        _dtext = _dec.decode("ascii")
-                    except UnicodeDecodeError:
-                        continue                 # non-ASCII bytes → not another layer
-                    # only recurse on an alphabet-DENSE printable string (an encoded
-                    # layer is ~100% [A-Za-z0-9+/=_-]); random/text decodes are not,
-                    # so they terminate the recursion (no FP, bounded cost).
-                    if (len(_dtext) >= 24
-                            and sum(c in _ENC_ALPHABET for c in _dtext) >= 0.9 * len(_dtext)):
-                        _work.append((_dtext, _depth + 1))
+                    # Re-feed the decoded BYTES (as latin-1, never raises) so the
+                    # candidate-finder re-extracts any inner encoded LAYER from them,
+                    # REGARDLESS of whether the whole decode is clean ASCII. A glued
+                    # ≥4-char prefix ('token=<b64(b64(secret))>') makes the depth-0
+                    # decode start with garbage bytes, so a clean-ASCII gate would
+                    # never recurse and the inner layer would leak — re-feeding the
+                    # bytes lets the inner ≥24-char alphabet run be found and decoded.
+                    # Random/hash/text decodes contain no ≥24-char alphabet run, so
+                    # the candidate regex finds nothing → recursion self-terminates
+                    # (no false positive); the depth cap, `_seen`, and the 4 MB
+                    # `_total` volume guard bound the cost.
+                    _work.append((_dec.decode("latin-1"), _depth + 1))
     return hits
 
 

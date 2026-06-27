@@ -2960,6 +2960,19 @@ def _():
                 f"email leaked {_lvl + 1}x-base64 {_sec3[:6]}"
     _hexb64 = _b64e.b64encode(("ghp_" + "B" * 36).encode()).decode().encode().hex()
     assert _email_blocked("blob " + _hexb64 + " end"), "email leaked hex(base64) ghp"
+    # REGRESSION (R30): a multi-layer-encoded secret with a >=4-char alnum prefix
+    # GLUED (no whitespace) before the blob — 'token=<b64(b64(secret))>' — must be
+    # caught. The glued prefix corrupts the depth-0 byte alignment, so the recursion
+    # now re-feeds the decoded BYTES (not only a clean-ASCII decode) to find the
+    # inner layer. Verified no FP on random/hash multi-layer blobs above.
+    for _gsec in (_tok, "AKIAIOSFODNN7EXAMPLE", "ghp_" + "A" * 36):
+        for _gl in (2, 3):
+            _ge3 = _gsec
+            for _ in range(_gl):
+                _ge3 = _b64e.b64encode(_ge3.encode()).decode()
+            for _gp in ("token=", "state=", "blob"):
+                assert _email_blocked("Run. " + _gp + _ge3 + " logged here today."), \
+                    f"email leaked {_gl}x-b64 glued '{_gp}' {_gsec[:6]}"
     _b32b64 = _b64e.b32encode(_b64e.b64encode(b"AKIAIOSFODNN7EXAMPLE")).decode()  # pragma: allowlist secret
     assert _email_blocked("blob " + _b32b64 + " end"), "email leaked base32(base64) AKIA"
     # NO false positive: double-base64 of random / a hash / DNA decodes to non-
