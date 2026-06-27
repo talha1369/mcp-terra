@@ -2781,7 +2781,7 @@ def _():
 
 @case("BB-AudioSummary", "audio+email block PLAIN and homoglyphed non-ya29 secrets (AWS/GitHub); legit Greek science passes")
 def _():
-    from mcp_terra import audio_summary as _A, email_send as _E
+    from mcp_terra import audio_summary as _A, email_send as _E, secret_scan
     _ack = "I reviewed runner.stderr line 47, the traceback shows AttributeError on cell 3."
     PRE = "This is a sufficiently long results summary describing the analysis here today. "
 
@@ -2892,6 +2892,31 @@ def _():
         assert _email_blocked("config " + _glue), f"email leaked glued encoded secret {_glue[:10]}"
     _junk = " ".join(_b64e.b64encode(__import__("os").urandom(18)).decode() for _ in range(250))
     assert _email_blocked(_junk + " " + _eb), "email leaked encoded secret after junk fillers"
+    # REGRESSION (R17): an encoded secret split by inserted PUNCTUATION ('.', ',',
+    # ';', ':', '|') — which `dense` keeps because it only collapses whitespace —
+    # must re-contiguate in the punctuation-stripped form and be caught.
+    for _sec2 in (_tok, "AKIAIOSFODNN7EXAMPLE"):
+        _e2 = _b64e.b64encode(_sec2.encode()).decode()
+        _m2 = len(_e2) // 2
+        for _sep in (".", ",", ";", ":", "|"):
+            _ps = "Results token: " + _e2[:_m2] + _sep + _e2[_m2:] + " end of report."
+            assert _email_blocked(_ps), f"email leaked punct-split encoded {_sec2[:6]} ({_sep})"
+            assert _audio_blocked(PRE + _ps), f"audio leaked punct-split encoded {_sec2[:6]} ({_sep})"
+    # REGRESSION (R17): a homoglyphed PEM header (Cherokee Ꮐ U+13C0 → 'G' in BEGIN,
+    # not in the per-glyph fold table) must be caught by the fold-tolerant PEM-frame
+    # backstop — the keyword runs are < the 16-char homoglyph-backstop floor.
+    _kb = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQ" * 4  # pragma: allowlist secret
+    for _cp in (0x13C0, 0x13A6, 0x13D9):
+        _hdr = "-----BE" + chr(_cp) + "IN RSA PRIVATE KEY-----"
+        _pem = "Run report.\n" + _hdr + "\n" + _kb + "\n-----END RSA PRIVATE KEY-----"
+        assert secret_scan.scan_egress(_pem), f"scan missed homoglyphed PEM ({hex(_cp)})"
+        assert _email_blocked(_pem), f"email leaked homoglyphed PEM ({hex(_cp)})"
+        assert _audio_blocked(_pem), f"audio leaked homoglyphed PEM ({hex(_cp)})"
+    # NO false positive: a decorative / accented dashed frame folds to pure ASCII
+    # (NFKD) → no residual non-ASCII letter → renders. ('LÉGENDE', 'RÉSUMÉ').
+    for _fr in ("Summary of run ----- LÉGENDE ----- and the results were significant here today ok now.",
+                "Section ----- RÉSUMÉ ----- complete with all the figures included and verified today ok."):
+        assert not _audio_blocked(_fr), f"audio false-positive on decorative frame: {_fr[:24]}"
     # NO false positive: a legit SHA-256 hash (64 hex) in a summary decodes to
     # random bytes (no secret pattern) — must render.
     import hashlib as _hl
@@ -2916,7 +2941,6 @@ def _():
                 "ya29.A0ARrdaM" + "b" * 30: ("a","b")}
     _cmap = {"a": 0x0251, "b": 0x0253, "d": 0x0257, "l": 0x026D, "i": 0x0269,
              "s": 0x0282, "Q": 0xA7AF, "o": 0x0254, "k": 0x0199}
-    from mcp_terra import secret_scan
     for _sec, _chars in _realsec.items():
         for _ch in _chars:
             if _ch in _sec and _ch in _cmap:

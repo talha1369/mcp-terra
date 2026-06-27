@@ -408,6 +408,25 @@ def scan_egress(text: str) -> list[dict]:
                 hits.append({"pattern": name, "severity": sev,
                              "source": "egress-dense", "offset": m.start(),
                              "context": f"…[REDACTED—{name}]…"})
+    # Fold-tolerant PEM-FRAME backstop. The literal private_key_header pattern needs
+    # the exact ASCII '-----BEGIN … PRIVATE KEY-----'; a homoglyph in a keyword that
+    # the per-glyph fold did not map (e.g. Cherokee Ꮐ U+13C0 → 'G' in BEGIN) breaks
+    # the literal match, and the has_homoglyph_token_shape backstop cannot help —
+    # PEM keyword runs (BEGIN/RSA/PRIVATE/KEY) are all < its 16-char floor. So flag
+    # a dashed frame -----…----- whose folded inner STILL carries a non-ASCII letter
+    # AND shows a PEM keyword remnant in its ASCII letters. A legitimate decorative
+    # frame ('----- LÉGENDE -----') folds to pure ASCII via NFKD → no residual → not
+    # flagged; an ASCII frame ('----- SUMMARY -----') has no residual → not flagged.
+    for _fm in re.finditer(r"-{4,}([^\n-]{1,80}?)-{4,}", fold):
+        _inner = _fm.group(1)
+        if any(ord(_c) > 127 and _ud.category(_c)[0] == "L" for _c in _inner):
+            _up = re.sub(r"[^A-Za-z]", "", _inner).upper()
+            if any(_kw in _up for _kw in ("KEY", "BEGIN", "PRIVATE",
+                                          "CERTIFICATE", "PUBLIC")):
+                hits.append({"pattern": "private_key_header_homoglyph",
+                             "severity": "CRITICAL", "source": "egress-pemframe",
+                             "offset": _fm.start(),
+                             "context": "…[REDACTED—homoglyphed PEM header]…"})
     # DECODE pass: an agent could hex/base32/base64-encode a secret so the raw
     # scanner misses it but the email recipient / TTS listener trivially decodes
     # it. Decode plausible encoded blobs and scan the decoded bytes with the same
@@ -418,13 +437,18 @@ def scan_egress(text: str) -> list[dict]:
     # the real secret past with junk fillers — that was a bypass). The input is
     # already length-bounded by the callers (audio ≤4000 chars, email ≤64 KiB);
     # bound the total decoded volume and FAIL CLOSED on pathological volume.
-    # Scan BOTH the fold AND the whitespace-collapsed `dense` form: an encoded
-    # secret split by an inserted space/newline ('QUtJ QUlP…') has no ≥24-char run
-    # in `fold` but re-contiguates in `dense`, so decoding only `fold` missed it.
-    # Shared `_seen` decodes a blob appearing in both forms once.
+    # Scan the fold, the whitespace-collapsed `dense` form, AND a form with every
+    # non-encoding-alphabet char removed (`punct_dense`): an encoded secret split by
+    # an inserted space/newline re-contiguates in `dense`, and one split by inserted
+    # PUNCTUATION ('eWEy.OS5B…', which `dense` keeps because it only collapses
+    # whitespace) re-contiguates in `punct_dense`. _try_decode's 0-3/0-7 alignment
+    # offsets re-align the secret even when prose chars glue to it, and decoding
+    # glued prose yields random bytes that match no anchored pattern (no false
+    # positive). Shared `_seen` decodes a blob appearing in multiple forms once.
+    punct_dense = re.sub(r"[^A-Za-z0-9+/=_-]", "", fold)
     _seen: set = set()
     _total = 0
-    for _src in (fold, dense):
+    for _src in (fold, dense, punct_dense):
         for _m in re.finditer(r"[A-Za-z0-9+/=_-]{24,}", _src):
             _b = _m.group(0)
             if _b in _seen or len(_b) > 200000:
@@ -444,44 +468,54 @@ def scan_egress(text: str) -> list[dict]:
 
 def _try_decode(blob: str) -> list[bytes]:
     """Return decoded-byte candidates for hex / base64 / base64url / base32
-    interpretations of `blob`. For each encoding, also tries the alignment offsets
-    a glued prefix (e.g. `key=<base64>`) would introduce — so an encoded secret
-    glued to a preceding word/key still decodes. Failures are skipped."""
+    interpretations of `blob`.
+
+    For each encoding and each alignment OFFSET a glued prefix would introduce
+    (e.g. `key=<base64>` or re-contiguated prose+secret), try BOTH:
+      • a right-TRUNCATED slice (length cut to a whole group) — preserves the
+        alignment of a secret embedded after a prefix even when stripping an
+        inserted/padding char left a non-group length; and
+      • a right-PADDED slice — preserves the final bytes of a STANDALONE
+        exact-length secret (so e.g. an AKIA value is not shortened below its
+        fixed pattern length).
+    Together these recover an encoded secret whether it is standalone, glued to
+    prose, or split by an inserted whitespace/punctuation char (whose stripping
+    would otherwise misalign the remainder). Failures are skipped."""
     import base64 as _b64
     import binascii as _ba
     out: list[bytes] = []
     b = blob.encode("ascii", "ignore")
+
+    def _attempt(decoder, s: bytes) -> None:
+        if s:
+            try:
+                out.append(decoder(s))
+            except (ValueError, _ba.Error):
+                pass
+
     _hx = re.sub(rb"[^0-9a-fA-F]", b"", b)
     for _off in (0, 1):                       # even-length alignment
         _s = _hx[_off:]
-        if len(_s) >= 40 and len(_s) % 2 == 0:
-            try:
-                out.append(bytes.fromhex(_s.decode("ascii")))
-            except ValueError:
-                pass
-    _b64s = re.sub(rb"[^A-Za-z0-9+/]", b"", b)
-    _b64u = re.sub(rb"[^A-Za-z0-9_-]", b"", b)
-    for _off in range(4):                      # base64 is 4-char aligned
-        _s = _b64s[_off:]
-        if len(_s) >= 24:
-            try:
-                out.append(_b64.b64decode(_s + b"=" * (-len(_s) % 4)))
-            except (ValueError, _ba.Error):
-                pass
-        _su = _b64u[_off:]
-        if len(_su) >= 24:
-            try:
-                out.append(_b64.urlsafe_b64decode(_su + b"=" * (-len(_su) % 4)))
-            except (ValueError, _ba.Error):
-                pass
+        if len(_s) >= 40:
+            _attempt(lambda x: bytes.fromhex(x.decode("ascii")),
+                     _s[: len(_s) // 2 * 2])
+    for _strip, _dec in ((rb"[^A-Za-z0-9+/]", _b64.b64decode),
+                         (rb"[^A-Za-z0-9_-]", _b64.urlsafe_b64decode)):
+        _clean = re.sub(_strip, b"", b)
+        for _off in range(4):                  # base64 is 4-char aligned
+            _s = _clean[_off:]
+            if len(_s) < 24:
+                continue
+            _attempt(_dec, _s[: len(_s) // 4 * 4])           # truncate (start-aligned)
+            if len(_s) % 4 != 1:                              # %4==1 cannot be padded
+                _attempt(_dec, _s + b"=" * (-len(_s) % 4))   # pad (keep tail bytes)
     _b32 = re.sub(rb"[^A-Za-z2-7]", b"", b).upper()
     for _off in range(8):                      # base32 is 8-char aligned
         _s = _b32[_off:]
-        if len(_s) >= 32:
-            try:
-                out.append(_b64.b32decode(_s + b"=" * (-len(_s) % 8)))
-            except (ValueError, _ba.Error):
-                pass
+        if len(_s) < 32:
+            continue
+        _attempt(_b64.b32decode, _s[: len(_s) // 8 * 8])
+        _attempt(lambda x: _b64.b32decode(x + b"=" * (-len(x) % 8)), _s)
     return out
 
 
