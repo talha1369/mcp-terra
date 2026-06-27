@@ -340,7 +340,7 @@ _WD_ACCUM="${MCP_TERRA_SPEND_ACCUM_FILE:-/home/jupyter/.mcp_terra_spend_seconds}
     LC_ALL=C awk -v v="$1" 'BEGIN{
       if (v ~ /^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?$/) {
         x = v + 0
-        if (x == x && x < 1e308 && x > -1e308) exit 0
+        if (x == x && x < 1e308 && x > -1e308 && !(x == 0 && v ~ /[1-9]/)) exit 0
       }
       exit 1
     }'
@@ -728,7 +728,7 @@ _num() {
     LC_ALL=C awk -v v="$1" 'BEGIN{
       if (v ~ /^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?$/) {
         x = v + 0
-        if (x == x && x < 1e308 && x > -1e308) exit 0
+        if (x == x && x < 1e308 && x > -1e308 && !(x == 0 && v ~ /[1-9]/)) exit 0
       }
       exit 1
     }'
@@ -742,15 +742,27 @@ _num() {
 # running total back. The independent watchdog uses the SAME file the same way.
 SPEND_ACCUM_FILE="${MCP_TERRA_SPEND_ACCUM_FILE:-/home/jupyter/.mcp_terra_spend_seconds}"
 # Pipe-free + EOF-after-data safe (preserve a value with no trailing newline) + CRLF-tolerant.
-SPEND_PRIOR_SEC=""; [ -f "$SPEND_ACCUM_FILE" ] && { IFS= read -r SPEND_PRIOR_SEC < "$SPEND_ACCUM_FILE"; } 2>/dev/null || true  # -f guards FIFO/device
-SPEND_PRIOR_SEC="${SPEND_PRIOR_SEC%$'\r'}"; [ -n "$SPEND_PRIOR_SEC" ] || SPEND_PRIOR_SEC=0
-case "$SPEND_PRIOR_SEC" in ''|*[!0-9]*) SPEND_PRIOR_SEC=0 ;; esac
-# Bound to a sane unsigned integer (<= 10 digits) so a huge/corrupt value cannot
-# wrap bash arithmetic negative and read as "below cap". The independent watchdog
-# is the authoritative fail-closed enforcer for a corrupt counter.
-[ "${#SPEND_PRIOR_SEC}" -gt 10 ] && SPEND_PRIOR_SEC=0 || true
-# Normalize base-10 so a leading-zero value (08/09) can't be read as bad octal.
-SPEND_PRIOR_SEC=$(( 10#$SPEND_PRIOR_SEC ))
+# ABSENT => valid first boot (0). PRESENT but not a SANE bounded unsigned integer
+# (empty / non-digit / > 10 digits / not a regular file) => CORRUPT: FLAG it (do
+# NOT silently reset the lifetime counter to 0, which would hand a fresh cap
+# window). enforce_spend_cap fails closed on the flag when a cap is armed; the
+# independent watchdog is the authoritative fail-closed enforcer either way.
+SPEND_PRIOR_CORRUPT=0
+SPEND_PRIOR_SEC=0
+if [ -e "$SPEND_ACCUM_FILE" ]; then
+  if [ -f "$SPEND_ACCUM_FILE" ]; then
+    _sp=""; { IFS= read -r _sp < "$SPEND_ACCUM_FILE"; } 2>/dev/null || true  # pipe-free, EOF-safe, -f guards FIFO/device
+    _sp="${_sp%$'\r'}"
+  else
+    _sp=X   # exists but NOT a regular file (FIFO/device/dir) → corrupt
+  fi
+  case "$_sp" in ''|*[!0-9]*) _sp="" ;; esac
+  if [ -z "$_sp" ] || [ "${#_sp}" -gt 10 ]; then
+    SPEND_PRIOR_CORRUPT=1
+  else
+    SPEND_PRIOR_SEC=$(( 10#$_sp ))   # base-10 normalize (no octal abort on 08/09)
+  fi
+fi
 
 # Run a command with a HARD deadline, coreutils-independent (pure-bash TERM-then-
 # KILL of the process group; SIGKILL cannot be ignored). Mirrors the watchdog's
@@ -896,7 +908,22 @@ enforce_spend_cap() {
         echo "[runner] non-numeric/non-finite spend cap or rate — halting the VM (fail closed)." >&2
         kill_pool; halt_vm "non-numeric spend cap/rate"; exit 1
     fi
+    # A cap with no positive rate cannot be enforced (no spend estimate). On the
+    # legacy/no-watchdog path the runner is the sole enforcer, so FAIL CLOSED here
+    # too (mirror the independent watchdog) rather than run with a dead cap.
+    if LC_ALL=C awk -v c="$MAX_COST_USD" -v r="$VM_HOURLY_USD" 'BEGIN{exit !(c>0 && r<=0)}'; then
+        echo "[runner] spend cap set with no positive hourly rate — halting the VM (fail closed)." >&2
+        kill_pool; halt_vm "cap set without enforceable rate"; exit 1
+    fi
     LC_ALL=C awk -v c="$MAX_COST_USD" -v r="$VM_HOURLY_USD" 'BEGIN{exit !(c>0 && r>0)}' || return 0
+    # A cap IS armed now. If the persisted accumulator was corrupt at boot, do NOT
+    # enforce against a silently-reset ($0) lifetime counter — FAIL CLOSED instead
+    # (mirror the watchdog; covers the legacy/no-watchdog runner path). When no cap
+    # is armed the line above already returned, so a stale corrupt file is ignored.
+    if [ "${SPEND_PRIOR_CORRUPT:-0}" = "1" ]; then
+        echo "[runner] persisted spend accumulator was corrupt/unreadable — halting the VM (fail closed)." >&2
+        kill_pool; halt_vm "corrupt spend accumulator"; exit 1
+    fi
     local _now_c _est _ts _total_s _disk_s
     _now_c="$(date +%s)"
     # CUMULATIVE running seconds = persisted prior sessions + this session. The

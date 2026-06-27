@@ -1411,6 +1411,17 @@ def _():
     assert sh.index("stat -c '%a'") < sh.index("stat -f '%Lp'"), \
         "install.sh mode check must use GNU `stat -c` BEFORE BSD `stat -f` (Linux fail)"
 
+@case("CC-Hardening", "install.sh writes config.env atomically + refuses a symlink/non-regular path")
+def _():
+    sh = (REPO_ROOT / "install.sh").read_text()
+    # config.env carries Slack/SMTP/workspace secrets; on reinstall it must not be
+    # written THROUGH a symlink, nor left loose-mode even briefly. Write to a 0600
+    # temp file then atomically rename — never `cat >` the final path in place.
+    assert '[ -L "$CONFIG_FILE" ] && fail' in sh, "config.env write must refuse a symlink"
+    assert 'mktemp "$HOME/.mcp-terra/config.env.XXXXXX"' in sh, "config.env must be staged via a 0600 mktemp file"
+    assert 'mv -f "$CONFIG_TMP" "$CONFIG_FILE"' in sh, "config.env must be installed atomically (rename)"
+    assert 'cat > "$CONFIG_FILE"' not in sh, "config.env still written in place (loose-mode/symlink race)"
+
 @case("CC-Hardening", "plugin .mcp.json is valid and uses the mcpServers schema")
 def _():
     import json
@@ -1453,8 +1464,8 @@ def _():
     assert 'NOTIFY_ENV_ARGS[@]+"${NOTIFY_ENV_ARGS[@]}"' in sh, \
         "must use the bash-3.2-safe empty-array expansion (macOS default bash)"
     # wired into BOTH sinks: the plugin config.env AND the claude mcp add registration
-    assert "$NOTIFY_CONFIG_LINES" in sh and '>> "$CONFIG_FILE"' in sh, \
-        "notification vars not appended to config.env"
+    assert "$NOTIFY_CONFIG_LINES" in sh and '>> "$CONFIG_TMP"' in sh, \
+        "notification vars not appended to the staged config.env temp file"
 
 @case("CC-Hardening", "doc tool-counts stay in sync with the live registered tool count")
 def _():
@@ -5810,11 +5821,14 @@ def _():
     assert snip.count("exit 1") >= 2  # corrupt path + unwritable path
     # security review [high]: a huge digit string is rejected (bash-arith overflow)
     assert '"${#_wd_prior}" -gt 10' in snip
-    assert '[ "${#SPEND_PRIOR_SEC}" -gt 10 ]' in runner
+    assert '[ "${#_sp}" -gt 10 ]' in runner   # runner boot-read overflow guard
+    # security review [high]: the runner now FLAGS a corrupt persisted accumulator
+    # (does not silently reset it to 0) and fails closed when a cap is armed
+    assert "SPEND_PRIOR_CORRUPT" in runner, "runner must flag a corrupt accumulator, not zero it"
     # security review [high]: base-10 normalization so leading-zero (08/09) values
     # cannot abort the arithmetic as bad octal
     assert "10#$_wd_prior" in snip and "10#$_wddisk" in snip
-    assert "10#$SPEND_PRIOR_SEC" in runner and "10#$_disk_s" in runner
+    assert "10#$_sp" in runner and "10#$_disk_s" in runner
     # security review [high]: at the cap the marker upload is BACKGROUNDED (cannot
     # hang the stop); compute is killed first
     assert ") >/dev/null 2>&1 &" in snip          # backgrounded marker in watchdog
@@ -5885,7 +5899,9 @@ def _():
     import tempfile
     import pathlib
     # non-numeric / non-finite cap OR rate must FAIL CLOSED, not silently coerce to 0
-    for cap, rate in [("abc", "5"), ("10", "xyz"), ("inf", "5"), ("nan", "5"), ("1e400", "5")]:
+    # 1e-400 is a positive value that underflows to 0.0: it must FAIL CLOSED (the
+    # Python parser rejects it too), not arm a $0 cap or silently disarm.
+    for cap, rate in [("abc", "5"), ("10", "xyz"), ("inf", "5"), ("nan", "5"), ("1e400", "5"), ("1e-400", "5")]:
         rc, out, err, events = _run_watchdog_snippet(
             {"MCP_TERRA_MAX_COST_USD": cap, "MCP_TERRA_VM_HOURLY_USD": rate})
         blob = out + err
@@ -5956,6 +5972,44 @@ def _():
                 stopped = True; break
             time.sleep(0.25)
         assert stopped, "watchdog did NOT stop an over-cap VM under locale %s (fail-open)" % comma
+
+
+@case("CC-SpendCap", "runner enforce_spend_cap fails closed: cap-without-rate AND corrupt accumulator (executable)")
+def _():
+    import os
+    import subprocess
+    from mcp_terra import notebook_runner as nbr
+    runner = nbr.runner_script_template()
+    # extract the real enforce_spend_cap function (its closing brace is the first
+    # line that is exactly "}" — inner awk/param braces are never on their own line)
+    i = runner.index("enforce_spend_cap() {")
+    end = runner.index("\n}\n", i)
+    func = runner[i:end + 2]
+    assert "kill_pool; halt_vm" in func, "did not extract the real enforce_spend_cap"
+
+    def run(env_over):
+        harness = (
+            "_num() { case \"$1\" in ''|*[!0-9.eE+-]*) return 1;; *) return 0;; esac; }\n"
+            "kill_pool() { :; }\n"
+            "halt_vm() { echo \"HALTED:$1\"; exit 1; }\n"
+            + func + "\n"
+            "enforce_spend_cap; echo NOHALT\n"
+        )
+        env = dict(os.environ)
+        env.update({"SPEND_PRIOR_SEC": "0", "COST_WARNED": "0", "RUNNER_START_EPOCH": "1000000000",
+                    "SPEND_ACCUM_FILE": "/tmp/nonexistent_acc_xyz", "BUCKET": "gs://x"})
+        env.update(env_over)
+        r = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True, timeout=15)
+        return r.stdout + r.stderr
+    # cap set with NO rate -> fail closed (the legacy/no-watchdog path needs this)
+    out = run({"MAX_COST_USD": "10", "VM_HOURLY_USD": "0", "SPEND_PRIOR_CORRUPT": "0"})
+    assert "HALTED" in out and "NOHALT" not in out, "cap-without-rate must fail closed: %r" % out
+    # armed cap + corrupt accumulator -> fail closed (no silent $0 reset)
+    out = run({"MAX_COST_USD": "10", "VM_HOURLY_USD": "5", "SPEND_PRIOR_CORRUPT": "1"})
+    assert "HALTED:corrupt" in out and "NOHALT" not in out, "corrupt accumulator must fail closed: %r" % out
+    # NO cap + corrupt accumulator -> must NOT halt (nothing to enforce)
+    out = run({"MAX_COST_USD": "0", "VM_HOURLY_USD": "0", "SPEND_PRIOR_CORRUPT": "1"})
+    assert "NOHALT" in out and "HALTED" not in out, "no-cap + corrupt must NOT halt: %r" % out
 
 
 # ──────────────────────────────────────────────────────────────────────────
