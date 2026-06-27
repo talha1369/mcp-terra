@@ -410,6 +410,8 @@ _DENSE_PATTERNS = [
 # false-positive-safe (ordinary prose is neither a single long token nor a per-char
 # separated run). 'AKIA'/'ASIA' both included (a collapsed 'A S I A …' run is a
 # genuine split key, not the all-caps word 'ASIA' which is not per-char separated).
+# PEM-header keywords (whole-word) for the fold-tolerant homoglyphed-PEM backstop.
+_PEM_KEYWORDS = frozenset({"BEGIN", "PRIVATE", "PUBLIC", "KEY", "CERTIFICATE"})
 # The hex/base64/base64url/base32 candidate alphabet — used to decide whether a
 # decoded blob is itself plausibly ANOTHER encoded layer (recursive decode pass).
 _ENC_ALPHABET = frozenset(
@@ -510,15 +512,18 @@ def scan_egress(text: str) -> list[dict]:
     # the literal match, and the has_homoglyph_token_shape backstop cannot help —
     # PEM keyword runs (BEGIN/RSA/PRIVATE/KEY) are all < its 16-char floor. So flag
     # a dashed frame -----…----- whose folded inner STILL carries a non-ASCII letter
-    # AND shows a PEM keyword remnant in its ASCII letters. A legitimate decorative
-    # frame ('----- LÉGENDE -----') folds to pure ASCII via NFKD → no residual → not
-    # flagged; an ASCII frame ('----- SUMMARY -----') has no residual → not flagged.
+    # AND contains ≥2 distinct PEM keywords as WHOLE WORDS. Requiring two whole-word
+    # keywords (a real header is 'BEGIN … PRIVATE KEY' / 'BEGIN … PUBLIC KEY' /
+    # 'BEGIN CERTIFICATE', so a single homoglyph still leaves ≥2 intact) avoids the
+    # false positive of a bilingual report heading where ONE keyword appears as an
+    # ordinary label ('----- 主要指标 KEY METRICS -----', '----- 開始 BEGIN SECTION
+    # -----') and the whole-word match avoids MONKEY/DONKEY/TURKEY/HOTKEY. A
+    # decorative/accented frame ('----- LÉGENDE -----') folds to ASCII → no residual.
     for _fm in re.finditer(r"-{4,}([^\n-]{1,80}?)-{4,}", fold):
         _inner = _fm.group(1)
         if any(ord(_c) > 127 and _ud.category(_c)[0] == "L" for _c in _inner):
-            _up = re.sub(r"[^A-Za-z]", "", _inner).upper()
-            if any(_kw in _up for _kw in ("KEY", "BEGIN", "PRIVATE",
-                                          "CERTIFICATE", "PUBLIC")):
+            _words = {_w.upper() for _w in re.findall(r"[A-Za-z]+", _inner)}
+            if len(_words & _PEM_KEYWORDS) >= 2:
                 hits.append({"pattern": "private_key_header_homoglyph",
                              "severity": "CRITICAL", "source": "egress-pemframe",
                              "offset": _fm.start(),

@@ -314,16 +314,26 @@ def _validate_secret_strength(secret, _depth: int = 0) -> None:
                     f"MCP_TERRA_RUNNER_SECRET is an encoding of a weak secret "
                     f"({_e}). Use python -c "
                     f"'import secrets; print(secrets.token_urlsafe(32))'.")
-        for _rb in _runs:
-            if len(_rb) >= 16:
-                _found = True
-                try:
-                    _validate_secret_strength(_rb.decode("ascii"), _depth=_depth + 1)
-                except ValueError as _e:
-                    raise ValueError(
-                        f"MCP_TERRA_RUNNER_SECRET is an encoding of a weak secret "
-                        f"({_e}). Use python -c "
-                        f"'import secrets; print(secrets.token_urlsafe(32))'.")
+        # Per-run full-validate ONLY when the decode is mostly-printable encoded
+        # TEXT (_ratio >= 0.85). Without this gate, a RANDOM key whose decoded bytes
+        # happen to contain a coincidental >=16-char contiguous-printable run (~2e-6
+        # of token_urlsafe secrets) had that 16-31-char fragment full-validated and
+        # rejected against the >=32 length floor — a spurious refusal of the
+        # recommended secret. When _ratio >= 0.85 the squeeze path above already
+        # full-validated `_sq` (a superset of every run), so this stays redundant-
+        # but-safe for genuine encoded text; famous/walk phrases embedded in diverse
+        # noise are still caught by the length-INDEPENDENT squeeze checks above.
+        if _ratio >= 0.85:
+            for _rb in _runs:
+                if len(_rb) >= 16:
+                    _found = True
+                    try:
+                        _validate_secret_strength(_rb.decode("ascii"), _depth=_depth + 1)
+                    except ValueError as _e:
+                        raise ValueError(
+                            f"MCP_TERRA_RUNNER_SECRET is an encoding of a weak secret "
+                            f"({_e}). Use python -c "
+                            f"'import secrets; print(secrets.token_urlsafe(32))'.")
         return _found
 
     # Decode the secret under EVERY recognized encoding (hex/base32 — which also

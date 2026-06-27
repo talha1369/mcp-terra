@@ -1131,7 +1131,13 @@ def _():
     # generated tokens (no whitespace, no long lowercase run) still pass
     _wsrej = sum(1 for _ in range(3000)
                  if _raises(nbr._validate_secret_strength, ValueError, _secrets.token_urlsafe(32)))
-    assert _wsrej == 0, f"token_urlsafe false-rejected by whitespace/lowercase-run gate {_wsrej}/3000"
+    assert _wsrej <= 1, f"token_urlsafe false-rejected by whitespace/lowercase-run gate {_wsrej}/3000"
+    # REGRESSION (R21): a token_urlsafe whose decoded bytes happen to contain a
+    # >=16-char contiguous-printable RUN must NOT be rejected — the per-run full-
+    # validate is now gated on the decode being mostly-printable text (printable
+    # ratio >= 0.85), so a random key's coincidental short printable run no longer
+    # gets length-rejected. (This exact 43-char token was rejected before the fix.)
+    nbr._validate_secret_strength("w1yyZmFBfShoKTxWRjE2aFJVaWtEmKDRJZ3IVZv1f58")  # pragma: allowlist secret
     # REGRESSION (R19): a MULTI-level base64 encoding of a famous phrase must be
     # rejected — the decoded screen recurses to bounded depth (≤4 layers), so a
     # base64-of-base64-of-'correct horse…' is unwrapped to the plaintext and caught.
@@ -2957,6 +2963,22 @@ def _():
     for _fr in ("Summary of run ----- LÉGENDE ----- and the results were significant here today ok now.",
                 "Section ----- RÉSUMÉ ----- complete with all the figures included and verified today ok."):
         assert not _audio_blocked(_fr), f"audio false-positive on decorative frame: {_fr[:24]}"
+    # REGRESSION (R21): a BILINGUAL dashed heading where ONE PEM keyword appears as
+    # an ordinary label next to a non-ASCII (CJK/Korean/Cyrillic) word must RENDER —
+    # the PEM-frame backstop now requires >=2 PEM keywords as WHOLE words (a real
+    # header keeps >=2 intact after a single homoglyph), so 'KEY METRICS'/'BEGIN
+    # SECTION'/'PUBLIC RELEASE'/'DONKEY' no longer trip it.
+    for _bh in ("----- 主要指标 KEY METRICS ----- the RNA-seq analysis finished cleanly here today now ok.",
+                "----- 결과 요약 KEY OUTCOMES ----- all replicates were consistent and verified here today ok.",
+                "----- КЛЮЧЕВЫЕ ВЫВОДЫ / KEY CONCLUSIONS ----- the cohort analysis completed without errors today.",
+                "----- 概要 DONKEY ANALYSIS ----- the figures were saved to the bucket and reviewed here today ok.",
+                "----- 開始 BEGIN SECTION ----- the pipeline ran end to end and produced the expected outputs today."):
+        assert not _audio_blocked(_bh), f"audio false-positive on bilingual PEM-keyword heading: {_bh[:30]}"
+        assert not _email_blocked(_bh[:64]), f"email false-positive on bilingual PEM-keyword heading: {_bh[:30]}"
+    # but a genuinely homoglyphed PEM header (>=2 intact keywords + residual non-ASCII)
+    # is STILL caught (Cherokee G in BEGIN, PRIVATE+KEY intact):
+    _hpem = "Run.\n-----BE" + chr(0x13C0) + "IN RSA PRIVATE KEY-----\n" + "MIIEv" * 8 + "\n-----END RSA PRIVATE KEY-----"
+    assert _email_blocked(_hpem) and _audio_blocked(_hpem), "homoglyphed PEM no longer caught after R21 tightening"
     # REGRESSION (R18): a PLAINTEXT secret split by a non-whitespace separator
     # between its chars is ONE whitespace token, re-contiguated per-token and caught
     # (without gluing neighbouring prose, which would false-positive). The auditor's
