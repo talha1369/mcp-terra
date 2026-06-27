@@ -94,16 +94,62 @@ _CONFUSABLES: dict[str, str] = {
 _CONFUSABLE_TABLE = {ord(k): v for k, v in _CONFUSABLES.items()}
 
 
-def fold_confusables(text: str) -> str:
-    """Return `text` with full-width/ligature variants (via NFKC) AND
-    Cyrillic/Greek Latin-look-alikes folded to ASCII.
+# Codepoint categories stripped before scanning: zero-width / format / control /
+# surrogate / private / unassigned (C*) and combining marks (Mn/Me). An invisible
+# char (ZWSP U+200B, ZWNJ, ZWJ, BOM) or a combining mark inserted mid-token
+# breaks the contiguous token/secret regex while rendering identically to a human
+# and being recovered by a trivial copy-paste — NFKC does NOT remove these.
+_STRIP_CATS = frozenset({"Cf", "Cc", "Cs", "Co", "Cn", "Mn", "Me"})
 
-    A homoglyph-smuggled token/secret then collapses to its ASCII twin, so the
-    same byte-level scan catches it. NFKC alone does NOT fold cross-script
-    confusables — this helper is the missing half of the homoglyph defense.
+_ASCII_TOKEN_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-")
+
+
+def fold_confusables(text: str) -> str:
+    """Return `text` with full-width/ligature variants (via NFKC) folded, all
+    zero-width / format / control / combining codepoints STRIPPED, and
+    Cyrillic/Greek Latin-look-alikes mapped to ASCII.
+
+    A homoglyph- or invisible-char-smuggled token/secret then collapses to its
+    ASCII twin / re-contiguates, so the same byte-level scan catches it. NFKC
+    alone folds neither cross-script confusables nor invisibles — this helper is
+    the missing half of the homoglyph defense.
     """
     import unicodedata as _ud
-    return _ud.normalize("NFKC", text).translate(_CONFUSABLE_TABLE)
+    t = _ud.normalize("NFKC", text)
+    t = "".join(ch for ch in t
+                if ch in ("\t", "\n", " ") or _ud.category(ch) not in _STRIP_CATS)
+    return t.translate(_CONFUSABLE_TABLE)
+
+
+def has_homoglyph_token_shape(text: str) -> bool:
+    """True if `text` has a token-shaped run smuggling a NON-ASCII homoglyph.
+
+    A real OAuth / cloud / API token is PURE ASCII ([A-Za-z0-9_.-]). A contiguous
+    run of token-ish chars that is long (≥16), carries an ASCII digit, yet
+    contains a non-ASCII letter is a confusable-smuggled token shape the curated
+    fold may not cover (Armenian, Cherokee, small-caps/phonetic, Lisu, …). The
+    ASCII-digit requirement avoids false positives on long non-ASCII words (e.g.
+    German/agglutinative compounds with umlauts), which carry no digits.
+    """
+    import unicodedata as _ud
+
+    def _flag(r: str) -> bool:
+        return (len(r) >= 16
+                and any(c in "0123456789" for c in r)
+                and any(ord(c) > 127 for c in r))
+
+    run: list[str] = []
+    for ch in text:
+        if (ch in _ASCII_TOKEN_CHARS
+                or _ud.category(ch)[0] in ("L", "M")
+                or _ud.category(ch) == "Nd"):
+            run.append(ch)
+        else:
+            if _flag("".join(run)):
+                return True
+            run = []
+    return _flag("".join(run))
 
 
 def scan_bytes(blob: bytes, source: str = "<bytes>") -> list[dict]:

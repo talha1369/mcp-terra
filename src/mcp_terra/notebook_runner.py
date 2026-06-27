@@ -153,9 +153,14 @@ def _validate_secret_strength(secret) -> None:
     _fmt_strong = bool(_alpha) and n * _math.log2(_alpha) >= 128.0
     # Character-diversity floor: ≥12 unique for a general secret; a recognized
     # strong-format key draws from a smaller alphabet, so a lower floor is
-    # correct (degenerate low-unique cases are caught by the walk/periodicity
-    # checks below regardless).
-    _uniq_floor = 7 if _fmt_strong else 12
+    # correct. It is set to 11 (not lower): a real token_hex(16) clears it
+    # 99.8% of the time, while enumerable "hex-word" secrets
+    # ('deadbeefcafef00d…', built from the dictionary hex words dead/beef/cafe/
+    # f00d/…) top out at ~10 distinct hex digits (those words avoid 2,3,4,6,7,9)
+    # — so this floor rejects the guessable hex-word construction that the
+    # format exemption would otherwise newly admit. Degenerate low-unique cases
+    # are also caught by the walk/periodicity checks below.
+    _uniq_floor = 11 if _fmt_strong else 12
     if unique < _uniq_floor:
         raise ValueError(
             f"MCP_TERRA_RUNNER_SECRET has only {unique} unique chars "

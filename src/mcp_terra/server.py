@@ -1173,22 +1173,31 @@ def terra_upload_to_bucket(local_path: str, bucket_uri: str,
     if recursive:
         local_root = _os.path.abspath(local_path)
         if _os.path.isdir(local_root):
+            _topdir = _os.path.basename(local_root)
             for dirpath, _dirs, files in _os.walk(local_root):
                 rel = _os.path.relpath(dirpath, local_root)
                 for fname in files:
                     rel_path = fname if rel == "." else f"{rel}/{fname}"
-                    derived = f"{bucket_uri.rstrip('/')}/{rel_path}"
-                    if safety.is_reserved_bucket_path(derived):
-                        raise safety.SafetyError(
-                            f"recursive upload would write RESERVED MCP object "
-                            f"{derived!r} (per-job audio explainer). Refused.")
-                    if safety.bucket_object_exists(derived):
-                        raise safety.SafetyError(
-                            f"recursive upload would clobber existing bucket "
-                            f"object {derived!r}. Refusing — no destructive "
-                            f"recursive overwrites. Manually rename/move the "
-                            f"existing prefix or use a different destination."
-                        )
+                    # gsutil cp -r may name the object WITH or WITHOUT the top
+                    # dir, depending on whether the prefix pre-exists. Check BOTH
+                    # forms — otherwise a pre-existing object at the form gsutil
+                    # actually uses is neither refused nor versioned, and can mask
+                    # a wrong/raced object at verify time.
+                    for derived in (
+                        f"{bucket_uri.rstrip('/')}/{rel_path}",
+                        f"{bucket_uri.rstrip('/')}/{_topdir}/{rel_path}",
+                    ):
+                        if safety.is_reserved_bucket_path(derived):
+                            raise safety.SafetyError(
+                                f"recursive upload would write RESERVED MCP object "
+                                f"{derived!r} (per-job audio explainer). Refused.")
+                        if safety.bucket_object_exists(derived):
+                            raise safety.SafetyError(
+                                f"recursive upload would clobber existing bucket "
+                                f"object {derived!r}. Refusing — no destructive "
+                                f"recursive overwrites. Manually rename/move the "
+                                f"existing prefix or use a different destination."
+                            )
     action_detail = (
         f"{local_path} → {effective_dest}  recursive={recursive}"
         + ("  (will rename prior to versioned name)" if dest_exists and version_existing else "")
@@ -1280,17 +1289,24 @@ def terra_upload_to_bucket(local_path: str, bucket_uri: str,
                 # stale / raced / wrong-content object.
                 _rel_with = _osu.path.relpath(_fp, _osu.path.dirname(_base))
                 _rel_without = _osu.path.relpath(_fp, _base)
-                _found = False
+                # gsutil cp -r uses exactly ONE of the two naming forms per
+                # invocation. We don't know which a-priori, so the file is
+                # verified iff at least one candidate dest URI EXISTS and EVERY
+                # candidate URI that exists holds matching content. A "correct"
+                # decoy sitting at the form gsutil did NOT use therefore cannot
+                # mask a wrong / raced object at the form it DID use (both are
+                # checked, not first-present-wins).
+                _exists = 0
+                _all_match = True
                 for _rel in (_rel_with, _rel_without):
                     _key = _prefix + "/" + _rel
                     if _key not in _manifest:
                         continue
+                    _exists += 1
                     _dc, _dm = _manifest[_key]
-                    # the destination-candidate object exists → its content ALONE
-                    # decides; do NOT fall through to a looser match.
-                    _found = bool((_lm and _dm and _lm == _dm) or (_lc and _dc and _lc == _dc))
-                    break
-                if not _found:
+                    if not ((_lm and _dm and _lm == _dm) or (_lc and _dc and _lc == _dc)):
+                        _all_match = False
+                if _exists == 0 or not _all_match:
                     _missing += 1
         if _missing:
             raise safety.SafetyError(
@@ -3520,14 +3536,36 @@ def terra_get_batch_job_status(google_project: str, region: str,
         job = {"_raw": (out.stdout or "")[:2000]}
     state = (job.get("status") or {}).get("state") if isinstance(job, dict) else None
     # Controlled-access: the full Batch spec carries commands, env, labels, and
-    # input/output paths. Return only state + status events, drop the spec. (security review.)
+    # input/output paths. Return only state + PROJECTED status events, drop the
+    # spec. (security review.)
     if policy.controlled_access_enabled():
-        _events = (job.get("status") or {}).get("statusEvents") if isinstance(job, dict) else None
+        _raw_events = (job.get("status") or {}).get("statusEvents") if isinstance(job, dict) else None
+        # statusEvents[].description is documented FREE-TEXT that routinely quotes
+        # the failing task path (which embeds the WDL call/task name — a user-
+        # controlled identifier that can encode cohort/sample/consent tokens) and
+        # the container image path (revealing the private pipeline image + GCP
+        # project id). Project each event to its structured, identifier-free
+        # fields only — NEVER the free-text description. (security review high.)
+        _events = None
+        if isinstance(_raw_events, list):
+            _events = []
+            for _ev in _raw_events:
+                if not isinstance(_ev, dict):
+                    continue
+                _texec = _ev.get("taskExecution")
+                _events.append({
+                    "type": _ev.get("type"),
+                    "eventTime": _ev.get("eventTime"),
+                    "exitCode": (_texec.get("exitCode")
+                                 if isinstance(_texec, dict) else None),
+                })
         return _ok({"job_name": job_name, "status": state,
                     "status_events": _events,
                     "_controlled_access_withheld": (
-                        "full Batch job spec (commands/env/labels/paths) withheld "
-                        "(MCP_TERRA_CONTROLLED_ACCESS)"),
+                        "full Batch job spec (commands/env/labels/paths) and "
+                        "statusEvents free-text descriptions withheld "
+                        "(MCP_TERRA_CONTROLLED_ACCESS); event type/time/exitCode "
+                        "kept for infra triage"),
                     "logging_command": logging_cmd})
     return _ok({"job_name": job_name, "status": state, "job": job,
                 "logging_command": logging_cmd})

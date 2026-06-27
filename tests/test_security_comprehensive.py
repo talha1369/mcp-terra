@@ -1071,16 +1071,31 @@ def _():
                 if _raises(nbr._validate_secret_strength, ValueError, _secrets.token_hex(32)))
     reju = sum(1 for _ in range(8000)
                if _raises(nbr._validate_secret_strength, ValueError, _secrets.token_urlsafe(32)))
-    assert rej16 <= 3, f"token_hex(16) broadly false-rejected {rej16}/8000 strong hex secrets"
+    # token_hex(16)=32 chars is the boundary case: the unique>=11 floor (set to
+    # reject enumerable hex-word secrets) rejects ~0.17% of real token_hex(16)
+    # — vastly better than the 5-19% before the fix; assert it is well under 1%.
+    assert rej16 < 80, f"token_hex(16) broadly false-rejected {rej16}/8000 (>1%)"
     assert rej32 <= 1, f"token_hex(32) broadly false-rejected {rej32}/3000 strong hex secrets"
     assert reju <= 3, f"token_urlsafe(32) broadly false-rejected {reju}/8000"
     # the relaxation must NOT admit a genuinely weak low-entropy 32-char string,
-    # a hex WALK, or a periodic hex block (caught by walk/periodicity/unique):
+    # a hex WALK, a periodic hex block, OR an enumerable hex-WORD secret:
     for weak in ("aaaabbbbccccddddaaaabbbbccccdddd", "a" * 64,
                  "0123456789abcdef0123456789abcdef",   # hex walk  # pragma: allowlist secret
                  "deadbeefdeadbeefdeadbeefdeadbeef",   # periodic hex block  # pragma: allowlist secret
+                 "deadbeefcafef00dba5eba11feedface",   # 8 hex-words, ~33 bits  # pragma: allowlist secret
+                 "cafebabefaceabadfeedd00df00d8bad",   # hex-words  # pragma: allowlist secret
                  "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"):  # base32 walk  # pragma: allowlist secret
         must_raise(nbr._validate_secret_strength, ValueError, weak)
+    # and a randomized hex-word sweep must be rejected (enumerable construction)
+    import random as _rnd
+    _W = ("dead", "beef", "cafe", "f00d", "ba5e", "ba11", "feed", "face",
+          "d00d", "1dea", "b00b", "8bad", "0ff1", "fee1", "babe", "c0de")
+    _rnd.seed(7)
+    hexword_accepted = sum(
+        1 for _ in range(1500)
+        if not _raises(nbr._validate_secret_strength, ValueError,
+                       "".join(_rnd.choice(_W) for _ in range(8))))
+    assert hexword_accepted == 0, f"{hexword_accepted}/1500 enumerable hex-word secrets accepted"
 
 @case("R-Hardening", "result-signature verification")
 def _():
@@ -2524,6 +2539,37 @@ def _():
     must_raise(audio_summary._validate_text, audio_summary.AudioSummaryError,
                cyrillic)
 
+@case("BB-AudioSummary", "audio_summary refuses zero-width / non-map homoglyph token smuggling")
+def _():
+    from mcp_terra import audio_summary
+    PRE = "This is a long enough summary that meets the minimum length here. "
+    B = "A" * 30
+    # zero-width / format / combining chars inserted mid-token (NFKC keeps them;
+    # the curated fold previously did NOT strip them) + scripts outside the
+    # curated map (Armenian, small-caps, Cherokee, Lisu). ALL must be refused.
+    for tok in (
+        "ya29." + B[:5] + "​" + B[5:],   # ZWSP mid-body
+        "ya​29." + B,                      # ZWSP in prefix
+        "ya‌29." + B,                      # ZWNJ
+        "ya﻿29." + B,                      # BOM
+        "ya29." + B[:3] + "́" + B[3:],     # combining acute
+        "yձ29." + B,                       # Armenian letter
+        "yᴀ29." + B,                       # small-cap A
+        "ʏᴀ29." + B,                  # small-cap Y + A
+        "yᎪ29." + B,                       # Cherokee A
+        "yꓮ29." + B,                       # Lisu A
+    ):
+        must_raise(audio_summary._validate_text, audio_summary.AudioSummaryError,
+                   PRE + tok + " end")
+    # NO false positives: legit non-ASCII prose (incl. a German umlaut compound
+    # and a digit-bearing sentence) must still render.
+    for clean in (
+        "Αναλύσαμε τα δεδομένα και βρήκαμε σημαντικά αποτελέσματα στο σύνολο.",
+        "Die Größenänderung des Rindfleischetikettierungsgesetzes lief 2024 gut genug.",
+        "We processed 1000 samples and found 42 significant hits across 3 cohorts.",
+    ):
+        audio_summary._validate_text(clean)   # must NOT raise
+
 @case("BB-AudioSummary", "audio_summary refuses CR in text")
 def _():
     from mcp_terra import audio_summary
@@ -2563,6 +2609,20 @@ def _():
     must_raise(email_send._validate_inputs, email_send.EmailError,
                f"clean subject {cyrillic_ya29}", "body",
                "20260101T000000Z-abcd1234", _ack)
+    # zero-width / format / combining + non-map scripts must ALL be refused
+    B = "A" * 30
+    for tok in ("ya29." + B[:5] + "​" + B[5:],   # ZWSP mid-body
+                "ya​29." + B,                      # ZWSP in prefix
+                "ya‌29." + B,                      # ZWNJ
+                "ya29." + B[:3] + "́" + B[3:],     # combining acute
+                "yᴀ29." + B,                       # small-cap A
+                "yᎪ29." + B):                      # Cherokee A
+        must_raise(email_send._validate_inputs, email_send.EmailError,
+                   f"clean subject {tok}", "body", "20260101T000000Z-abcd1234", _ack)
+    # NO false positives: a digit-bearing German umlaut compound subject sends.
+    email_send._validate_inputs(
+        "Die Größenänderung lief 2024 gut genug für alle", "body",
+        "20260101T000000Z-abcd1234", _ack)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -4978,6 +5038,61 @@ def _():
         _bk2.upload_file, _bk2._run_gsutil, safety.safe_bucket_uri, safety.bucket_object_exists = o
 
 
+@case("CC-Hardening", "recursive verify is symmetric across gsutil naming forms (no form-decoy mask)")
+def _():
+    # A CORRECT decoy at the gsutil naming form NOT used must not mask a WRONG /
+    # raced object at the form gsutil actually used: BOTH existing candidate URIs
+    # must match, not first-present-wins. Plus the pre-upload collision check must
+    # see BOTH the with-dir and without-dir forms.
+    import os as _os
+    import tempfile
+    from mcp_terra import policy as _p, bucket as _bk2
+    d = tempfile.mkdtemp()
+    base = _os.path.join(d, "src5"); _os.makedirs(base)
+    open(_os.path.join(base, "script.py"), "w").write("xyz")
+    BUCKET = "gs://fc-secure-x/out/"
+    GC, GM = "CRClocal==", "MD5local=="
+
+    def _obj(uri, c, m):
+        return [f"{uri}:", f"  Hash (crc32c):  {c}", f"  Hash (md5):  {m}"]
+
+    def _manifest():
+        # with-dir = CORRECT decoy; without-dir = WRONG real (the form gsutil used)
+        return "\n".join(_obj(f"{BUCKET}src5/script.py", GC, GM)
+                         + _obj(f"{BUCKET}script.py", "BADc==", "BADm==")) + "\n"
+
+    def _run(args, **k):
+        if args and args[0] == "ls":
+            return _manifest()
+        if args and args[0] == "hash":
+            return f"Hash (crc32c):  {GC}\nHash (md5):  {GM}\n"
+        return ""
+    o = (_bk2.upload_file, _bk2._run_gsutil, safety.safe_bucket_uri, safety.bucket_object_exists)
+    try:
+        _bk2.upload_file = lambda *a, **k: "Copying...\n"
+        _bk2._run_gsutil = _run
+        safety.safe_bucket_uri = lambda u: u
+        # no pre-existing object -> collision check passes, verify runs
+        safety.bucket_object_exists = lambda u: False
+        restore = _write_guards_on(_p)
+        try:
+            must_raise(server.terra_upload_to_bucket, safety.SafetyError, base, BUCKET, recursive=True)
+        finally:
+            restore()
+        # pre-upload collision check must refuse a pre-existing object at EITHER
+        # the without-dir OR the with-dir form (both gsutil-possible destinations)
+        for existing in (f"{BUCKET}script.py", f"{BUCKET}src5/script.py"):
+            safety.bucket_object_exists = (lambda e: (lambda u: u == e))(existing)
+            restore = _write_guards_on(_p)
+            try:
+                must_raise(server.terra_upload_to_bucket, safety.SafetyError,
+                           base, BUCKET, recursive=True)
+            finally:
+                restore()
+    finally:
+        _bk2.upload_file, _bk2._run_gsutil, safety.safe_bucket_uri, safety.bucket_object_exists = o
+
+
 @case("CC-ControlledAccessGuard", "terra_health withholds lock/bucket/IAM principals (sentinel) in controlled mode")
 def _():
     from mcp_terra import policy as _p
@@ -5053,6 +5168,48 @@ def _():
     i_guard = src.index('_err = (')
     i_raw = src.index('(out.stderr or "").strip()[:400]')
     assert i_guard < i_raw, "raw stderr must sit inside the controlled-access ternary"
+
+
+@case("CC-ControlledAccessGuard", "batch_job_status projects statusEvents (drops free-text description) under guard")
+def _():
+    # statusEvents[].description is free-text that quotes the failing task path
+    # (WDL call name — a user identifier that can encode cohort/sample tokens) and
+    # the container image path (private image + project id). Under the guard it
+    # must be dropped, keeping only structured type/eventTime/exitCode for triage.
+    import subprocess as _sp
+    import json as _json
+    from mcp_terra import policy as _p, auth as _auth
+    saved = (_p._CONTROLLED_ACCESS, _auth._find_gcloud, _sp.run, _p.assert_project_allowed)
+    SENT_PATH = "PROBE_COHORT_zzz999"
+    SENT_IMG = "PROBE_PRIVATE_PROJECT/secret-pipeline"
+    job = {"status": {"state": "FAILED", "statusEvents": [
+        {"type": "STATUS_CHANGED", "eventTime": "2026-01-01T00:00:00Z",
+         "description": f"Job failed: task task/{SENT_PATH}/0 exited with status 1",
+         "taskExecution": {"exitCode": 1}},
+        {"type": "STATUS_CHANGED", "eventTime": "2026-01-01T00:00:01Z",
+         "description": f"Image pull failed: gcr.io/{SENT_IMG}@sha256:cafe not found"}]}}
+
+    class _R:
+        returncode = 0
+        stdout = _json.dumps(job)
+        stderr = ""
+    _auth._find_gcloud = lambda: "/usr/bin/gcloud"
+    _sp.run = lambda *a, **k: _R()
+    _p.assert_project_allowed = lambda *a, **k: None
+    try:
+        _p._CONTROLLED_ACCESS = True
+        out = server.terra_get_batch_job_status("proj", "uscentral1", "job123")
+        assert SENT_PATH not in out, "statusEvents description leaked a task path under guard"
+        assert "secret-pipeline" not in out and "PROBE_PRIVATE_PROJECT" not in out, \
+            "statusEvents description leaked the image/project under guard"
+        # structured infra-triage fields preserved
+        assert "FAILED" in out and "exitCode" in out and "STATUS_CHANGED" in out
+        # guard OFF returns the full job (incl description) for triage
+        _p._CONTROLLED_ACCESS = False
+        out2 = server.terra_get_batch_job_status("proj", "uscentral1", "job123")
+        assert SENT_PATH in out2, "guard-OFF should return the full job for triage"
+    finally:
+        _p._CONTROLLED_ACCESS, _auth._find_gcloud, _sp.run, _p.assert_project_allowed = saved
 
 
 @case("CC-SessionLimit", "runner atomically CLAIMS each spec via GCS precondition (parallel-safe)")

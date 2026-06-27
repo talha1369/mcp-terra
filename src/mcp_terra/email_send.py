@@ -160,12 +160,21 @@ def _validate_inputs(subject: str, body: str, job_id: str,
                 f"{field_name}. This is a defense-in-depth check (catches "
                 f"stale tokens too)."
             )
-        # Same check on the de-homoglyphed form (NFKC + Cyrillic/Greek fold) —
-        # defeats homoglyph smuggling NFKC alone would miss.
+        # Same check on the de-homoglyphed form (NFKC + Cyrillic/Greek fold +
+        # invisible-char strip) — defeats homoglyph / zero-width smuggling NFKC
+        # alone would miss.
         if _YA29_RE.search(secret_scan.fold_confusables(field_val)):
             raise EmailError(
                 f"refusing to send: ya29.* OAuth-token shape detected in "
                 f"{field_name} (de-homoglyphed). Homoglyph-smuggling defense."
+            )
+        # Catch homoglyphs outside the curated fold (Armenian/Cherokee/small-caps):
+        # a token-shaped run with a non-ASCII letter is not a real (pure-ASCII)
+        # token — refuse rather than risk emailing a smuggled secret.
+        if secret_scan.has_homoglyph_token_shape(field_val):
+            raise EmailError(
+                f"refusing to send: a non-ASCII homoglyph inside a token-shaped "
+                f"run detected in {field_name} (possible secret smuggling)."
             )
     # Defense in depth #2: also block the CURRENTLY-active token by exact
     # match (catches the rare case the regex misses or a non-Google token

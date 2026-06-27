@@ -78,6 +78,14 @@ def _nfkc_check_token_shape(text: str) -> None:
                 "summary_text contains ya29.* OAuth-token shape "
                 "(raw / Unicode-normalized / de-homoglyphed) — refusing."
             )
+    # Catch homoglyphs the curated fold may miss (Armenian/Cherokee/small-caps/…):
+    # a token-shaped run carrying a non-ASCII letter cannot be a real (pure-ASCII)
+    # token, so refuse it rather than read a possibly-smuggled secret aloud.
+    if secret_scan.has_homoglyph_token_shape(text):
+        raise AudioSummaryError(
+            "summary_text contains a non-ASCII homoglyph inside a token-shaped "
+            "run — refusing (possible OAuth/secret smuggling)."
+        )
 
 
 def _validate_text(text: str) -> None:
