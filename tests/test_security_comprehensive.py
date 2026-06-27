@@ -89,6 +89,15 @@ def must_raise(callable_, exc_types, *args, **kwargs):
         return e
 
 
+def _raises(callable_, exc_types, *args, **kwargs) -> bool:
+    """True iff calling raises one of exc_types (for counting false-rejects)."""
+    try:
+        callable_(*args, **kwargs)
+        return False
+    except exc_types:
+        return True
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # A. INJECTION (shell, command, path, log)
 # ──────────────────────────────────────────────────────────────────────────
@@ -1042,6 +1051,36 @@ def _():
         for k, v in (("MCP_TERRA_RUNNER_SECRET", saved), ("MCP_TERRA_RUNNER_SECRET_FILE", savedf)):
             if v is None: _os.environ.pop(k, None)
             else: _os.environ[k] = v
+
+@case("R-Hardening", "strong small-alphabet secrets (openssl rand -hex / token_hex) are NOT rejected")
+def _():
+    # A security engineer commonly generates a secret with `openssl rand -hex N`
+    # (or secrets.token_hex). Hex maxes at 4.0 bits/char and a short sample dips
+    # below the 3.5 per-char Shannon floor by chance — the gate must NOT reject a
+    # cryptographically strong 128–256-bit hex secret (total-entropy acceptance).
+    import secrets as _secrets
+    from mcp_terra import notebook_runner as nbr
+    # token_hex(16)=128 bits/32 chars is the tight case (BEFORE the format-aware
+    # fix it was rejected ~5-19% of the time). Sweep many samples; the only
+    # residual is the inherent ~1e-6 substring collision of the famous-string
+    # screen (a random token happening to contain e.g. 'abc123'), NOT a broad
+    # reject — so allow a tiny floor but assert the rate is essentially zero.
+    rej16 = sum(1 for _ in range(8000)
+                if _raises(nbr._validate_secret_strength, ValueError, _secrets.token_hex(16)))
+    rej32 = sum(1 for _ in range(3000)
+                if _raises(nbr._validate_secret_strength, ValueError, _secrets.token_hex(32)))
+    reju = sum(1 for _ in range(8000)
+               if _raises(nbr._validate_secret_strength, ValueError, _secrets.token_urlsafe(32)))
+    assert rej16 <= 3, f"token_hex(16) broadly false-rejected {rej16}/8000 strong hex secrets"
+    assert rej32 <= 1, f"token_hex(32) broadly false-rejected {rej32}/3000 strong hex secrets"
+    assert reju <= 3, f"token_urlsafe(32) broadly false-rejected {reju}/8000"
+    # the relaxation must NOT admit a genuinely weak low-entropy 32-char string,
+    # a hex WALK, or a periodic hex block (caught by walk/periodicity/unique):
+    for weak in ("aaaabbbbccccddddaaaabbbbccccdddd", "a" * 64,
+                 "0123456789abcdef0123456789abcdef",   # hex walk  # pragma: allowlist secret
+                 "deadbeefdeadbeefdeadbeefdeadbeef",   # periodic hex block  # pragma: allowlist secret
+                 "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"):  # base32 walk  # pragma: allowlist secret
+        must_raise(nbr._validate_secret_strength, ValueError, weak)
 
 @case("R-Hardening", "result-signature verification")
 def _():
@@ -2465,17 +2504,25 @@ def _():
 @case("BB-AudioSummary", "audio_summary refuses homoglyph-encoded ya29 token")
 def _():
     from mcp_terra import audio_summary
-    # Cyrillic 'у' (U+0443) and 'а' (U+0430) instead of ASCII 'y' and 'a'.
-    # Raw substring check misses; NFKC normalization should catch it… but
-    # NFKC does NOT map these Cyrillic chars to ASCII (they're different
-    # scripts). For NFKC defense to work it must be on FULLWIDTH chars
-    # which DO map (U+FF59 → 'y'). Test both:
+    # FULLWIDTH y/a (U+FF59/U+FF41) — folded by NFKC.
     fullwidth = (
         "This is a long enough summary that meets the minimum. "
         + "ｙａ" + "29." + "A" * 30 + " end"
     )
     must_raise(audio_summary._validate_text, audio_summary.AudioSummaryError,
                fullwidth)
+    # CYRILLIC у (U+0443) / а (U+0430) for ASCII y/a — NFKC does NOT fold these
+    # (different scripts); only confusable folding catches them. This is the
+    # regression for the overclaimed-defense finding: it must now REFUSE.
+    cyrillic = (
+        "This is a long enough summary that meets the minimum. "
+        + "уа" + "29." + "A" * 30 + " end"   # Cyrillic у+а fold→ ya
+    )
+    # sanity: the literal bytes are NOT a raw ya29 match (proves the fold matters)
+    import re as _re
+    assert not _re.search(r"ya29\.[A-Za-z0-9_\-]{20,}", cyrillic)
+    must_raise(audio_summary._validate_text, audio_summary.AudioSummaryError,
+               cyrillic)
 
 @case("BB-AudioSummary", "audio_summary refuses CR in text")
 def _():
@@ -2503,11 +2550,19 @@ def _():
 @case("BB-AudioSummary", "email_send refuses homoglyph-encoded ya29 in subject")
 def _():
     from mcp_terra import email_send
+    _ack = "I reviewed runner.stderr line 47, the traceback shows AttributeError on cell 3."
+    # FULLWIDTH (NFKC folds these)
     fullwidth_ya29 = "ｙａ" + "29." + "A" * 30
     must_raise(email_send._validate_inputs, email_send.EmailError,
                f"clean subject {fullwidth_ya29}", "body",
-               "20260101T000000Z-abcd1234",
-               "I reviewed runner.stderr line 47, the traceback shows AttributeError on cell 3.")
+               "20260101T000000Z-abcd1234", _ack)
+    # CYRILLIC у+а (NFKC does NOT fold; needs confusable folding) — regression
+    cyrillic_ya29 = "уа" + "29." + "A" * 30   # Cyrillic у+а fold→ ya
+    import re as _re
+    assert not _re.search(r"ya29\.[A-Za-z0-9_\-]{20,}", cyrillic_ya29)
+    must_raise(email_send._validate_inputs, email_send.EmailError,
+               f"clean subject {cyrillic_ya29}", "body",
+               "20260101T000000Z-abcd1234", _ack)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -4982,6 +5037,22 @@ def _():
         assert "1.23" in out and "0.99" in out  # exact-allowlisted cost fields kept
     finally:
         _p._CONTROLLED_ACCESS, _tc.rawls_get_workflow_cost, server.auth.get_access_token = saved, oc, ot
+
+
+@case("CC-ControlledAccessGuard", "batch_job_status withholds raw gcloud stderr in controlled mode (rc!=0)")
+def _():
+    import inspect as _insp
+    src = _insp.getsource(server.terra_get_batch_job_status)
+    # The rc!=0 path previously returned raw gcloud stderr UNCONDITIONALLY —
+    # before the controlled-access check (which only guarded the rc==0 path).
+    # It must now redact under the guard while preserving triage value when OFF.
+    assert "controlled_access_enabled()" in src
+    assert 'withheld (MCP_TERRA_CONTROLLED_ACCESS)' in src
+    assert '"stderr": _err' in src, "rc!=0 path must return the guarded _err, not raw stderr"
+    # the raw stderr slice must be the ELSE (guard-OFF) branch, not a bare return
+    i_guard = src.index('_err = (')
+    i_raw = src.index('(out.stderr or "").strip()[:400]')
+    assert i_guard < i_raw, "raw stderr must sit inside the controlled-access ternary"
 
 
 @case("CC-SessionLimit", "runner atomically CLAIMS each spec via GCS precondition (parallel-safe)")

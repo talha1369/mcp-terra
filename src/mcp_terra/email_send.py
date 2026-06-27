@@ -43,7 +43,7 @@ import ssl
 import time
 from pathlib import Path
 
-from . import auth, safety
+from . import auth, safety, secret_scan
 
 
 class EmailError(RuntimeError):
@@ -145,10 +145,10 @@ def _validate_inputs(subject: str, body: str, job_id: str,
     # anywhere in body/subject/ack. Catches STALE tokens that no longer
     # equal the freshly-fetched one (Google OAuth tokens live ~3600s; an
     # agent could have captured one earlier and tried to exfil it now).
-    # Check BOTH raw and NFKC-normalized forms so Cyrillic/full-width
-    # homoglyphs (e.g. Cyrillic у/а for ASCII y/a) cannot smuggle a token.
+    # Check raw, NFKC-normalized, AND confusable-folded forms so full-width
+    # AND Cyrillic/Greek homoglyphs (e.g. Cyrillic у/а for ASCII y/a — which
+    # NFKC does NOT fold) cannot smuggle a token.
     import re as _re
-    import unicodedata as _ud
     _YA29_RE = _re.compile(r"ya29\.[A-Za-z0-9_\-]{20,}")
     for field_name, field_val in (
         ("subject", subject), ("body", body),
@@ -160,11 +160,12 @@ def _validate_inputs(subject: str, body: str, job_id: str,
                 f"{field_name}. This is a defense-in-depth check (catches "
                 f"stale tokens too)."
             )
-        # Same check on the NFKC-normalized form — defeats homoglyph smuggling.
-        if _YA29_RE.search(_ud.normalize("NFKC", field_val)):
+        # Same check on the de-homoglyphed form (NFKC + Cyrillic/Greek fold) —
+        # defeats homoglyph smuggling NFKC alone would miss.
+        if _YA29_RE.search(secret_scan.fold_confusables(field_val)):
             raise EmailError(
                 f"refusing to send: ya29.* OAuth-token shape detected in "
-                f"{field_name} (NFKC-normalized). Homoglyph-smuggling defense."
+                f"{field_name} (de-homoglyphed). Homoglyph-smuggling defense."
             )
     # Defense in depth #2: also block the CURRENTLY-active token by exact
     # match (catches the rare case the regex misses or a non-Google token

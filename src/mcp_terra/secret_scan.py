@@ -66,6 +66,46 @@ class SensitiveDataFound(Exception):
         )
 
 
+# ── Visually-confusable codepoint fold (Unicode TR39-style skeleton) ─────────
+# NFKC (compatibility normalization) folds full-width / ligature variants but
+# does NOT fold Cyrillic / Greek look-alikes — they are distinct, non-decomposing
+# letters. So a token like "ya29.<base64>" smuggled with Cyrillic у/а/е/о/с/х
+# (visually identical) slips a raw OR NFKC regex. Mapping the confusables that
+# overlap the Latin alphanumerics used in token/secret shapes back to ASCII
+# closes that bypass. Curated to the [A-Za-z] confusables (token alphabets are
+# [A-Za-z0-9_-]); digits/_/- have no common cross-script confusable worth folding.
+_CONFUSABLES: dict[str, str] = {
+    # Cyrillic lowercase → Latin
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c",
+    "у": "y", "х": "x", "ѕ": "s", "і": "i", "ј": "j",
+    "ԁ": "d", "һ": "h", "ԛ": "q", "ӏ": "l", "ɡ": "g",
+    # Cyrillic uppercase → Latin
+    "А": "A", "В": "B", "Е": "E", "К": "K", "М": "M",
+    "Н": "H", "О": "O", "Р": "P", "С": "C", "Т": "T",
+    "У": "Y", "Х": "X", "Ѕ": "S", "І": "I", "Ј": "J",
+    # Greek lowercase → Latin
+    "ο": "o", "α": "a", "ρ": "p", "ν": "v", "ι": "i",
+    "κ": "k", "υ": "u",
+    # Greek uppercase → Latin
+    "Α": "A", "Β": "B", "Ε": "E", "Ζ": "Z", "Η": "H",
+    "Ι": "I", "Κ": "K", "Μ": "M", "Ν": "N", "Ο": "O",
+    "Ρ": "P", "Τ": "T", "Υ": "Y", "Χ": "X",
+}
+_CONFUSABLE_TABLE = {ord(k): v for k, v in _CONFUSABLES.items()}
+
+
+def fold_confusables(text: str) -> str:
+    """Return `text` with full-width/ligature variants (via NFKC) AND
+    Cyrillic/Greek Latin-look-alikes folded to ASCII.
+
+    A homoglyph-smuggled token/secret then collapses to its ASCII twin, so the
+    same byte-level scan catches it. NFKC alone does NOT fold cross-script
+    confusables — this helper is the missing half of the homoglyph defense.
+    """
+    import unicodedata as _ud
+    return _ud.normalize("NFKC", text).translate(_CONFUSABLE_TABLE)
+
+
 def scan_bytes(blob: bytes, source: str = "<bytes>") -> list[dict]:
     """Return a list of pattern hits in `blob`. Each hit:
         {pattern, severity, offset, preview}

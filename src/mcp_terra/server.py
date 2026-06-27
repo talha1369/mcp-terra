@@ -3504,9 +3504,15 @@ def terra_get_batch_job_status(google_project: str, region: str,
                     "note": "gcloud batch describe timed out.",
                     "logging_command": logging_cmd})
     if out.returncode != 0:
+        # raw gcloud stderr is GCP infra diagnostics (not workspace genomic
+        # data), but it can echo back caller paths/identifiers — withhold it
+        # under the controlled-access guard for belt-and-suspenders.
+        _err = ("withheld (MCP_TERRA_CONTROLLED_ACCESS)"
+                if policy.controlled_access_enabled()
+                else (out.stderr or "").strip()[:400])
         return _ok({"job_name": job_name, "status": None,
                     "note": "could not describe the Batch job (check name/region/IAM).",
-                    "stderr": (out.stderr or "").strip()[:400],
+                    "stderr": _err,
                     "logging_command": logging_cmd})
     try:
         job = json.loads(out.stdout or "{}")

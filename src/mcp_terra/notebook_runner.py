@@ -130,22 +130,47 @@ def _validate_secret_strength(secret) -> None:
             f"Generate with: python -c "
             f"'import secrets; print(secrets.token_urlsafe(32))'"
         )
+    n = len(secret)
     unique = len(set(secret))
-    if unique < 12:
+    import math as _math
+    import re as _re_fmt
+    # Recognize strong small-alphabet generator FORMATS up front. The per-char
+    # diversity / Shannon floors below assume a large alphabet; they structurally
+    # penalize hex (16 symbols, max 4.0 bits/char) and base32 (32, max 5.0),
+    # wrongly rejecting a strong `openssl rand -hex 32` / secrets.token_hex /
+    # base32 key — a 32-char hex key is a full 128 real bits, yet may use only
+    # ~11 of 16 digits and dip below the floors by sampling chance. Exempt a
+    # secret drawn from such an alphabet AND long enough to carry ≥ 128 bits in
+    # it. NOT a loophole: the walk / repetition / common+placeholder checks below
+    # still run, so a degenerate small-alphabet string ('0123…','abab…','aaaa…')
+    # is still rejected.
+    if _re_fmt.fullmatch(r"[0-9a-fA-F]+", secret):
+        _alpha = 16        # hex (openssl rand -hex, secrets.token_hex)
+    elif _re_fmt.fullmatch(r"[A-Z2-7]+", secret):
+        _alpha = 32        # RFC 4648 base32
+    else:
+        _alpha = 0
+    _fmt_strong = bool(_alpha) and n * _math.log2(_alpha) >= 128.0
+    # Character-diversity floor: ≥12 unique for a general secret; a recognized
+    # strong-format key draws from a smaller alphabet, so a lower floor is
+    # correct (degenerate low-unique cases are caught by the walk/periodicity
+    # checks below regardless).
+    _uniq_floor = 7 if _fmt_strong else 12
+    if unique < _uniq_floor:
         raise ValueError(
-            f"MCP_TERRA_RUNNER_SECRET has only {unique} unique chars (need ≥ 12). "
-            f"A length-32 string of 'a' is just as bad as a length-1 string. "
-            f"Use python -c 'import secrets; print(secrets.token_urlsafe(32))' "
-            f"to generate a high-entropy value."
+            f"MCP_TERRA_RUNNER_SECRET has only {unique} unique chars "
+            f"(need ≥ {_uniq_floor}). A length-32 string of 'a' is just as bad "
+            f"as a length-1 string. Use python -c "
+            f"'import secrets; print(secrets.token_urlsafe(32))'."
         )
     # Shannon entropy floor — defeats keyboard-walks like 'abcdefg…' or
     # 'qwertyuiop…' that pass the unique-char threshold but are predictable.
-    import math as _math
+    # Skipped for recognized strong formats (the structural walk / periodicity
+    # checks below still apply to them).
     from collections import Counter as _Counter
     counts = _Counter(secret)
-    n = len(secret)
     shannon = -sum((c / n) * _math.log2(c / n) for c in counts.values())
-    if shannon < 3.5:
+    if shannon < 3.5 and not _fmt_strong:
         raise ValueError(
             f"MCP_TERRA_RUNNER_SECRET Shannon entropy {shannon:.2f} bits/char "
             f"is below 3.5 (looks predictable: alphabet/keyboard walks and "
@@ -179,7 +204,12 @@ def _validate_secret_strength(secret) -> None:
         return False
     if n >= 2:
         walk = sum(1 for i in range(n - 1) if _adjacent(secret[i], secret[i + 1]))
-        if walk / (n - 1) >= 0.5:
+        # A DENSE small alphabet (hex 0-9a-f) has a higher base rate of
+        # walk-adjacent pairs purely by chance (random token_hex peaks ~0.58),
+        # so a strong-format secret uses a higher threshold — a real hex walk
+        # ('0123…abcdef') still scores ~0.90 and is caught.
+        _walk_limit = 0.65 if _fmt_strong else 0.5
+        if walk / (n - 1) >= _walk_limit:
             raise ValueError(
                 f"MCP_TERRA_RUNNER_SECRET is mostly a predictable walk "
                 f"({walk}/{n - 1} adjacent chars are consecutive or keyboard "

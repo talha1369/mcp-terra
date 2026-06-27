@@ -17,8 +17,9 @@ This module trusts only:
 
   • Text fits the cap (≤ 4000 chars ≈ ~3 min audio)
   • Text contains no shell/script smuggling (sanitize_output applied)
-  • Text contains no OAuth-token shape — checked AFTER NFKC normalize
-    (defeats Cyrillic / full-width homoglyph bypass)
+  • Text contains no OAuth-token shape — checked raw, AFTER NFKC normalize,
+    AND after confusable folding (defeats full-width AND Cyrillic/Greek
+    homoglyph bypass; NFKC alone does not fold cross-script look-alikes)
 
 If those pass, the text ships to Cloud TTS and the returned bytes are
 returned. On ANY failure, raises AudioSummaryError — never returns
@@ -61,22 +62,22 @@ def is_configured() -> bool:
 
 
 def _nfkc_check_token_shape(text: str) -> None:
-    """Refuse if text contains ya29.* in raw OR NFKC-normalized form.
+    """Refuse if text contains ya29.* in raw, NFKC-normalized, OR
+    confusable-folded form.
 
-    Defeats Cyrillic-у/а or full-width-y/a homoglyph smuggling, where a
-    raw substring match would miss but the visual rendering is identical
-    to a real OAuth token.
+    NFKC folds full-width / ligature variants; confusable folding additionally
+    maps Cyrillic/Greek look-alikes (у/а/е/о/с/х …) to ASCII. Together they
+    defeat homoglyph smuggling, where a raw substring match would miss but the
+    visual rendering is identical to a real OAuth token.
     """
-    if _YA29_RE.search(text):
-        raise AudioSummaryError(
-            "summary_text contains ya29.* OAuth-token shape (refusing)."
-        )
-    normalized = unicodedata.normalize("NFKC", text)
-    if _YA29_RE.search(normalized):
-        raise AudioSummaryError(
-            "summary_text contains ya29.* OAuth-token shape after Unicode "
-            "normalization (homoglyph smuggling refused)."
-        )
+    for variant in (text,
+                    unicodedata.normalize("NFKC", text),
+                    secret_scan.fold_confusables(text)):
+        if _YA29_RE.search(variant):
+            raise AudioSummaryError(
+                "summary_text contains ya29.* OAuth-token shape "
+                "(raw / Unicode-normalized / de-homoglyphed) — refusing."
+            )
 
 
 def _validate_text(text: str) -> None:
@@ -93,14 +94,18 @@ def _validate_text(text: str) -> None:
         raise AudioSummaryError("summary_text contains CR (refusing).")
     _nfkc_check_token_shape(text)
     # Full secret scan before this text leaves via TTS / persisted audio — the
-    # ya29 check above only covers Google OAuth tokens. Scan raw AND NFKC-
-    # normalized (homoglyph defense), fail closed on ANY hit (AWS keys, GitHub
-    # PATs, Slack tokens, PEM private keys, …). (security review high finding.)
+    # ya29 check above only covers Google OAuth tokens. Scan raw, NFKC-normalized,
+    # AND confusable-folded forms (homoglyph defense), fail closed on ANY hit
+    # (AWS keys, GitHub PATs, Slack tokens, PEM private keys, …).
+    # (security review high finding.)
     hits = secret_scan.scan_bytes(text.encode("utf-8"), "audio-summary")
-    normalized = unicodedata.normalize("NFKC", text)
-    if normalized != text:
-        hits = hits + secret_scan.scan_bytes(normalized.encode("utf-8"),
-                                             "audio-summary-nfkc")
+    for _tag, _variant in (
+        ("nfkc", unicodedata.normalize("NFKC", text)),
+        ("folded", secret_scan.fold_confusables(text)),
+    ):
+        if _variant != text:
+            hits = hits + secret_scan.scan_bytes(_variant.encode("utf-8"),
+                                                 f"audio-summary-{_tag}")
     if hits:
         raise AudioSummaryError(
             f"summary_text contains {len(hits)} secret-shaped value(s); "
