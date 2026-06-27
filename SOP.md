@@ -456,7 +456,7 @@ The MCP also auto-trips if more than 10 refused operations occur within
 
 | Symptom | What to do |
 |---|---|
-| `MCP_TERRA_RUNNER_SECRET must be ≥ 32 chars / low entropy` | Regenerate with the `secrets.token_urlsafe(32)` command in § 2.3 |
+| `MCP_TERRA_RUNNER_SECRET must be ≥ 32 chars / low entropy / looks like a passphrase` | Use a **generated** token, not a typed passphrase: the gate refuses whitespace, long lowercase runs, and known/encoded weak phrases. Regenerate with the `secrets.token_urlsafe(32)` command in § 2.3 (a generated token is occasionally refused ~1e-5 — just run it again). |
 | `terra_submit_notebook_job refuses to run without MCP_TERRA_WORKSPACE` | Set the workspace lock env var and restart the MCP |
 | `runner heartbeat is Xs old (stale > 90s)` | The on-VM runner died. SSH/Jupyter terminal into the VM and restart it (§ 3) |
 | `per-session submit cap reached` | Restart the MCP process; raise `MCP_TERRA_MAX_SUBMITS_PER_SESSION` if you legitimately need more |

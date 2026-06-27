@@ -264,7 +264,7 @@ hijack). To change a value, restart the MCP process.
 | `MCP_TERRA_WORKSPACE` | *(unset)* | Workspace lock | `namespace/name` — restricts the MCP to one workspace. Strongly recommended. |
 | `MCP_TERRA_CONTROLLED_ACCESS` | `0` | NIH controlled data | `1` = refuse raw-data egress to the LLM (`terra_read_bucket_object`, `terra_get_entities`) for non-public buckets — GDS/DUC. Off by default (lab/public analysis unhindered). See [docs/compliance.md](docs/compliance.md). |
 | `MCP_TERRA_DATA_EGRESS_ALLOW` | *(unset)* | Controlled-access exception | Comma/space-separated bucket names you certify as non-controlled (lab-open) that may be read even when the guard is on. Public reference buckets are allowed automatically. |
-| `MCP_TERRA_RUNNER_SECRET` | *(unset)* | Notebook execution | ≥ 32 chars, ≥ 12 unique chars. HMAC-signs job specs. Generate via `python -c 'import secrets; print(secrets.token_urlsafe(32))'`. |
+| `MCP_TERRA_RUNNER_SECRET` | *(unset)* | Notebook execution | HMAC-signs job specs. Must be a generated high-entropy token (≥ 32 chars, ≥ 12 unique); rejected if it contains whitespace, a long run of lowercase letters, or decodes to a known/weak passphrase — a typed passphrase is refused. Generate via `python -c 'import secrets; print(secrets.token_urlsafe(32))'`. |
 | `MCP_TERRA_MAX_CALLS_PER_MIN` | `60` | Rate limit | Bounds the per-minute call rate against runaway loops. |
 | `MCP_TERRA_KILL_REFUSAL_THRESHOLD` | `10` | Auto-kill-switch | Auto-trips the kill switch after N refusals in the window. |
 | `MCP_TERRA_KILL_REFUSAL_WINDOW_SEC` | `60` | Auto-kill-switch | Refusal-counting window for auto-trip. |
