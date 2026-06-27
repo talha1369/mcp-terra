@@ -799,10 +799,15 @@ def terra_create_runtime(
             # produces a NEW generation, so the pinned URI fetches the original (or
             # fails closed if the bucket lacks versioning). The runner is ALSO
             # sha256-verified on the VM, so this is defense-in-depth. NOTE: we do
-            # NOT pin the Leonardo startUserScriptUri this way — it is fetched by
-            # the runtime's own localization (not plain gsutil) and an unverified
-            # `#generation` could break create for everyone; that first-stage
-            # residual is documented in SECURITY.md (co-member trust boundary).
+            # NOT pin the Leonardo startUserScriptUri this way. Verified against the
+            # Leonardo source: it validates the script URI at create time via the
+            # google-cloud-storage BlobId.of(bucket, name) API (no generation arg),
+            # so a `gs://…#<gen>` suffix is treated as a LITERAL object name and the
+            # create call fails object-not-found (RuntimeServiceInterp.
+            # validateBucketObjectUri -> GoogleStorageInterpreter BlobId.of). Pinning
+            # the first stage is therefore impossible without a Leonardo-side
+            # immutable/inline bootstrap; that first-stage residual is documented in
+            # SECURITY.md §7 (co-member trust boundary) with its workspace mitigation.
             if pin_generation:
                 try:
                     _stat = bk._run_gsutil(["stat", dest], timeout=30.0)

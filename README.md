@@ -110,8 +110,12 @@ Run <my-notebook>.ipynb via the auto-fix loop, auto-stop on success, email me th
 **Trust boundaries:**
 - `Agent ⇄ MCP`: stdio, in-process. Agent input is treated as untrusted.
 - `MCP ⇄ GCS bucket`: gsutil with user's OAuth. No-clobber on every write.
-- `MCP ⇄ Runner`: HMAC-SHA256 signed specs bound to `_spec_gcs` + `_submit_ts`.
-  Bucket co-members **cannot** forge or replay jobs.
+- `MCP ⇄ Runner`: HMAC-SHA256 signed specs bound to `_spec_gcs` + `_submit_ts`,
+  so a co-member who only has bucket access cannot forge or replay a job. (Caveat:
+  in a **shared** workspace, a co-member with bucket write access could swap the
+  first-stage VM start script — which Leonardo runs with the runner secret — and
+  capture the key; see SECURITY.md §7 for this co-member trust boundary and the
+  single-user-workspace / restricted-bucket-writer mitigation.)
 - `MCP ⇄ Terra REST`: Sam-authenticated; refuses cross-workspace ops when locked.
 - `Runner ⇄ Notebook`: SHA-256 integrity check before execution. Bucket-side
   tamper between submit and pickup is detected.

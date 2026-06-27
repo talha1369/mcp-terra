@@ -35,7 +35,8 @@ What the MCP **cannot do** by design:
 - Delete or overwrite a single file in the bucket or on your laptop
 - Operate on a workspace you don't own / haven't been granted access to
 - Run any tool when the kill-switch is tripped
-- Submit jobs without a valid HMAC signature (no co-member can forge a job)
+- Submit jobs without a valid HMAC signature (a co-member with only bucket access
+  cannot forge a job; note the shared-workspace first-stage caveat in SECURITY.md §7)
 - Send mail to anyone except your own Terra account email
 
 ---
@@ -411,8 +412,13 @@ See the suggested `docker run` flags in the `Dockerfile` for `--read-only`,
 The MCP refuses by design to delete or overwrite any file. The agent's
 notebook uploads use `.BAK.<timestamp>` versioning. Every notebook job
 is HMAC-signed and replay-bound to a specific GCS path + submit time, so
-a co-member can't forge or replay jobs. The runner verifies the notebook's
-SHA-256 against the spec before executing — bucket-side tamper is caught.
+a co-member who only has bucket access can't forge or replay jobs. (In a
+**shared** workspace, a co-member with bucket write access could swap the
+first-stage VM start script Leonardo runs with the runner secret — a
+documented co-member trust boundary; see SECURITY.md §7 and prefer a
+single-user workspace or restricted bucket-writer IAM.) The runner verifies
+the notebook's SHA-256 against the spec before executing — bucket-side tamper
+is caught.
 The agent never sees the runner secret; it's scrubbed from papermill's
 environment. Reports email only to your own Terra account email. The audit
 log is an HMAC-chained, rotating file at `~/.mcp-terra/audit.log` — any
