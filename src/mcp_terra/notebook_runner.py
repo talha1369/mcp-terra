@@ -299,7 +299,15 @@ def _validate_secret_strength(secret, _depth: int = 0) -> None:
         _np = bytes(_b for _b in _dec if not 0x20 <= _b <= 0x7e)
         _ratio = (len(_dec) - len(_np)) / len(_dec) if _dec else 0.0
         _found = bool(_sq) and (_ratio >= 0.85 or (_np and len(set(_np)) <= 2))
-        if _found:
+        # The famous-phrase / walk squeeze screens depend only on `_sq` (a length-
+        # bounded dictionary/structure lookup that does NOT false-reject a random
+        # key), so run them whenever the squeeze is SUBSTANTIAL relative to the
+        # decode — not only under the ≤2-distinct _found gate. This catches a famous
+        # phrase interleaved with ≥3 DISTINCT control bytes (which keeps _found
+        # False) while still skipping a random key: token_urlsafe decodes ~37%
+        # printable so its squeeze is < 0.45·len(_dec) and never reaches here.
+        _screen_text = _found or (len(_sq) >= 16 and len(_sq) >= 0.45 * len(_dec))
+        if _screen_text:
             _hit = _secret_common_hit(_sq)
             if _hit:
                 raise ValueError(
@@ -312,6 +320,9 @@ def _validate_secret_strength(secret, _depth: int = 0) -> None:
                     "MCP_TERRA_RUNNER_SECRET is an encoding of a predictable walk/"
                     "repeated pattern. Use python -c "
                     "'import secrets; print(secrets.token_urlsafe(32))'.")
+        if _found:
+            # FULL length/diversity validate stays _found-gated: a random key's
+            # coincidental printable run must not be length-rejected (R21/R22).
             try:
                 _validate_secret_strength(_sq, _depth=_depth + 1)
             except ValueError as _e:

@@ -1145,6 +1145,16 @@ def _():
     for _lvl in range(4):
         _enc = _b642.b64encode(_enc.encode()).decode()
         must_raise(nbr._validate_secret_strength, ValueError, _enc)
+    # REGRESSION (R26): a famous phrase interleaved with >=3 DISTINCT control bytes
+    # (which keeps the non-printable bytes >2-distinct, so the ≤2 _found gate is
+    # False) must still be rejected — the squeeze famous/walk screen now runs
+    # whenever the squeeze is substantial relative to the decode.
+    _phrase = b"correct horse battery staple"
+    _inter = bytearray()
+    for _i, _c in enumerate(_phrase):
+        _inter += bytes([_c, 1 + (_i % 8)])      # cycle 8 distinct control bytes
+    must_raise(nbr._validate_secret_strength, ValueError, _b642.b32encode(bytes(_inter)).decode())
+    must_raise(nbr._validate_secret_strength, ValueError, _b642.b64encode(bytes(_inter)).decode())
     # REGRESSION (R15): a base64-encoded phrase whose ciphertext happens to be a
     # valid base32 alphabet (no 0/1/8/9/+/) must NOT be mis-classified as base32 and
     # routed to a garbage base32 decode that passes — every applicable decoding is
@@ -2498,6 +2508,19 @@ def _():
     for _clabel in ("AWS secreт access key: " + KEY,
                     "AWS secret access кey: " + KEY):
         assert secret_scan.scan_egress(_clabel), f"missed Cyrillic-label AWS secret: {_clabel[:20]!r}"
+    # REGRESSION (R26): a single UNFOLDED homoglyph (any codepoint/script) in a
+    # label word is caught by the homoglyph-robust fuzzy AWS-label matcher — small-
+    # capital S ꜱ (U+A731), Latin k-with-descender ⱪ (U+2C6A), Cherokee Ꮶ (U+13E6),
+    # Cyrillic abkhasian che ҽ (U+04BD) — the value is the intact 40-char ASCII key.
+    for _cp, _lc in ((0xA731, "s"), (0x2C6A, "k"), (0x13E6, "k"), (0x04BD, "e")):
+        _w = {"s": "secret", "k": "key", "e": "secret"}[_lc]
+        _lbl = "AWS secret access key: "
+        _idx = _lbl.index(_w) + _w.index(_lc)
+        _hl = _lbl[:_idx] + chr(_cp) + _lbl[_idx + 1:] + KEY
+        assert secret_scan.scan_egress(_hl), f"missed {_lc}->{hex(_cp)} label-homoglyph AWS secret"
+    # NO false positive: 'secret'/'key' in ordinary prose (no 40-char value) renders
+    assert not secret_scan.scan_egress(
+        "The secret to success is the key insight reproduced across replicates today.")
 
 @case("Y-SecretScan", "PEM private-key header blocks upload")
 def _():

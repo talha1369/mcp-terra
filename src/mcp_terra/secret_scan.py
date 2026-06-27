@@ -53,6 +53,35 @@ _PATTERNS: list[tuple[str, re.Pattern[bytes], str]] = [
     # PEM certificate is NOT a secret — explicitly NOT matched.
 ]
 
+# Homoglyph-ROBUST AWS-secret-label matcher. The AWS secret VALUE is the only
+# in-scope credential with NO self-identifying value prefix (the bare 40-char value
+# is a documented accepted residual), so its detection relies entirely on the
+# 'secret … key' label. A single UNFOLDED homoglyph in a label word — ꜱecret, ⱪey,
+# any script/codepoint the curated fold misses — would otherwise leak the intact
+# value. This matcher runs on a SKELETON of the text where every non-ASCII char is
+# replaced by a sentinel (\x01); each keyword may contain AT MOST ONE sentinel
+# (every other letter must be the exact ASCII keyword letter), so a pure-foreign
+# word cannot match (it has no exact keyword letters) — closing the whole label-
+# homoglyph class for ALL codepoints without per-glyph enumeration, FP-free.
+_LABEL_SENTINEL = "\x01"
+
+
+def _fuzzy_kw(word: str) -> str:
+    """Regex matching `word` exactly, or with exactly ONE letter replaced by the
+    homoglyph sentinel — i.e. one cross-script homoglyph anywhere in the keyword."""
+    import re as _re
+    alts = [_re.escape(word)]
+    for _i in range(len(word)):
+        alts.append(_re.escape(word[:_i]) + _LABEL_SENTINEL + _re.escape(word[_i + 1:]))
+    return "(?:" + "|".join(alts) + ")"
+
+
+_AWS_LABEL_FUZZY = re.compile(
+    _fuzzy_kw("secret") + r"[\s_\x01-]{0,4}"
+    + r"(?:" + _fuzzy_kw("access") + r"[\s_\x01-]{0,4})?"
+    + _fuzzy_kw("key") + r"[\"'\s_\x01-]*[:=][\s_\x01-]*[\"']?[A-Za-z0-9/+=]{40}",
+    re.IGNORECASE)
+
 _MAX_SCAN_BYTES = 8 * 1024 * 1024   # 8 MiB cap on per-file scan
 
 
@@ -521,6 +550,16 @@ def scan_egress(text: str) -> list[dict]:
                 hits.append({"pattern": name, "severity": sev,
                              "source": "egress-charsplit", "offset": _m.start(),
                              "context": f"…[REDACTED—{name}]…"})
+    # Homoglyph-ROBUST AWS-secret-label scan: replace every non-ASCII char in the
+    # fold with the sentinel and match the fuzzy 'secret … key: <40-char value>'
+    # label (≤1 homoglyph per keyword). Closes the label-homoglyph class for ANY
+    # codepoint (ꜱecret / ⱪey / Cherokee / small-cap / …) without per-glyph
+    # enumeration; a pure-foreign word can't match (no exact keyword letters).
+    _label_skel = re.sub(r"[^\x00-\x7f]", _LABEL_SENTINEL, fold)
+    if _AWS_LABEL_FUZZY.search(_label_skel):
+        hits.append({"pattern": "aws_secret_key_assignment", "severity": "CRITICAL",
+                     "source": "egress-label-fuzzy", "offset": 0,
+                     "context": "…[REDACTED—aws_secret_key_assignment]…"})
     # `punct_dense` (base64 alphabet kept) feeds the DECODE pass below: an ENCODED
     # secret split by whitespace OR punctuation re-contiguates here for decoding.
     punct_dense = re.sub(r"[^A-Za-z0-9+/=_-]", "", fold)
