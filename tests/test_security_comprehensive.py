@@ -4872,7 +4872,7 @@ def _():
     # honest estimate: CUMULATIVE uptime x rate (no hardcoded prices). The cap is
     # a LIFETIME ceiling — spend is the persisted prior sessions + this session,
     # so a pause/resume does not reset the cap window.
-    assert "_total_s/3600.0*$VM_HOURLY_USD" in s
+    assert 'awk -v t="$_total_s" -v r="$VM_HOURLY_USD"' in s and "t/3600.0*r" in s
     assert "SPEND_PRIOR_SEC" in s and "SPEND_ACCUM_FILE" in s
     assert "SPEND_PRIOR_SEC + (_now_c - RUNNER_START_EPOCH)" in s
     # halts via STOP (not delete) when over the cap, warns at 80%
@@ -5034,6 +5034,125 @@ def _():
             if v is None: _os.environ.pop(k, None)
             else: _os.environ[k] = v
 
+@case("CC-SpendCap", "cross-PROCESS reservations cannot overshoot (exercises the flock, not just threads)")
+def _():
+    import os as _os
+    import tempfile
+    import pathlib
+    import multiprocessing as _mp
+    # The thread test above shares ONE process, so the in-process threading.Lock
+    # alone satisfies it — it CANNOT detect loss of the cross-process fcntl.flock
+    # (the _ledger_locked docstring explicitly claims multi-PROCESS mutual
+    # exclusion). This forks real processes: each child gets its OWN copy of the
+    # threading.Lock, so the FILE flock is the only thing serializing
+    # check-then-record. Remove the flock and independent MCP processes
+    # oversubscribe — this test then fails.
+    if not hasattr(_os, "fork"):
+        return  # POSIX-only; the flock guard is POSIX
+    saved = {k: _os.environ.get(k) for k in ("MCP_TERRA_BUDGET_USD", "MCP_TERRA_BUDGET_WINDOW_DAYS")}
+    led, lock = policy._SPEND_LEDGER, policy._SPEND_LEDGER_LOCK
+    try:
+        _os.environ["MCP_TERRA_BUDGET_USD"] = "100"
+        _os.environ["MCP_TERRA_BUDGET_WINDOW_DAYS"] = "30"
+        base = pathlib.Path(tempfile.mkdtemp())
+        policy._SPEND_LEDGER = base / "p.jsonl"
+        policy._SPEND_LEDGER_LOCK = base / "p.lock"
+        now = 1_000_000_000.0
+        ctx = _mp.get_context("fork")
+        n = 12
+        barrier = ctx.Barrier(n)
+        admitted = ctx.Value("i", 0)
+
+        def _proc():
+            try:
+                barrier.wait(10)      # all 12 contend on the lock at the same instant
+                policy.reserve_within_budget(30, "p%d" % _os.getpid(), now)
+                with admitted.get_lock():
+                    admitted.value += 1
+            except policy.PolicyError:
+                pass
+            except Exception:
+                pass
+
+        procs = [ctx.Process(target=_proc) for _ in range(n)]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(30)
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
+        spent = policy.windowed_spend_usd(now)
+        # 3*$30=$90<=$100; a 4th ($120) would exceed it. The flock must admit
+        # EXACTLY 3 across processes, and the recorded total must never overshoot.
+        assert admitted.value == 3, "expected exactly 3 cross-process reservations, got %d" % admitted.value
+        assert spent == 90.0 and spent <= 100.0, "cross-process budget overshoot: $%s" % spent
+    finally:
+        policy._SPEND_LEDGER, policy._SPEND_LEDGER_LOCK = led, lock
+        for k, v in saved.items():
+            if v is None: _os.environ.pop(k, None)
+            else: _os.environ[k] = v
+
+@case("CC-SpendCap", "the spend lock is a real cross-PROCESS mutex (2nd process BLOCKS on the flock)")
+def _():
+    import os as _os
+    import tempfile
+    import pathlib
+    import time
+    import multiprocessing as _mp
+    # DETERMINISTIC guard for the cross-process flock (the overshoot test above can
+    # only catch its loss probabilistically — the race is sub-millisecond). One
+    # process holds _ledger_locked(strict=True) for `hold` seconds; a second must
+    # BLOCK until release. Forked children each get their own threading.Lock, so a
+    # 2nd process can only be blocked by the FILE flock — remove it and the 2nd
+    # process enters near-instantly, failing this test reliably.
+    if not hasattr(_os, "fork"):
+        return
+    led, lock = policy._SPEND_LEDGER, policy._SPEND_LEDGER_LOCK
+    try:
+        base = pathlib.Path(tempfile.mkdtemp())
+        policy._SPEND_LEDGER = base / "x.jsonl"
+        policy._SPEND_LEDGER_LOCK = base / "x.lock"
+        ctx = _mp.get_context("fork")
+        a_locked = base / "a_locked"
+        hold = 2.0
+        a_at = ctx.Value("d", -1.0)
+        b_at = ctx.Value("d", -1.0)
+
+        def _holder():
+            with policy._ledger_locked(strict=True):
+                a_at.value = time.time()
+                a_locked.write_text("1")
+                time.sleep(hold)
+
+        def _contender():
+            for _ in range(400):
+                if a_locked.exists():
+                    break
+                time.sleep(0.01)
+            with policy._ledger_locked(strict=True):
+                b_at.value = time.time()
+
+        pa = ctx.Process(target=_holder)
+        pb = ctx.Process(target=_contender)
+        pa.start()
+        for _ in range(400):
+            if a_locked.exists():
+                break
+            time.sleep(0.01)
+        pb.start()
+        pa.join(15)
+        pb.join(15)
+        for p in (pa, pb):
+            if p.is_alive():
+                p.terminate()
+        assert a_at.value > 0 and b_at.value > 0, "both processes must have acquired the lock"
+        waited = b_at.value - a_at.value
+        assert waited >= hold * 0.5, \
+            "2nd process did not block on the cross-process lock (waited %.2fs < %.1fs) — flock not enforced" % (waited, hold)
+    finally:
+        policy._SPEND_LEDGER, policy._SPEND_LEDGER_LOCK = led, lock
+
 @case("CC-SpendCap", "ledger self-compacts to the window (no unbounded growth)")
 def _():
     import os as _os
@@ -5185,15 +5304,33 @@ def _():
         _os.environ["MCP_TERRA_BUDGET_WINDOW_DAYS"] = "30"
         base = pathlib.Path(tempfile.mkdtemp())
         now = 1_000_000_000.0
-        # (a) ledger EXISTS but is unreadable (a directory) → reserve must raise,
-        # NOT treat as empty and overwrite. windowed_spend (lenient) returns 0.
-        as_dir = base / "ledger_is_a_dir.jsonl"
-        as_dir.mkdir()
-        policy._SPEND_LEDGER = as_dir
-        policy._SPEND_LEDGER_LOCK = base / "ok.lock"
-        assert policy.windowed_spend_usd(now) == 0.0  # lenient reader tolerates it
-        must_raise(policy.reserve_within_budget, policy.PolicyError, 10, "r", now)
-        assert as_dir.is_dir()  # nothing overwrote it
+        # (a) ledger EXISTS, holds a PRIOR commitment, but its bytes cannot be read
+        # (chmod 000). reserve must FAIL CLOSED on the read error — NOT treat it as
+        # $0-spent and OVERWRITE it (dropping the prior commitment). A directory was
+        # the old probe, but os.replace onto a dir trips the WRITE guard too, so it
+        # passed even if the strict READ guard were removed. An unreadable regular
+        # file isolates the read guard: the containing dir stays writable, so a
+        # broken (lenient) reserve WOULD overwrite — and this test would then fail.
+        unread = base / "u.jsonl"
+        policy._SPEND_LEDGER = unread
+        policy._SPEND_LEDGER_LOCK = base / "u.lock"
+        policy.record_run_cost(95, "prior_commit", now)   # seed $95 of the $100 budget
+        unread.chmod(0o000)
+        # skip the read-error assertion only where perms are not enforced (e.g. root,
+        # which can read 000 files); the non-UTF-8 test covers the read guard there.
+        _really_unreadable = True
+        try:
+            unread.read_bytes()
+            _really_unreadable = False
+        except OSError:
+            pass
+        if _really_unreadable:
+            must_raise(policy.reserve_within_budget, policy.PolicyError, 10, "r", now)
+            unread.chmod(0o600)
+            assert "prior_commit" in unread.read_text(), \
+                "read-error guard removed: unreadable ledger was overwritten, dropping the prior commitment"
+        else:
+            unread.chmod(0o600)
         # (b) cross-process lock cannot be acquired (lock dir does not exist) →
         # reserve fails closed rather than degrading to thread-only.
         policy._SPEND_LEDGER = base / "l.jsonl"
@@ -5299,8 +5436,10 @@ def _():
     s = nbr.start_runner_script_template()
     # an independent watchdog stops the VM at the cap even if the main runner dies
     assert "spend-cap watchdog" in s and "crash-safe" in s
-    # it only arms when BOTH cap and rate are set
-    assert '$_WD_CAP>0 && $_WD_RATE>0' in s
+    # it only arms when BOTH cap and rate are set — and the cap/rate reach awk as
+    # DATA (-v), never interpolated as awk CODE (no injection / no coerce-to-0 disarm)
+    assert 'awk -v c="$_WD_CAP" -v r="$_WD_RATE"' in s and "c>0 && r>0" in s
+    assert '"BEGIN{exit !($_WD_CAP' not in s, "must not interpolate the cap into awk code"
     # it STOPS (pause), never deletes
     assert "instances stop" in s and "instances delete" not in s
     # security review [high]: cumulative across pause/resume (no per-resume reset)
@@ -5552,6 +5691,95 @@ def _():
     assert ks < ms, "runner must kill_pool before the spend-cap marker upload"
     # security review [high]: watchdog armed before the secret requirement
     assert start.index("watchdog armed") < start.index("MCP_TERRA_RUNNER_SECRET must be set")
+
+
+def _run_watchdog_snippet(env_overrides, accum_content=None, timeout=20):
+    """Render spend_watchdog_snippet() and RUN it under bash with stubbed cloud
+    tools, returning (rc, stdout, stderr, events). Lets the fail-closed paths be
+    EXECUTED (not merely string-grepped): a tautological source check cannot tell
+    whether the real guard still fires, but this can."""
+    import os
+    import tempfile
+    import subprocess
+    import pathlib
+    from mcp_terra import notebook_runner as nbr
+    d = pathlib.Path(tempfile.mkdtemp())
+    stub = d / "bin"; stub.mkdir()
+    events = d / "events"; events.write_text("")
+    for t in ("gcloud", "gsutil", "pkill", "sudo", "shutdown", "poweroff", "setsid"):
+        p = stub / t
+        p.write_text('#!/bin/sh\necho "%s $*" >> "%s"\nexit 0\n' % (t, events))
+        p.chmod(0o755)
+    curl = stub / "curl"
+    curl.write_text('#!/bin/sh\necho "curl $*" >> "%s"\n'
+                    'case "$*" in *name*) printf fakevm;; *zone*) printf p/zones/z;; esac\nexit 0\n' % events)
+    curl.chmod(0o755)
+    accum = d / "accum"
+    if accum_content is not None:
+        accum.write_bytes(accum_content if isinstance(accum_content, bytes) else accum_content.encode())
+    env = dict(os.environ)
+    env["PATH"] = "%s:/usr/bin:/bin:/usr/sbin:/sbin" % stub
+    env["WD_EVENTS"] = str(events)
+    env["MCP_TERRA_BUCKET"] = "gs://fake"
+    env["MCP_TERRA_SPEND_ACCUM_FILE"] = str(accum)
+    env.update(env_overrides)
+    script = "set -euo pipefail\n" + nbr.spend_watchdog_snippet() + "\necho RUNNER-LAUNCHED\n"
+    try:
+        r = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout, r.stderr, events.read_text()
+    except subprocess.TimeoutExpired:
+        return 124, "", "TIMEOUT", events.read_text()
+
+
+@case("CC-SpendCap", "watchdog EXECUTABLY fails closed on a corrupt accumulator (aborts launch + stops VM)")
+def _():
+    # The source-grep test alone can't catch removal of the runner-launch `exit 1`;
+    # this RUNS the corrupt-accumulator path and proves the script aborts (non-zero,
+    # no RUNNER-LAUNCHED) and attempts the VM stop. cap/rate are valid so the
+    # accumulator branch is actually reached.
+    env = {"MCP_TERRA_MAX_COST_USD": "10", "MCP_TERRA_VM_HOURLY_USD": "5"}
+    for label, content in [("non-digit", b"abc\n"), ("11-digit-overflow", b"99999999999\n"), ("empty", b"")]:
+        rc, out, err, events = _run_watchdog_snippet(env, accum_content=content)
+        blob = out + err
+        assert rc != 0, "%s: expected non-zero exit, got 0 (runner would launch uncapped)" % label
+        assert "RUNNER-LAUNCHED" not in blob, "%s: runner launched despite corrupt accumulator" % label
+        assert "failing closed" in blob, "%s: missing fail-closed message" % label
+        assert ("gcloud" in events) or ("poweroff" in events) or ("shutdown" in events), \
+            "%s: VM stop was not attempted" % label
+
+
+@case("CC-SpendCap", "watchdog rejects non-numeric / awk-injection cap-rate (fail closed, no code exec)")
+def _():
+    import tempfile
+    import pathlib
+    # non-numeric / non-finite cap OR rate must FAIL CLOSED, not silently coerce to 0
+    for cap, rate in [("abc", "5"), ("10", "xyz"), ("inf", "5"), ("nan", "5"), ("1e400", "5")]:
+        rc, out, err, events = _run_watchdog_snippet(
+            {"MCP_TERRA_MAX_COST_USD": cap, "MCP_TERRA_VM_HOURLY_USD": rate})
+        blob = out + err
+        assert rc != 0 and "RUNNER-LAUNCHED" not in blob, \
+            "cap=%r rate=%r must fail closed, did not (rc=%s)" % (cap, rate, rc)
+        assert "failing closed" in blob, "cap=%r rate=%r: no fail-closed message" % (cap, rate)
+    # empty / unset cap is the legitimate OPT-OUT (no spend cap) — the feature is
+    # opt-in, so it must run NORMALLY (not arm, not fail closed)
+    rc, out, err, events = _run_watchdog_snippet(
+        {"MCP_TERRA_MAX_COST_USD": "", "MCP_TERRA_VM_HOURLY_USD": "5"})
+    blob = out + err
+    assert rc == 0 and "RUNNER-LAUNCHED" in blob and "watchdog armed" not in blob, \
+        "empty cap must opt out (run uncapped), not arm or fail (rc=%s)" % rc
+    # a value that CONTAINS awk source must be passed as data, never executed
+    sentinel = pathlib.Path(tempfile.mkdtemp()) / "PWNED"
+    inj = '0)} END{system("touch %s")} BEGIN{exit !(1' % sentinel
+    rc, out, err, events = _run_watchdog_snippet(
+        {"MCP_TERRA_MAX_COST_USD": inj, "MCP_TERRA_VM_HOURLY_USD": "5"})
+    assert not sentinel.exists(), "awk injection EXECUTED: sentinel file was created"
+    assert rc != 0 and "RUNNER-LAUNCHED" not in (out + err), "injection must fail closed"
+    # a clean numeric cap+rate still ARMS and launches the runner (no false positives)
+    rc, out, err, events = _run_watchdog_snippet(
+        {"MCP_TERRA_MAX_COST_USD": "1000.0", "MCP_TERRA_VM_HOURLY_USD": "2.5"})
+    blob = out + err
+    assert rc == 0 and "watchdog armed" in blob and "RUNNER-LAUNCHED" in blob, \
+        "valid cap/rate must arm and launch (rc=%s)" % rc
 
 
 # ──────────────────────────────────────────────────────────────────────────

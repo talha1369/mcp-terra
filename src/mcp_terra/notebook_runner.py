@@ -270,7 +270,8 @@ _WD_CAP="${MCP_TERRA_MAX_COST_USD:-0}"
 _WD_RATE="${MCP_TERRA_VM_HOURLY_USD:-0}"
 _WD_BUCKET="${MCP_TERRA_BUCKET:-}"; _WD_BUCKET="${_WD_BUCKET%/}"
 _WD_ACCUM="${MCP_TERRA_SPEND_ACCUM_FILE:-/home/jupyter/.mcp_terra_spend_seconds}"
-if awk "BEGIN{exit !($_WD_CAP>0 && $_WD_RATE>0)}"; then
+# Helper functions are defined UNCONDITIONALLY (before the arming gate) so the
+# fail-closed numeric check below can stop the VM even on a malformed cap/rate.
   # Stop THIS VM (pause; disk kept; NEVER delete). Kill billable compute first,
   # then retry the cloud stop until accepted — one transient failure must not
   # leave the VM billing with no enforcer.
@@ -328,6 +329,36 @@ if awk "BEGIN{exit !($_WD_CAP>0 && $_WD_RATE>0)}"; then
       || { echo "[watchdog] FATAL: could not stop VM ($_wdr); MANUAL STOP REQUIRED NOW." >&2; return 1; }
     return 0
   }
+  # ── DEFENSE-IN-DEPTH: the validated server path always sends clean numeric
+  # floats, but _WD_CAP/_WD_RATE are read straight from the environment, so a
+  # non-numeric value (anything bypassing the Python parsers) must FAIL CLOSED
+  # rather than let awk coerce it to 0 and silently disarm. Every awk comparison
+  # below passes these as DATA (-v), never as code, so a value that contains awk
+  # source can never execute. _wd_num accepts only a FINITE decimal/scientific
+  # number (rejects abc / inf / nan / 1e400 / awk-code / empty).
+  _wd_num() {
+    awk -v v="$1" 'BEGIN{
+      if (v ~ /^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?$/) {
+        x = v + 0
+        if (x == x && x < 1e308 && x > -1e308) exit 0
+      }
+      exit 1
+    }'
+  }
+  if ! _wd_num "$_WD_CAP" || ! _wd_num "$_WD_RATE"; then
+    echo "[watchdog] non-numeric/non-finite spend cap or rate; failing closed (stopping, not launching runner)." >&2
+    _wd_stop "non-numeric spend cap/rate" 5
+    exit 1
+  fi
+  # A cap set with no positive rate cannot be enforced (no spend estimate) — FAIL
+  # CLOSED rather than launch the runner with a silently-unenforced cap.
+  if awk -v c="$_WD_CAP" -v r="$_WD_RATE" 'BEGIN{exit !(c>0 && r<=0)}'; then
+    echo "[watchdog] spend cap set with no positive hourly rate; failing closed (stopping, not launching runner)." >&2
+    _wd_stop "cap set without enforceable rate" 5
+    exit 1
+  fi
+  # Arm the monitor only when BOTH a cap and a rate are positive (data-safe, -v).
+  if awk -v c="$_WD_CAP" -v r="$_WD_RATE" 'BEGIN{exit !(c>0 && r>0)}'; then
   # Accumulator: ABSENT => valid first boot (0). PRESENT but not a SANE bounded
   # unsigned integer (non-digit, empty, or > 10 digits => bash-arithmetic
   # overflow risk) => CORRUPT. CORRUPT or UNWRITABLE => FAIL CLOSED: stop the VM
@@ -384,8 +415,8 @@ if awk "BEGIN{exit !($_WD_CAP>0 && $_WD_RATE>0)}"; then
       _wddisk=$(( 10#$_wddisk ))
       if [ "$_wddisk" -gt "$_wdtot" ]; then _wdtot="$_wddisk"; fi
       printf '%s\n' "$_wdtot" > "${_WD_ACCUM}.tmp" 2>/dev/null && mv -f "${_WD_ACCUM}.tmp" "$_WD_ACCUM" 2>/dev/null || true
-      _wdest="$(awk "BEGIN{printf \"%.4f\", $_wdtot/3600.0*$_WD_RATE}")"
-      if awk "BEGIN{exit !($_wdest>=$_WD_CAP)}"; then
+      _wdest="$(awk -v t="$_wdtot" -v r="$_WD_RATE" 'BEGIN{printf "%.4f", t/3600.0*r}')"
+      if awk -v e="$_wdest" -v c="$_WD_CAP" 'BEGIN{exit !(e>=c)}'; then
         # STOP COMPUTE + VM FIRST. The marker upload is BACKGROUNDED so a hung
         # GCS/auth dependency can never delay the stop (stop first).
         _wdts="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -688,6 +719,20 @@ echo "[runner] polling $BUCKET/mcp_terra_jobs/ every ${POLL_SEC}s (Ctrl-C to sto
 MAX_COST_USD="${MCP_TERRA_MAX_COST_USD:-0}"
 VM_HOURLY_USD="${MCP_TERRA_VM_HOURLY_USD:-0}"
 COST_WARNED=0
+# Reusable numeric (FINITE decimal/scientific) check; the value reaches awk as
+# DATA (-v), never as code. Rejects abc/inf/nan/1e400/awk-source/empty. The
+# independent watchdog already fail-closes on a malformed cap before this runner
+# starts; this is the in-runner belt-and-suspenders so a non-numeric cap can
+# never be silently coerced to 0 (disarming the cap) or executed as awk source.
+_num() {
+    awk -v v="$1" 'BEGIN{
+      if (v ~ /^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?$/) {
+        x = v + 0
+        if (x == x && x < 1e308 && x > -1e308) exit 0
+      }
+      exit 1
+    }'
+}
 # Cumulative-spend accumulator: the cap is a LIFETIME ceiling on this VM, NOT a
 # per-uptime-session one. startUserScriptUri reruns on every resume, so estimating
 # from the current boot alone would hand each resume a fresh full cap window and
@@ -847,7 +892,11 @@ kill_pool() {
 # the cap for the whole batch before the next top-of-loop check. Halts + exits
 # on breach; warns once at 80%.
 enforce_spend_cap() {
-    awk "BEGIN{exit !($MAX_COST_USD>0 && $VM_HOURLY_USD>0)}" || return 0
+    if ! _num "$MAX_COST_USD" || ! _num "$VM_HOURLY_USD"; then
+        echo "[runner] non-numeric/non-finite spend cap or rate — halting the VM (fail closed)." >&2
+        kill_pool; halt_vm "non-numeric spend cap/rate"; exit 1
+    fi
+    awk -v c="$MAX_COST_USD" -v r="$VM_HOURLY_USD" 'BEGIN{exit !(c>0 && r>0)}' || return 0
     local _now_c _est _ts _total_s _disk_s
     _now_c="$(date +%s)"
     # CUMULATIVE running seconds = persisted prior sessions + this session. The
@@ -864,8 +913,8 @@ enforce_spend_cap() {
     if [ "$_disk_s" -gt "$_total_s" ]; then _total_s="$_disk_s"; fi
     printf '%s\n' "$_total_s" > "${SPEND_ACCUM_FILE}.tmp" 2>/dev/null \
         && mv -f "${SPEND_ACCUM_FILE}.tmp" "$SPEND_ACCUM_FILE" 2>/dev/null || true
-    _est="$(awk "BEGIN{printf \"%.2f\", $_total_s/3600.0*$VM_HOURLY_USD}")"
-    if awk "BEGIN{exit !($_est>=$MAX_COST_USD)}"; then
+    _est="$(awk -v t="$_total_s" -v r="$VM_HOURLY_USD" 'BEGIN{printf "%.2f", t/3600.0*r}')"
+    if awk -v e="$_est" -v c="$MAX_COST_USD" 'BEGIN{exit !(e>=c)}'; then
         echo "[runner] estimated VM spend \$$_est >= cap \$$MAX_COST_USD — STOPPING the VM (stop/pause; persistent disk kept) to avoid exceeding the credit limit." >&2
         # KILL COMPUTE FIRST, then BACKGROUND the marker upload so a hung GCS/auth
         # dependency can never delay the halt (stop first, marker after).
@@ -875,7 +924,7 @@ enforce_spend_cap() {
             | gsutil cp -n - "${BUCKET%/}/mcp_terra_jobs/HALTED-SPEND-CAP.${_ts}.txt" ) >/dev/null 2>&1 &
         halt_vm "spend cap \$$MAX_COST_USD reached"
         exit 0
-    elif [ "$COST_WARNED" -eq 0 ] && awk "BEGIN{exit !($_est>=0.8*$MAX_COST_USD)}"; then
+    elif [ "$COST_WARNED" -eq 0 ] && awk -v e="$_est" -v c="$MAX_COST_USD" 'BEGIN{exit !(e>=0.8*c)}'; then
         echo "[runner] WARN: estimated VM spend \$$_est is >=80% of the \$$MAX_COST_USD cap; the VM will auto-stop at the cap." >&2
         COST_WARNED=1
     fi
