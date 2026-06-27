@@ -1200,6 +1200,67 @@ def terra_upload_to_bucket(local_path: str, bucket_uri: str,
     if dest_exists and version_existing:
         safety.version_existing_bucket(effective_dest, method=version_method)
     up = bk.upload_file(local_path, bucket_uri, recursive=recursive)
+    # READ-BACK VERIFY (adversarial review): bk.upload_file uses `gsutil cp -n`
+    # (no-clobber), which SILENTLY SKIPS if a co-member or other process raced an
+    # object into the destination between our checks/version-move and the upload.
+    # Confirm the destination actually holds OUR content, failing closed — else the
+    # agent (e.g. the bug-fix loop) would proceed as if a fixed notebook landed
+    # while a stale/raced/attacker object remains.
+    import base64 as _b64u
+    import hashlib as _hlu
+    import os as _osu
+    import re as _reu
+
+    def _md5_b64(_p):
+        _h = _hlu.md5()
+        with open(_p, "rb") as _fh:
+            for _c in iter(lambda: _fh.read(1 << 20), b""):
+                _h.update(_c)
+        return _b64u.b64encode(_h.digest()).decode()
+    if not recursive:
+        try:
+            _stat = bk._run_gsutil(["stat", effective_dest], timeout=60.0)
+        except bk.BucketError as _e:
+            raise safety.SafetyError(
+                f"cannot read back {effective_dest} to verify the upload landed "
+                f"({type(_e).__name__}) — refusing to report success.")
+        _md5 = _reu.search(r"Hash \(md5\):\s*(\S+)", _stat)
+        _len = _reu.search(r"Content-Length:\s*(\d+)", _stat)
+        if _md5:
+            _matched = (_md5.group(1) == _md5_b64(local_path))
+        elif _len:   # a composite/large object may carry no md5 → fall back to size
+            _matched = (int(_len.group(1)) == _osu.path.getsize(local_path))
+        else:
+            _matched = False
+        if not _matched:
+            raise safety.SafetyError(
+                f"upload verification failed for {effective_dest}: the destination "
+                f"does not match your local file (a raced `gsutil cp -n` skip) — "
+                f"refusing to report success so stale/raced content is not mistaken "
+                f"for your upload.")
+    else:
+        # recursive: EVERY local file's content (md5, or size if md5 absent) must
+        # be present among the destination objects — a raced skip would drop one.
+        try:
+            _ls = bk._run_gsutil(["ls", "-L", "-r", bucket_uri], timeout=180.0)
+        except bk.BucketError as _e:
+            raise safety.SafetyError(
+                f"cannot list {bucket_uri} to verify the recursive upload "
+                f"({type(_e).__name__}) — refusing to report success.")
+        _have_md5 = set(_reu.findall(r"Hash \(md5\):\s*(\S+)", _ls))
+        _have_len = set(_reu.findall(r"Content-Length:\s*(\d+)", _ls))
+        _missing = 0
+        for _root, _ds, _fs in _osu.walk(local_path):
+            for _f in _fs:
+                _fp = _osu.path.join(_root, _f)
+                if _md5_b64(_fp) in _have_md5 or str(_osu.path.getsize(_fp)) in _have_len:
+                    continue
+                _missing += 1
+        if _missing:
+            raise safety.SafetyError(
+                f"recursive upload verification failed: {_missing} local file(s) not "
+                f"found among destination objects (a raced `gsutil cp -n` skip) — "
+                f"refusing to report success.")
     # security review: raw `gsutil cp` output can enumerate object paths (esp. recursive).
     # In guard mode return a minimal ack (the destination is the caller's own
     # argument); the raw output is back-compat for non-controlled deployments.

@@ -4742,12 +4742,20 @@ def _():
     import tempfile
     from mcp_terra import policy as _p, bucket as _bk2
     SENTINEL = "gs://fc-secure-x/NA12878-secret/out.bam"
-    o_up, o_safe, o_exist = _bk2.upload_file, safety.safe_bucket_uri, safety.bucket_object_exists
+    import hashlib as _hl3
+    import base64 as _b64_3
+    o_up, o_safe, o_exist, o_run = (_bk2.upload_file, safety.safe_bucket_uri,
+                                    safety.bucket_object_exists, _bk2._run_gsutil)
+    _payload = b"clean upload payload, no secrets\n"
+    _exp_md5 = _b64_3.b64encode(_hl3.md5(_payload).digest()).decode()
     _bk2.upload_file = lambda *a, **k: f"Copying file://x [Content-Type=...]\n{SENTINEL}\n"
     safety.safe_bucket_uri = lambda u: u
     safety.bucket_object_exists = lambda u: False
+    # stub the read-back stat to report OUR bytes landed (md5 match) so the new
+    # upload-verification passes; this test is about the controlled-mode ACK.
+    _bk2._run_gsutil = lambda args, **k: f"Hash (md5):  {_exp_md5}\nContent-Length: {len(_payload)}\n"
     fd, tmp = tempfile.mkstemp(suffix=".txt")
-    _os.write(fd, b"clean upload payload, no secrets\n")
+    _os.write(fd, _payload)
     _os.close(fd)
     restore = _write_guards_on(_p)
     try:
@@ -4756,7 +4764,33 @@ def _():
         assert '"ok": true' in out and "uploaded_to" in out
     finally:
         restore()
-        _bk2.upload_file, safety.safe_bucket_uri, safety.bucket_object_exists = o_up, o_safe, o_exist
+        (_bk2.upload_file, safety.safe_bucket_uri, safety.bucket_object_exists,
+         _bk2._run_gsutil) = o_up, o_safe, o_exist, o_run
+        _os.unlink(tmp)
+
+@case("CC-Hardening", "terra_upload_to_bucket fails closed if cp -n skipped (read-back mismatch)")
+def _():
+    import os as _os
+    import tempfile
+    from mcp_terra import policy as _p, bucket as _bk2
+    o_up, o_safe, o_exist, o_run = (_bk2.upload_file, safety.safe_bucket_uri,
+                                    safety.bucket_object_exists, _bk2._run_gsutil)
+    _bk2.upload_file = lambda *a, **k: "Copying file://x\n"
+    safety.safe_bucket_uri = lambda u: u
+    safety.bucket_object_exists = lambda u: False
+    # simulate a raced `cp -n` skip: the destination holds DIFFERENT bytes than our
+    # local file (md5 + size both mismatch) → verification must FAIL CLOSED.
+    _bk2._run_gsutil = lambda args, **k: "Hash (md5):  ZZZZtamperedZZZZ==\nContent-Length: 999999\n"
+    fd, tmp = tempfile.mkstemp(suffix=".ipynb")
+    _os.write(fd, b"the fixed notebook the agent thinks it uploaded\n")
+    _os.close(fd)
+    restore = _write_guards_on(_p)
+    try:
+        must_raise(server.terra_upload_to_bucket, safety.SafetyError, tmp, "gs://fc-secure-x/nb.ipynb")
+    finally:
+        restore()
+        (_bk2.upload_file, safety.safe_bucket_uri, safety.bucket_object_exists,
+         _bk2._run_gsutil) = o_up, o_safe, o_exist, o_run
         _os.unlink(tmp)
 
 

@@ -154,15 +154,21 @@ def _validate_secret_strength(secret) -> None:
     # points OR neighbours on a QWERTY keyboard row (so 'qwerty…' is caught even
     # though its code points are not adjacent). A cryptographically-random token
     # has only a few percent such adjacencies, so it is not affected.
-    _ROWS = ("1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm",
-             "abcdefghijklmnopqrstuvwxyz")
+    # QWERTY adjacency: horizontal ROWS, vertical/staggered COLUMNS, and the
+    # alphabet. Two chars are "walk-adjacent" if consecutive in code point OR
+    # neighbours on any of these — this catches horizontal ('qwerty…'), vertical
+    # ('qazwsxedc…'), digit, and alphabet walks.
+    _WALKS = ("1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm",
+              "1qaz", "2wsx", "3edc", "4rfv", "5tgb",
+              "6yhn", "7ujm", "8ik", "9ol", "0p",
+              "abcdefghijklmnopqrstuvwxyz")
 
     def _adjacent(a, b):
         if abs(ord(a) - ord(b)) <= 1:
             return True
         la, lb = a.lower(), b.lower()
-        for _row in _ROWS:
-            ia, ib = _row.find(la), _row.find(lb)
+        for _w in _WALKS:
+            ia, ib = _w.find(la), _w.find(lb)
             if ia != -1 and ib != -1 and abs(ia - ib) == 1:
                 return True
         return False
@@ -172,8 +178,23 @@ def _validate_secret_strength(secret) -> None:
             raise ValueError(
                 f"MCP_TERRA_RUNNER_SECRET is mostly a predictable walk "
                 f"({walk}/{n - 1} adjacent chars are consecutive or keyboard "
-                f"neighbours) — guessable despite high diversity (an alphabet, "
-                f"digit, or keyboard-row walk). Use python -c "
+                f"neighbours) — guessable despite high diversity (alphabet, digit, "
+                f"or keyboard row/column walk). Use python -c "
+                f"'import secrets; print(secrets.token_urlsafe(32))'."
+            )
+        # Repeated-block / periodicity: a short pattern repeated (e.g. a dictionary
+        # word doubled like 'passwordPASSWORD…') is guessable despite character
+        # diversity. Reject if, for ANY period, >=50% of chars repeat the char one
+        # period earlier. A random token has no such periodicity.
+        best_period = max(
+            sum(1 for i in range(p, n) if secret[i] == secret[i - p]) / (n - p)
+            for p in range(1, n // 2 + 1)
+        )
+        if best_period >= 0.5:
+            raise ValueError(
+                f"MCP_TERRA_RUNNER_SECRET is mostly a repeated pattern "
+                f"({best_period:.0%} periodic) — guessable (e.g. a short word or "
+                f"block repeated). Use python -c "
                 f"'import secrets; print(secrets.token_urlsafe(32))'."
             )
 
