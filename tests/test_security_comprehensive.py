@@ -2846,9 +2846,13 @@ def _():
     # agnostic backstop (no ASCII-digit requirement). All must be CAUGHT.
     homo_secrets = (
         "ya29." + "A" * 5 + "χ" + "A" * 18,        # Greek chi in body
-        "ya29." + "A" * 5 + "ϲ" + "A" * 18,        # Greek lunate sigma in body
+        "ya29." + "A" * 5 + "ϲ" + "A" * 18,        # Greek lunate sigma (lc) in body
         "ghp_" + "Ⲣ" * 4 + "a" * 32,               # Coptic capitals, DIGIT-FREE
         "AKIA" + "Օ" + "PQRSTUVWXYZL" + "Օ" + "MN",  # Armenian O, DIGIT-FREE  # pragma: allowlist secret
+        # REGRESSION (R24): uppercase Greek lunate sigma U+03F9 'Ϲ' (looks like C)
+        # NFKD-decomposes to Σ (exempt science-Greek) BEFORE the post-NFKD fold — the
+        # pre-NFKD fold pass now maps it to 'C' so the byte-scan recovers the key.
+        "AKIA" + chr(0x03F9) + "DEFGHIJKLMNOPQR",   # pragma: allowlist secret
     )
     for gtok in homo_secrets:
         assert _audio_blocked(PRE + gtok + " end"), f"audio leaked homoglyph {gtok!r}"
@@ -6172,7 +6176,12 @@ def _():
              + [os.path.join(repo, f) for f in ("SECURITY.md", "CHANGELOG.md",
                                                 "README.md", "SOP.md")]
              + glob.glob(os.path.join(repo, "docs/*.md"))
-             + glob.glob(os.path.join(repo, ".claude/skills/*/SKILL.md")))
+             + glob.glob(os.path.join(repo, ".claude/skills/*/SKILL.md"))
+             # also the SHIPPED top-level skills tree and plugin manifests — same
+             # class of shipped files; an iteration marker must not leak there either
+             # (R24: this tree was outside the gate).
+             + glob.glob(os.path.join(repo, "skills/*/SKILL.md"))
+             + glob.glob(os.path.join(repo, ".claude-plugin/*.json")))
     bad = []
     for fp in files:
         if not os.path.exists(fp):

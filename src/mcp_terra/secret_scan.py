@@ -227,7 +227,14 @@ def fold_confusables(text: str) -> str:
                 return str(_d)
         return ch
 
-    t = _ud.normalize("NFKD", text)
+    # Fold confusables BEFORE NFKD as well as after: a Greek/Coptic SYMBOL variant
+    # (e.g. U+03F9 GREEK CAPITAL LUNATE SIGMA 'Ϲ', which renders like Latin 'C')
+    # NFKD-decomposes to its canonical base letter (Σ U+03A3) — an exempt science-
+    # Greek letter — BEFORE the post-NFKD table could map it, so the homoglyph would
+    # survive. The pre-NFKD pass maps Ϲ→C (and any other table codepoint) before
+    # NFKD can rewrite it; the post-NFKD pass still catches confusables exposed by
+    # decomposition. Idempotent for ordinary input (ASCII translates to itself).
+    t = _ud.normalize("NFKD", text.translate(_CONFUSABLE_TABLE))
     t = "".join(_foldch(ch) for ch in t
                 if ch in ("\t", "\n", " ") or _ud.category(ch) not in _STRIP_CATS)
     return t.translate(_CONFUSABLE_TABLE)
@@ -275,7 +282,12 @@ def has_homoglyph_token_shape(text: str) -> bool:
     # `orig` = NFKD-normalized text with invisibles/combining stripped (accents
     # collapsed to ASCII; Cyrillic/Greek/… NOT yet folded). `fold` = orig with the
     # confusable + Latin-extras maps applied. They are 1:1 aligned (each map entry
-    # is a single char), so orig[i] and fold[i] correspond.
+    # is a single char), so orig[i] and fold[i] correspond. NOTE: orig is NOT
+    # pre-folded — pre-folding Cyrillic/Greek confusables to ASCII here would make a
+    # legit foreign word's UNMAPPED native letters look inline-adjacent to ASCII and
+    # false-positive (e.g. 'Western-blot-анализ'). The Greek/Coptic SYMBOL-variant
+    # homoglyph (U+03F9 'Ϲ'→C, which NFKD would turn into exempt Σ) is instead caught
+    # by the byte-scan via fold_confusables' pre-NFKD pass; the backstop need not.
     orig = _ud.normalize("NFKD", text)
     orig = "".join(c for c in orig
                    if c in ("\t", "\n", " ") or _ud.category(c) not in _STRIP_CATS)
