@@ -114,7 +114,21 @@ _CONFUSABLES: dict[str, str] = {
     # symbol ϱ as 'p' — fold so the byte-scan recovers a token using them.
     "ϲ": "c", "Ϲ": "C", "ς": "c", "ϵ": "e", "ϐ": "b", "ϱ": "p",
 }
+# Coptic alphabet → Latin, built from codepoints (the glyphs are not eye-
+# distinguishable, so a literal-glyph dict is error-prone). Coptic capitals
+# render near-identically to Latin caps (Ro→P, Kapa→K, Me→M, …); folding lets
+# the byte-scan recover a homoglyph token / PEM header even though PEM keyword
+# words are too short for the ≥16-char run backstop. Each tuple is the CAPITAL
+# codepoint (the lowercase is +1) and its ASCII look-alike.
+_COPTIC_CONFUSABLES = {
+    0x2C80: "A", 0x2C82: "B", 0x2C88: "E", 0x2C8C: "H", 0x2C92: "I",
+    0x2C94: "K", 0x2C98: "M", 0x2C9A: "N", 0x2C9E: "O", 0x2CA2: "P",
+    0x2CA4: "C", 0x2CA6: "T", 0x2CA8: "Y", 0x2CAC: "X",
+}
 _CONFUSABLE_TABLE = {ord(k): v for k, v in _CONFUSABLES.items()}
+for _cp, _lat in _COPTIC_CONFUSABLES.items():
+    _CONFUSABLE_TABLE[_cp] = _lat            # capital
+    _CONFUSABLE_TABLE[_cp + 1] = _lat.lower()  # lowercase (Coptic pairs are cap, cap+1)
 
 # GENUINE science Greek letters that are NOT Latin look-alikes (δ θ λ ξ π σ …),
 # excluded from the homoglyph backstop so 'TGFβ1' / 'λmax-2024' / 'δ13C' / a
@@ -290,6 +304,58 @@ def scan_bytes(blob: bytes, source: str = "<bytes>") -> list[dict]:
                 # context, so the report itself doesn't leak the secret.
                 "context": f"…{preview}[REDACTED—{name}]…",
             })
+    return hits
+
+
+# Boundary-relaxed variants of the anchored secret patterns — for scanning a
+# WHITESPACE-COLLAPSED variant where a secret was split by an inserted space /
+# newline (the \b word-boundaries would otherwise fail once neighbouring words
+# glue onto the secret). The patterns stay distinctive (ya29. / AKIA / ghp_ /
+# xox / PEM / aws_secret), so dropping the boundaries adds negligible FP risk.
+_DENSE_PATTERNS = [
+    (name, re.compile(pat.pattern.replace(rb"\b", b""), pat.flags), sev)
+    for name, pat, sev in _PATTERNS
+]
+
+
+def scan_egress(text: str) -> list[dict]:
+    """Scan agent-authored text bound for an OUTBOUND human channel (TTS audio /
+    email) for ANY secret shape, defeating homoglyph, zero-width, whitespace-
+    split, and encoding evasions. Returns a list of hits (empty = clean):
+
+      • raw, NFKC-normalized, and confusable-folded (+ invisible/combining-
+        stripped) forms scanned with the anchored patterns;
+      • a WHITESPACE-COLLAPSED fold scanned with boundary-relaxed patterns, so a
+        secret split by an inserted space/newline re-contiguates;
+      • a homoglyph-aware PEM-frame check: a real `-----…-----` key header is pure
+        ASCII, so a frame whose interior carries a non-ASCII letter (and folds to
+        a BEGIN/PRIVATE/KEY header) is a smuggled private-key header.
+
+    The homoglyph token backstop (has_homoglyph_token_shape) is complementary and
+    called separately by the egress validators.
+    """
+    import unicodedata as _ud
+    hits: list[dict] = []
+    fold = fold_confusables(text)
+    for variant in (text, _ud.normalize("NFKC", text), fold):
+        if variant:
+            hits += scan_bytes(variant.encode("utf-8", "replace"), "egress")
+    dense = re.sub(r"\s+", "", fold)
+    if dense:
+        blob = dense.encode("utf-8", "replace")
+        for name, pat, sev in _DENSE_PATTERNS:
+            for m in pat.finditer(blob):
+                hits.append({"pattern": name, "severity": sev,
+                             "source": "egress-dense", "offset": m.start(),
+                             "context": f"…[REDACTED—{name}]…"})
+    for m in re.finditer(r"-{4,}[^\n]{0,80}?-{4,}", text):
+        seg = m.group(0)
+        if any(ord(c) > 127 and _ud.category(c)[0] == "L" for c in seg):
+            _up = fold_confusables(seg).upper()
+            if "BEGIN" in _up or "KEY" in _up or "PRIVATE" in _up or "END" in _up:
+                hits.append({"pattern": "private_key_header", "severity": "CRITICAL",
+                             "source": "egress-pem-homoglyph", "offset": m.start(),
+                             "context": "…[REDACTED—private_key_header]…"})
     return hits
 
 

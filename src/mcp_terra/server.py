@@ -25,6 +25,7 @@ in the loop.
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Any
 
@@ -1250,6 +1251,16 @@ def terra_upload_to_bucket(local_path: str, bucket_uri: str,
                 f"does not match your local file (a raced `gsutil cp -n` skip, or a "
                 f"wrong-content same-size object) — refusing to report success.")
     else:
+        # recursive verification walks the local DIRECTORY tree. If local_path is
+        # a regular file, os.walk yields NOTHING, _missing stays 0, and we would
+        # report success WITHOUT verifying the uploaded object (a raced cp -n skip
+        # or wrong object goes undetected). Refuse: a single file must use
+        # recursive=False so it goes through the single-file content-hash verify.
+        if not _os.path.isdir(local_path):
+            raise safety.SafetyError(
+                f"recursive=True requires a directory, but {local_path!r} is a "
+                f"regular file — re-upload it with recursive=False so its content "
+                f"hash is verified.")
         # recursive: verify EACH local file against ITS OWN destination object
         # (matched by relative-path suffix) by CONTENT hash — not size, not global
         # set membership. A raced skip leaves the wrong content at that exact URI.
@@ -3984,6 +3995,16 @@ def terra_render_audio_summary(job_id: str, bucket_uri: str,
             "enable texttospeech.googleapis.com); or run on macOS where the "
             "local `say` fallback works with no setup."
         )
+    # voice_name is an outbound field (goes to the TTS API) AND is logged below by
+    # _pre — validate it to a strict Cloud-TTS voice-id shape BEFORE _pre so an
+    # arbitrary/secret-shaped value can neither be logged nor sent. (security
+    # review.) Empty = backend default.
+    if voice_name and not re.fullmatch(
+            r"[A-Za-z]{2,3}-[A-Za-z]{2,3}-[A-Za-z0-9]+(?:-[A-Za-z0-9]+){0,3}",
+            voice_name):
+        raise ValueError(
+            "voice_name must be a Cloud TTS voice id like 'en-US-Studio-O' "
+            "(letters/digits/hyphens only).")
 
     _pre("terra_render_audio_summary", WRITE_SAFE,
          f"job={job_id} text_len={len(summary_text)} "

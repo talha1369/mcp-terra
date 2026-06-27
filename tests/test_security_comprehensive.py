@@ -1084,8 +1084,29 @@ def _():
                  "deadbeefdeadbeefdeadbeefdeadbeef",   # periodic hex block  # pragma: allowlist secret
                  "deadbeefcafef00dba5eba11feedface",   # 8 hex-words, ~33 bits  # pragma: allowlist secret
                  "cafebabefaceabadfeedd00df00d8bad",   # hex-words  # pragma: allowlist secret
-                 "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"):  # base32 walk  # pragma: allowlist secret
+                 "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567",   # base32 walk  # pragma: allowlist secret
+                 # SPACED/punctuated famous passphrase (the actual xkcd spelling)
+                 # — caught via alnum-normalization, not just contiguous match:
+                 "correct horse battery staple 1234567890",  # pragma: allowlist secret
+                 "Change This Secret Before Production!!"):   # pragma: allowlist secret
         must_raise(nbr._validate_secret_strength, ValueError, weak)
+    # base32/hex of a SPACED famous phrase, and a NUL-INTERLEAVED walk / repeated
+    # word, must all be rejected (the squeeze screen runs the structural checks):
+    import base64 as _b642
+    must_raise(nbr._validate_secret_strength, ValueError,
+               _b642.b32encode(b"correct horse battery staple 1234").decode())
+
+    def _nul_interleave(_b, _grp):
+        _o = bytearray()
+        for _i, _c in enumerate(_b):
+            _o.append(_c)
+            if (_i + 1) % _grp == 0:
+                _o.append(0)
+        return bytes(_o).ljust(40, b"\x00")
+    for _wb in (b"abcdefghijklmnopqrstuvwxyz0123", b"Summer2024Summer2024Summer2024"):
+        for _g in (5, 6, 7):
+            must_raise(nbr._validate_secret_strength, ValueError,
+                       _b642.b32encode(_nul_interleave(_wb, _g)).decode())
     # and a randomized hex-word sweep must be rejected (enumerable construction)
     import random as _rnd
     _W = ("dead", "beef", "cafe", "f00d", "ba5e", "ba11", "feed", "face",
@@ -2761,6 +2782,16 @@ def _():
     inline = "AKIAԜPQRSTUVWXYZLMN0"  # Ԝ U+051C between ASCII letters  # pragma: allowlist secret
     assert _audio_blocked(PRE + inline + " end"), "audio leaked inline homoglyph"
     assert _email_blocked("results " + inline), "email leaked inline homoglyph"
+    # a homoglyph PEM header (Coptic Ⲣ for P in PRIVATE; keyword too short for the
+    # 16-char backstop) must be caught (folded by the byte-scan + the PEM frame).
+    pem = ("-----BEGIN " + "Ⲣ" + "RIVATE KEY-----\nMIIEexamplebody\n"
+           "-----END " + "Ⲣ" + "RIVATE KEY-----")
+    assert _audio_blocked(PRE + pem), "audio leaked homoglyph PEM header"
+    assert _email_blocked("report\n" + pem), "email leaked homoglyph PEM header"
+    # a secret SPLIT by an inserted space must be caught (whitespace-collapse scan)
+    split = "token ya29.A0ARrdaM FAKEBODYxxxxxxxxxxxxxxxx output"
+    assert _audio_blocked(PRE + split), "audio leaked whitespace-split ya29"
+    assert _email_blocked(split), "email leaked whitespace-split ya29"
     # NO false positive: Russian/Cyrillic biomedical prose with HYPHENATED Latin
     # technical terms (Latin head '-' Cyrillic suffix, no inline substitution) —
     # ubiquitous in real summaries — must render in BOTH channels.
@@ -5301,6 +5332,45 @@ def _():
                 restore()
     finally:
         _bk2.upload_file, _bk2._run_gsutil, safety.safe_bucket_uri, safety.bucket_object_exists = o
+
+
+@case("CC-Hardening", "recursive=True on a regular FILE is refused (os.walk verification would be a no-op)")
+def _():
+    # recursive verification walks a directory tree; on a regular file os.walk
+    # yields nothing and would report success WITHOUT verifying the object. Must
+    # refuse so a single file goes through the single-file content-hash verify.
+    import os as _os
+    import tempfile
+    from mcp_terra import policy as _p, bucket as _bk2
+    d = tempfile.mkdtemp()
+    f = _os.path.join(d, "one.txt"); open(f, "w").write("data")
+    BUCKET = "gs://fc-secure-x/out/"
+    o = (_bk2.upload_file, _bk2._run_gsutil, safety.safe_bucket_uri, safety.bucket_object_exists)
+    try:
+        _bk2.upload_file = lambda *a, **k: "Copying...\n"
+        _bk2._run_gsutil = lambda *a, **k: ""
+        safety.safe_bucket_uri = lambda u: u
+        safety.bucket_object_exists = lambda u: False
+        restore = _write_guards_on(_p)
+        try:
+            must_raise(server.terra_upload_to_bucket, safety.SafetyError, f, BUCKET, recursive=True)
+        finally:
+            restore()
+    finally:
+        _bk2.upload_file, _bk2._run_gsutil, safety.safe_bucket_uri, safety.bucket_object_exists = o
+
+
+@case("BB-AudioSummary", "render_audio_summary validates voice_name (allowlist) BEFORE _pre logs it")
+def _():
+    # voice_name is outbound (TTS) AND logged by _pre — it must be validated to a
+    # strict Cloud-TTS voice-id shape before _pre, so a secret-shaped value can be
+    # neither logged nor sent. (Source-level: the behavioral path needs a backend.)
+    import inspect as _insp
+    src = _insp.getsource(server.terra_render_audio_summary)
+    i_voice = src.index("voice_name and not re.fullmatch")
+    i_pre = src.index('_pre("terra_render_audio_summary"')
+    assert i_voice < i_pre, "voice_name must be validated BEFORE _pre()"
+    assert "Cloud TTS voice id" in src
 
 
 @case("CC-ControlledAccessGuard", "terra_health withholds lock/bucket/IAM principals (sentinel) in controlled mode")

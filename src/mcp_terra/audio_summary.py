@@ -101,19 +101,14 @@ def _validate_text(text: str) -> None:
     if "\r" in text:
         raise AudioSummaryError("summary_text contains CR (refusing).")
     _nfkc_check_token_shape(text)
-    # Full secret scan before this text leaves via TTS / persisted audio — the
-    # ya29 check above only covers Google OAuth tokens. Scan raw, NFKC-normalized,
-    # AND confusable-folded forms (homoglyph defense), fail closed on ANY hit
-    # (AWS keys, GitHub PATs, Slack tokens, PEM private keys, …).
-    # (security review high finding.)
-    hits = secret_scan.scan_bytes(text.encode("utf-8"), "audio-summary")
-    for _tag, _variant in (
-        ("nfkc", unicodedata.normalize("NFKC", text)),
-        ("folded", secret_scan.fold_confusables(text)),
-    ):
-        if _variant != text:
-            hits = hits + secret_scan.scan_bytes(_variant.encode("utf-8"),
-                                                 f"audio-summary-{_tag}")
+    # Full egress secret scan before this text leaves via TTS / persisted audio.
+    # scan_egress covers raw + NFKC + confusable-fold + whitespace-collapsed +
+    # homoglyph-PEM, defeating homoglyph / zero-width / whitespace-split / encoded
+    # secrets of ANY shape (AWS, GitHub, Slack, PEM, ya29). The token backstop is
+    # complementary. (security review high finding.)
+    hits = secret_scan.scan_egress(text)
+    if secret_scan.has_homoglyph_token_shape(text):
+        hits = hits + [{"pattern": "homoglyph_token_shape"}]
     if hits:
         raise AudioSummaryError(
             f"summary_text contains {len(hits)} secret-shaped value(s); "

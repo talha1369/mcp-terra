@@ -122,6 +122,60 @@ _SECRET_PLACEHOLDER = (
     "tobereplaced", "notarealsecret",
 )
 
+# Keyboard / sequence walk lines (rows, staggered columns, alphabet, digits).
+_SECRET_WALK_LINES = (
+    "1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm",
+    "1qaz", "2wsx", "3edc", "4rfv", "5tgb", "6yhn", "7ujm", "8ik", "9ol", "0p",
+    "abcdefghijklmnopqrstuvwxyz",
+)
+
+
+def _secret_alnum_lower(s):
+    """Lowercase + strip non-alnum — so a famous phrase is matched whether typed
+    contiguously ('correcthorsebatterystaple') or spaced/punctuated ('correct
+    horse battery staple')."""
+    import re as _r
+    return _r.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def _secret_common_hit(s):
+    """Return the first common/placeholder phrase found in s (alnum-normalized),
+    or None. Shared by the raw-secret check and the decoded-content screen."""
+    _norm = _secret_alnum_lower(s)
+    for _w in _SECRET_COMMON + _SECRET_PLACEHOLDER:
+        if _w in _norm:
+            return _w
+    return None
+
+
+def _secret_walk_ratio(s):
+    """Fraction of adjacent char pairs that are walk-adjacent (consecutive code
+    point OR keyboard-line neighbours)."""
+    n = len(s)
+    if n < 2:
+        return 0.0
+
+    def _adj(a, b):
+        if abs(ord(a) - ord(b)) <= 1:
+            return True
+        la, lb = a.lower(), b.lower()
+        for _w in _SECRET_WALK_LINES:
+            ia, ib = _w.find(la), _w.find(lb)
+            if ia != -1 and ib != -1 and abs(ia - ib) == 1:
+                return True
+        return False
+    return sum(1 for i in range(n - 1) if _adj(s[i], s[i + 1])) / (n - 1)
+
+
+def _secret_periodicity(s):
+    """Max fraction of chars that repeat the char one period earlier, over all
+    periods — a repeated word/block ('Summer2024Summer2024…') scores high."""
+    n = len(s)
+    if n < 2:
+        return 0.0
+    return max(sum(1 for i in range(p, n) if s[i] == s[i - p]) / (n - p)
+               for p in range(1, n // 2 + 1))
+
 
 def _validate_secret_strength(secret, _depth: int = 0) -> None:
     """Refuse weak/low-entropy secrets.
@@ -203,20 +257,28 @@ def _validate_secret_strength(secret, _depth: int = 0) -> None:
         if _decoded:
             _runs = _re_fmt.findall(rb"[\x20-\x7e]{8,}", _decoded)
             # SQUEEZE out every non-printable byte and screen the concatenated
-            # printable text for famous/placeholder phrases too — this catches a
-            # phrase that was NUL/control-INTERLEAVED ('c\x00o\x00r\x00r…') to keep
-            # every contiguous run below the 8-char threshold. A real random key
-            # squeezes to ~37% scattered printable chars that match no phrase, so
-            # there is no false-reject.
-            _squeezed_low = _re_fmt.sub(rb"[^\x20-\x7e]", b"", _decoded).decode(
-                "ascii", "replace").lower()
-            _joined_low = b" ".join(_runs).decode("ascii", "replace").lower()
-            for _w in _SECRET_COMMON + _SECRET_PLACEHOLDER:
-                if _w in _joined_low or _w in _squeezed_low:
-                    raise ValueError(
-                        f"MCP_TERRA_RUNNER_SECRET is a hex/base32 encoding of a "
-                        f"weak/known phrase ({_w!r} after decoding). Use python -c "
-                        f"'import secrets; print(secrets.token_urlsafe(32))'.")
+            # printable text — this catches a phrase that was NUL/control-
+            # INTERLEAVED ('c\x00o\x00r\x00r…') to keep every contiguous run below
+            # the 8-char threshold. Screen for famous/placeholder phrases AND for
+            # a structural walk/periodicity (a NUL-interleaved alphabet walk or
+            # repeated word). A real random key squeezes to scattered printable
+            # chars that match no phrase and are neither a walk nor periodic, so
+            # there is no false-reject. (Length-INDEPENDENT checks only, so a
+            # 16-31-char squeezed-random concat is never wrongly rejected.)
+            _squeezed = _re_fmt.sub(rb"[^\x20-\x7e]", b"", _decoded).decode(
+                "ascii", "replace")
+            if _secret_common_hit(_squeezed):
+                _hit = _secret_common_hit(_squeezed)
+                raise ValueError(
+                    f"MCP_TERRA_RUNNER_SECRET is a hex/base32 encoding of a "
+                    f"weak/known phrase ({_hit!r} after decoding). Use python -c "
+                    f"'import secrets; print(secrets.token_urlsafe(32))'.")
+            if len(_squeezed) >= 16 and (_secret_walk_ratio(_squeezed) >= 0.5
+                                         or _secret_periodicity(_squeezed) >= 0.5):
+                raise ValueError(
+                    "MCP_TERRA_RUNNER_SECRET is a hex/base32 encoding of a "
+                    "predictable walk/repeated pattern. Use python -c "
+                    "'import secrets; print(secrets.token_urlsafe(32))'.")
             for _rb in _runs:
                 if len(_rb) >= 16:
                     _fmt_strong = False  # encodes human text, not random key bytes
@@ -264,79 +326,46 @@ def _validate_secret_strength(secret, _depth: int = 0) -> None:
     # predictable walk — adjacent characters that are either consecutive code
     # points OR neighbours on a QWERTY keyboard row (so 'qwerty…' is caught even
     # though its code points are not adjacent). A cryptographically-random token
-    # has only a few percent such adjacencies, so it is not affected.
-    # QWERTY adjacency: horizontal ROWS, vertical/staggered COLUMNS, and the
-    # alphabet. Two chars are "walk-adjacent" if consecutive in code point OR
-    # neighbours on any of these — this catches horizontal ('qwerty…'), vertical
-    # ('qazwsxedc…'), digit, and alphabet walks.
-    _WALKS = ("1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm",
-              "1qaz", "2wsx", "3edc", "4rfv", "5tgb",
-              "6yhn", "7ujm", "8ik", "9ol", "0p",
-              "abcdefghijklmnopqrstuvwxyz")
-
-    def _adjacent(a, b):
-        if abs(ord(a) - ord(b)) <= 1:
-            return True
-        la, lb = a.lower(), b.lower()
-        for _w in _WALKS:
-            ia, ib = _w.find(la), _w.find(lb)
-            if ia != -1 and ib != -1 and abs(ia - ib) == 1:
-                return True
-        return False
+    # has only a few percent such adjacencies, so it is not affected. (Walk +
+    # periodicity use the shared module helpers so the decoded-content screen and
+    # the embedded runner validator stay in lock-step.)
     if n >= 2:
-        walk = sum(1 for i in range(n - 1) if _adjacent(secret[i], secret[i + 1]))
         # A DENSE small alphabet (hex 0-9a-f) has a higher base rate of
         # walk-adjacent pairs purely by chance (random token_hex peaks ~0.58),
         # so a strong-format secret uses a higher threshold — a real hex walk
         # ('0123…abcdef') still scores ~0.90 and is caught.
         _walk_limit = 0.65 if _fmt_strong else 0.5
-        if walk / (n - 1) >= _walk_limit:
+        if _secret_walk_ratio(secret) >= _walk_limit:
             raise ValueError(
-                f"MCP_TERRA_RUNNER_SECRET is mostly a predictable walk "
-                f"({walk}/{n - 1} adjacent chars are consecutive or keyboard "
-                f"neighbours) — guessable despite high diversity (alphabet, digit, "
-                f"or keyboard row/column walk). Use python -c "
-                f"'import secrets; print(secrets.token_urlsafe(32))'."
+                "MCP_TERRA_RUNNER_SECRET is mostly a predictable walk "
+                "(adjacent chars are consecutive or keyboard neighbours) — "
+                "guessable despite high diversity (alphabet, digit, or keyboard "
+                "row/column walk). Use python -c "
+                "'import secrets; print(secrets.token_urlsafe(32))'."
             )
         # Repeated-block / periodicity: a short pattern repeated (e.g. a dictionary
         # word doubled like 'passwordPASSWORD…') is guessable despite character
         # diversity. Reject if, for ANY period, >=50% of chars repeat the char one
         # period earlier. A random token has no such periodicity.
-        best_period = max(
-            sum(1 for i in range(p, n) if secret[i] == secret[i - p]) / (n - p)
-            for p in range(1, n // 2 + 1)
-        )
-        if best_period >= 0.5:
+        if _secret_periodicity(secret) >= 0.5:
             raise ValueError(
-                f"MCP_TERRA_RUNNER_SECRET is mostly a repeated pattern "
-                f"({best_period:.0%} periodic) — guessable (e.g. a short word or "
-                f"block repeated). Use python -c "
-                f"'import secrets; print(secrets.token_urlsafe(32))'."
+                "MCP_TERRA_RUNNER_SECRET is mostly a repeated pattern — guessable "
+                "(e.g. a short word or block repeated). Use python -c "
+                "'import secrets; print(secrets.token_urlsafe(32))'."
             )
-    # Famous example / common-password screen. This is NOT a full strength
-    # estimator and does not claim to reject every human passphrase — but it must
-    # catch the well-known named strings a human types instead of token_urlsafe
-    # (above all the xkcd "correct horse battery staple") and common passwords
-    # that appear in any targeted guess list. Always prefer the generated token.
-    _low = secret.lower()
-    for _w in _SECRET_COMMON:
-        if _w in _low:
-            raise ValueError(
-                f"MCP_TERRA_RUNNER_SECRET contains a well-known/common secret "
-                f"phrase ({_w!r}) — guessable. Use python -c "
-                f"'import secrets; print(secrets.token_urlsafe(32))'."
-            )
-    # Placeholder / template screen. The single most plausible real-world weak
-    # secret is a doc/template value the user copied and forgot to replace (e.g.
-    # "ChangeThisSecretBeforeProduction"). A compromised secret defeats the whole
-    # HMAC defense, so reject the common template stems. None of these substrings
-    # occur in token_urlsafe output, so screening them is free (0 false-rejects).
-    for _w in _SECRET_PLACEHOLDER:
-        if _w in _low:
-            raise ValueError(
-                f"MCP_TERRA_RUNNER_SECRET looks like an unmodified placeholder / "
-                f"template value (contains {_w!r}) — set a real random secret. "
-                f"Use python -c 'import secrets; print(secrets.token_urlsafe(32))'."
+    # Famous example / common-password + placeholder/template screen. This is NOT
+    # a full strength estimator — but it must catch the well-known named strings a
+    # human types instead of token_urlsafe (above all the xkcd "correct horse
+    # battery staple"), common passwords, and unmodified template stems
+    # ("ChangeThisSecretBeforeProduction"). Matched on the ALNUM-NORMALIZED form,
+    # so a SPACED/punctuated phrase ("correct horse battery staple 1234") is
+    # caught too. None of these stems occur in token_urlsafe output.
+    _w = _secret_common_hit(secret)
+    if _w:
+        raise ValueError(
+            f"MCP_TERRA_RUNNER_SECRET contains a well-known/common or placeholder "
+            f"phrase ({_w!r}) — guessable. Use python -c "
+            f"'import secrets; print(secrets.token_urlsafe(32))'."
             )
 
 
@@ -2119,15 +2148,20 @@ done
 """
     # Inject the REAL secret-strength validator into the runner's fail-closed gate
     # (security review: the runner must enforce the same policy as the MCP signer).
-    # Embedding inspect.getsource keeps the two in lock-step — no drift. The
-    # validator references only its own local imports + these two module constants,
-    # so it is self-contained once they are defined. The secret is read from the
-    # env (never argv), and the gate prints no secret/substring on failure.
+    # Embedding inspect.getsource keeps the two in lock-step — no drift. We embed
+    # the module constants AND the shared helpers the validator now calls, so the
+    # block is self-contained. The secret is read from the env (never argv), and
+    # the gate prints no secret/substring on failure.
     import inspect as _inspect
     _validator = (
         "import os as _os, sys as _sys\n"
         + "_SECRET_COMMON = " + repr(_SECRET_COMMON) + "\n"
         + "_SECRET_PLACEHOLDER = " + repr(_SECRET_PLACEHOLDER) + "\n"
+        + "_SECRET_WALK_LINES = " + repr(_SECRET_WALK_LINES) + "\n"
+        + _inspect.getsource(_secret_alnum_lower)
+        + _inspect.getsource(_secret_common_hit)
+        + _inspect.getsource(_secret_walk_ratio)
+        + _inspect.getsource(_secret_periodicity)
         + _inspect.getsource(_validate_secret_strength)
         + "\ntry:\n"
         + "    _validate_secret_strength(_os.environ.get('MCP_TERRA_RUNNER_SECRET', ''))\n"
