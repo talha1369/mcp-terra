@@ -83,9 +83,13 @@ _CONFUSABLES: dict[str, str] = {
     "А": "A", "В": "B", "Е": "E", "К": "K", "М": "M",
     "Н": "H", "О": "O", "Р": "P", "С": "C", "Т": "T",
     "У": "Y", "Х": "X", "Ѕ": "S", "І": "I", "Ј": "J",
-    # Greek lowercase → Latin
+    # Greek lowercase → Latin (the Latin-LOOK-ALIKE subset; β/γ/ε/η/μ/τ/χ/ω
+    # included so a Greek-letter smuggled token body — 'ya29.…χ…' — folds and is
+    # caught. NON-Latin-looking Greek (δ θ λ ξ π σ φ ψ ζ) is left unmapped and is
+    # excluded from the homoglyph backstop as genuine science notation.)
     "ο": "o", "α": "a", "ρ": "p", "ν": "v", "ι": "i",
-    "κ": "k", "υ": "u",
+    "κ": "k", "υ": "u", "β": "b", "γ": "y", "ε": "e",
+    "η": "n", "μ": "u", "τ": "t", "χ": "x", "ω": "w",
     # Greek uppercase → Latin
     "Α": "A", "Β": "B", "Ε": "E", "Ζ": "Z", "Η": "H",
     "Ι": "I", "Κ": "K", "Μ": "M", "Ν": "N", "Ο": "O",
@@ -190,14 +194,23 @@ def has_homoglyph_token_shape(text: str) -> bool:
                 if c in ("\t", "\n", " ") or _ud.category(c) not in _STRIP_CATS)
     t = t.translate(_CONFUSABLE_TABLE).translate(_LATIN_EXTRAS_TABLE)
 
+    def _suspect(c: str) -> bool:
+        # A residual letter counts as a homoglyph SUSPECT only if it is a
+        # narrow, non-Greek, non-ideographic letter. Greek/Coptic are genuine
+        # science notation (β, μ, λ); WIDE/ideographic letters (Han, Hiragana,
+        # Katakana, Hangul — East_Asian_Width W/F) are NOT [A-Za-z] look-alikes
+        # and appear glued to Latin gene-IDs in CJK research prose, so excluding
+        # them prevents a false positive on legitimate CJK summaries.
+        return (ord(c) > 127 and _ud.category(c)[0] == "L"
+                and not _is_greek_or_coptic(c)
+                and _ud.east_asian_width(c) not in ("W", "F"))
+
     def _flag(r: str) -> bool:
         if len(r) < 16:
             return False
         ascii_tok = sum(1 for c in r if c in _ASCII_TOKEN_CHARS)
         has_digit = any(c in "0123456789" for c in r)
-        has_nonascii_letter = any(
-            ord(c) > 127 and _ud.category(c)[0] == "L" and not _is_greek_or_coptic(c)
-            for c in r)
+        has_nonascii_letter = any(_suspect(c) for c in r)
         return has_digit and has_nonascii_letter and ascii_tok / len(r) >= 0.5
 
     run: list[str] = []

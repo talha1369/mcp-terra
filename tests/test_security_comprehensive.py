@@ -1096,22 +1096,25 @@ def _():
         if not _raises(nbr._validate_secret_strength, ValueError,
                        "".join(_rnd.choice(_W) for _ in range(8))))
     assert hexword_accepted == 0, f"{hexword_accepted}/1500 enumerable hex-word secrets accepted"
-    # hex/base32 ENCODINGS of famous/placeholder phrases must be rejected too —
-    # for base32 the floors alone do NOT reject (5-bit expansion keeps entropy
-    # high), so the decoded content is screened against the common/placeholder
-    # lists. Real generated base32 (random bytes) is unaffected.
+    # hex AND base32 ENCODINGS of famous/placeholder/walk phrases must ALL be
+    # rejected — denying the format exemption is a no-op for base32 (5-bit
+    # expansion keeps the wrapper high-entropy), so the DECODED plaintext is
+    # validated with the FULL policy; PADDED base32 must not slip past the format
+    # regex either. (Codex + audit pass-8 findings.)
     import base64 as _b64
     for _phrase in (b"correcthorsebatterystaple", b"ChangeThisSecretBeforeProd1",
-                    b"tobeornottobethatisquestion", b"iloveyou-so-much-forever-x"):
-        _b32 = _b64.b32encode(_phrase).decode().rstrip("=")
-        _hx = _phrase.hex()
-        must_raise(nbr._validate_secret_strength, ValueError, _b32)
-        must_raise(nbr._validate_secret_strength, ValueError, _hx)
-    # real random base32 secrets (b32encode of 20 random bytes) are accepted
+                    b"tobeornottobethatisquestion", b"abcdefghijklmnopqrstuvwx",
+                    b"ChangeThisSecret"):
+        for _enc in (_b64.b32encode(_phrase).decode(),              # PADDED base32
+                     _b64.b32encode(_phrase).decode().rstrip("="),  # unpadded base32
+                     _phrase.hex()):                                # hex
+            must_raise(nbr._validate_secret_strength, ValueError, _enc)
+    # real random (padded) base32 secrets are NOT broadly rejected — only the
+    # ~1e-4 case where random bytes happen to decode mostly-printable.
     b32rej = sum(1 for _ in range(3000)
                  if _raises(nbr._validate_secret_strength, ValueError,
-                            _b64.b32encode(_secrets.token_bytes(20)).decode().rstrip("=")))
-    assert b32rej == 0, f"random base32 secrets false-rejected {b32rej}/3000"
+                            _b64.b32encode(_secrets.token_bytes(16)).decode()))
+    assert b32rej < 30, f"random base32 secrets broadly false-rejected {b32rej}/3000"
 
 @case("R-Hardening", "result-signature verification")
 def _():
@@ -1142,6 +1145,36 @@ def _():
     src = nbr.runner_script_template()
     assert 'MCP_TERRA_RUNNER_SECRET' in src
     assert 'HMAC' in src or 'hmac' in src   # mentions HMAC
+
+@case("R-Hardening", "runner ENFORCES secret-strength at startup (trust boundary, not just MCP-side)")
+def _():
+    # Codex finding: the runner is the HMAC trust boundary; a manually/legacy-
+    # started runner with a weak secret lets a co-member forge signed specs. The
+    # rendered runner must embed the REAL strength validator and fail closed.
+    import os as _os
+    import re as _re
+    import secrets as _secrets
+    import base64 as _b64
+    import subprocess as _sp
+    from mcp_terra import notebook_runner as nbr
+    src = nbr.runner_script_template()
+    assert "__MCP_STRENGTH_VALIDATOR__" not in src, "validator placeholder not substituted"
+    assert "failed the strength policy" in src and "exit 7" in src
+    # the embedded validator must reject weak and accept strong secrets
+    m = _re.search(r"<<'PYSTRENGTH'\n(.*?)\nPYSTRENGTH", src, _re.S)
+    assert m, "embedded PYSTRENGTH validator block missing"
+    import tempfile
+    _p = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False)
+    _p.write(m.group(1)); _p.close()
+
+    def _rc(secret):
+        e = dict(_os.environ); e["MCP_TERRA_RUNNER_SECRET"] = secret
+        return _sp.run([sys.executable, _p.name], env=e, capture_output=True).returncode
+    for strong in (_secrets.token_urlsafe(32), _secrets.token_hex(32)):
+        assert _rc(strong) == 0, "runner rejected a strong secret"
+    for weak in ("a" * 40, "ChangeThisSecretBeforeProduction",  # pragma: allowlist secret
+                 _b64.b32encode(b"ChangeThisSecret").decode(), "short"):
+        assert _rc(weak) == 1, f"runner ACCEPTED a weak secret: {weak[:12]!r}"
 
 @case("R-Hardening", "runner script validates JOB_ID before use")
 def _():
@@ -2669,12 +2702,25 @@ def _():
     for name, tok in {**plain, "akia_armenian": akia_homo}.items():
         assert _audio_blocked(PRE + tok + " end"), f"audio leaked {name}"
         assert _email_blocked(f"results {tok}"), f"email leaked {name}"
-    # NO false positive: legit lowercase-Greek scientific identifiers (β/γ/μ/λ)
+    # Greek look-alike letters smuggled INSIDE a token body (χ→x, ε→e, τ→t) must
+    # still be CAUGHT (they fold to Latin so the byte-scan recovers the token).
+    for gtok in ("ya29." + "A" * 5 + "χ" + "A" * 18,
+                 "ya29." + "A" * 5 + "ε" + "A" * 18):
+        assert _audio_blocked(PRE + gtok + " end"), f"audio leaked greek-token {gtok!r}"
+        assert _email_blocked(f"results {gtok}"), f"email leaked greek-token {gtok!r}"
+    # NO false positive: legit lowercase-Greek scientific identifiers (β/γ/μ/λ/δ/σ)
     # with digits — common nomenclature — must render in BOTH channels.
     for ok in ("Expression of TGFβ1-2024-batch7 rose; IFNγ-clone-2024-rev3 was stable here.",
-               "Absorbance at 280nm λmax-2024 with 5μM compound and Aβ42-2024-aggregate ok."):
+               "Absorbance at 280nm λmax-2024 with 5μM compound and Aβ42-2024-aggregate ok.",
+               "δ13C-2024-cohort and σ-factor-2024-batch values were within the expected range."):
         assert not _audio_blocked(ok), f"audio false-positive: {ok}"
         assert not _email_blocked(ok[:60]), f"email false-positive: {ok}"
+    # NO false positive: CJK summary with a GLUED-IN Latin gene-ID + numbers
+    # (CJK has no spaces, so the whole sentence is one run) — must render.
+    cjk = ("遺伝子ENSG00000139618BRCA2の発現量は2.3倍に増加した。これは統計的に"
+           "有意な結果であり今後の研究に重要である。")
+    assert not _audio_blocked(cjk), "audio false-positive on CJK+glued Latin gene-ID"
+    assert not _email_blocked("Result summary " + cjk[:12]), "email false-positive on CJK"
 
 
 # ──────────────────────────────────────────────────────────────────────────

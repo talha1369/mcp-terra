@@ -123,7 +123,7 @@ _SECRET_PLACEHOLDER = (
 )
 
 
-def _validate_secret_strength(secret) -> None:
+def _validate_secret_strength(secret, _depth: int = 0) -> None:
     """Refuse weak/low-entropy secrets.
 
     Bar set high because a compromised secret defeats the entire HMAC
@@ -163,43 +163,53 @@ def _validate_secret_strength(secret) -> None:
     # it. NOT a loophole: the walk / repetition / common+placeholder checks below
     # still run, so a degenerate small-alphabet string ('0123…','abab…','aaaa…')
     # is still rejected.
-    if _re_fmt.fullmatch(r"[0-9a-fA-F]+", secret):
-        _alpha = 16        # hex (openssl rand -hex, secrets.token_hex)
-    elif _re_fmt.fullmatch(r"[A-Z2-7]+", secret):
-        _alpha = 32        # RFC 4648 base32
-    else:
-        _alpha = 0
-    _fmt_strong = bool(_alpha) and n * _math.log2(_alpha) >= 128.0
+    # Strip RFC-4648 '=' padding BEFORE the format regex (b32encode pads to a
+    # multiple of 8) so a PADDED base32 secret is still recognized and routed
+    # through the decoded screen, not mis-classified as a general secret. At
+    # _depth>0 we are validating the DECODED plaintext of an outer encoded secret
+    # — grant NO format exemption there (apply the full general floors).
+    _core = secret.rstrip("=")
+    _alpha = 0
+    if _depth == 0:
+        if _re_fmt.fullmatch(r"[0-9a-fA-F]+", _core):
+            _alpha = 16        # hex (openssl rand -hex, secrets.token_hex)
+        elif _re_fmt.fullmatch(r"[A-Z2-7]+", _core):
+            _alpha = 32        # RFC 4648 base32
+    _fmt_strong = bool(_alpha) and len(_core) * _math.log2(_alpha) >= 128.0
     # A hex/base32 string that DECODES to mostly-printable ASCII is an ENCODING of
     # human text (rockyou-class keyspace), NOT random bytes: random token_hex
-    # decodes to ~37% printable, an encoded phrase to ~100%. For HEX, denying the
-    # exemption is enough (the hex string itself then fails the Shannon floor); for
-    # BASE32 it is NOT (base32's 5-bit expansion keeps the string high-entropy and
-    # it clears the floors), so we must also screen the DECODED content for the
-    # famous/placeholder phrases — catching e.g. base32('correcthorsebatterystaple')
-    # in ANY encoding. Real openssl-rand-hex / token_hex / base32 output is
-    # unaffected. Undecodable (e.g. odd-length hex) → deny the exemption.
+    # decodes to ~37% printable, an encoded phrase to ~100%. When that happens we
+    # deny the format exemption AND validate the DECODED plaintext as the effective
+    # secret with the FULL strength policy (length/unique/entropy/walk/periodicity/
+    # common/placeholder) — so an encoded weak/famous/walk/short phrase is rejected
+    # in ANY encoding, just like typing it would be (denying the exemption alone is
+    # a no-op for base32, whose 5-bit expansion keeps the wrapper high-entropy).
+    # Real openssl-rand-hex / token_hex / base32 output decodes to random bytes
+    # (~37% printable) and is unaffected. Undecodable (e.g. odd-length hex) → deny.
     if _fmt_strong:
         _decoded = None
         try:
             if _alpha == 16:
-                _decoded = bytes.fromhex(secret)
+                _decoded = bytes.fromhex(_core)
             else:
                 import base64 as _b64
-                _decoded = _b64.b32decode(secret + "=" * ((8 - len(secret) % 8) % 8))
+                _decoded = _b64.b32decode(_core + "=" * ((8 - len(_core) % 8) % 8))
         except ValueError:   # binascii.Error subclasses ValueError; odd-length hex
             _fmt_strong = False
         if _decoded:
             _printable = sum(1 for _b in _decoded if 0x20 <= _b <= 0x7e) / len(_decoded)
-            if _printable >= 0.70:
+            # Encoded human text is ~100% printable; random bytes ~37%. Use a HIGH
+            # threshold (0.85) so a real generated key whose random bytes happen to
+            # be mostly-printable is not mistaken for an encoded phrase.
+            if _printable >= 0.85:
                 _fmt_strong = False   # encoded text, not random bytes → no exemption
-                _dec_low = _decoded.decode("latin-1").lower()
-                for _w in _SECRET_COMMON + _SECRET_PLACEHOLDER:
-                    if _w in _dec_low:
-                        raise ValueError(
-                            f"MCP_TERRA_RUNNER_SECRET is a hex/base32 encoding of a "
-                            f"weak/known phrase ({_w!r} after decoding) — use python "
-                            f"-c 'import secrets; print(secrets.token_urlsafe(32))'.")
+                try:
+                    _validate_secret_strength(_decoded.decode("latin-1"), _depth=1)
+                except ValueError as _e:
+                    raise ValueError(
+                        f"MCP_TERRA_RUNNER_SECRET is a hex/base32 encoding of a weak "
+                        f"secret ({_e}). Use python -c "
+                        f"'import secrets; print(secrets.token_urlsafe(32))'.")
     # Character-diversity floor: ≥12 unique for a general secret; a recognized
     # strong-format key draws from a smaller alphabet, so a lower floor is
     # correct. It is set to 11 (not lower): a real token_hex(16) clears it
@@ -738,7 +748,7 @@ def runner_script_template() -> str:
       • status/result files signed before upload so the MCP can verify
         the runner produced them (defeats co-member result-spoofing).
     """
-    return r"""#!/usr/bin/env bash
+    _script = r"""#!/usr/bin/env bash
 # mcp_terra_runner.sh — agent-driven notebook executor for Terra VMs.
 # Installed once per VM session. HMAC-authenticated job specs only.
 set -euo pipefail
@@ -746,6 +756,19 @@ set -euo pipefail
 : "${BUCKET:?BUCKET env var must be set, e.g. gs://fc-secure-…}"
 : "${POLL_SEC:=15}"
 : "${MCP_TERRA_RUNNER_SECRET:?MCP_TERRA_RUNNER_SECRET env var must be set. Must match the same value the MCP signed specs with.}"
+
+# ── Fail-closed secret-strength gate (security review: the runner is the trust
+# boundary for HMAC verification). The MCP signer rejects weak secrets before
+# launch, but a MANUALLY or legacy-started runner must enforce the SAME policy
+# itself — else a co-member who guesses a weak/placeholder/encoded-weak secret
+# could forge signed specs this runner would execute. Refuse to start if weak.
+if ! MCP_TERRA_RUNNER_SECRET="$MCP_TERRA_RUNNER_SECRET" python3 - <<'PYSTRENGTH'
+__MCP_STRENGTH_VALIDATOR__
+PYSTRENGTH
+then
+    echo "[runner] MCP_TERRA_RUNNER_SECRET failed the strength policy — refusing to start. Set a strong secret: python -c 'import secrets; print(secrets.token_urlsafe(32))'." >&2
+    exit 7
+fi
 
 # Validate BUCKET shape — disallow consecutive dots, underscores in name
 # (GCS bucket-naming rule), and require sensible length bounds.
@@ -2077,6 +2100,24 @@ PYRESULT
     done
 done
 """
+    # Inject the REAL secret-strength validator into the runner's fail-closed gate
+    # (security review: the runner must enforce the same policy as the MCP signer).
+    # Embedding inspect.getsource keeps the two in lock-step — no drift. The
+    # validator references only its own local imports + these two module constants,
+    # so it is self-contained once they are defined. The secret is read from the
+    # env (never argv), and the gate prints no secret/substring on failure.
+    import inspect as _inspect
+    _validator = (
+        "import os as _os, sys as _sys\n"
+        + "_SECRET_COMMON = " + repr(_SECRET_COMMON) + "\n"
+        + "_SECRET_PLACEHOLDER = " + repr(_SECRET_PLACEHOLDER) + "\n"
+        + _inspect.getsource(_validate_secret_strength)
+        + "\ntry:\n"
+        + "    _validate_secret_strength(_os.environ.get('MCP_TERRA_RUNNER_SECRET', ''))\n"
+        + "except Exception:\n"
+        + "    _sys.exit(1)\n"
+    )
+    return _script.replace("__MCP_STRENGTH_VALIDATOR__", _validator)
 
 
 def parse_result(result_json: str) -> dict:
