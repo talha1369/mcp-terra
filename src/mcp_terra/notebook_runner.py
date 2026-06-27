@@ -284,29 +284,34 @@ def _validate_secret_strength(secret, _depth: int = 0) -> None:
         # denies the format exemption). A real random key decodes to scattered
         # non-printable bytes → returns False, no raise (no false-reject).
         _runs = _re_fmt.findall(rb"[\x20-\x7e]{8,}", _dec)
-        # SQUEEZE out non-printable bytes and screen the concatenation — catches a
-        # phrase NUL/control-INTERLEAVED to keep every contiguous run < 8.
+        # SQUEEZE out non-printable bytes — catches a phrase NUL/control-INTERLEAVED
+        # to keep every contiguous run < 8.
         _sq = _re_fmt.sub(rb"[^\x20-\x7e]", b"", _dec).decode("ascii", "replace")
-        _hit = _secret_common_hit(_sq)
-        if _hit:
-            raise ValueError(
-                f"MCP_TERRA_RUNNER_SECRET is an encoding of a weak/known phrase "
-                f"({_hit!r} after decoding). Use python -c "
-                f"'import secrets; print(secrets.token_urlsafe(32))'.")
-        if len(_sq) >= 16 and (_secret_walk_ratio(_sq) >= 0.5
-                               or _secret_periodicity(_sq) >= 0.5):
-            raise ValueError(
-                "MCP_TERRA_RUNNER_SECRET is an encoding of a predictable walk/"
-                "repeated pattern. Use python -c "
-                "'import secrets; print(secrets.token_urlsafe(32))'.")
-        # ENCODED TEXT: mostly-printable OR non-printable bytes are uniform PADDING
-        # (≤2 distinct values). Then `_sq` IS the effective secret → full policy
-        # (length/diversity), closing the length-floor bypass. A random key is
-        # neither → never wrongly rejected.
+        # ENCODED TEXT signal: the decode is mostly-printable, OR its non-printable
+        # bytes are uniform PADDING (≤2 distinct, i.e. a NUL/control pad or
+        # interleave). A real RANDOM key is NEITHER (its non-printable bytes are
+        # diverse). Gate ALL squeeze screens (famous/walk/periodicity AND the full
+        # length/diversity validate) on this signal: otherwise a random token's
+        # scattered-printable squeeze can coincidentally alnum-fold to a short
+        # common word ('admin') or look walk-like and FALSE-REJECT the recommended
+        # token_urlsafe (~1e-5). A genuinely interleaved famous phrase has uniform
+        # padding → _found True → still caught.
         _np = bytes(_b for _b in _dec if not 0x20 <= _b <= 0x7e)
         _ratio = (len(_dec) - len(_np)) / len(_dec) if _dec else 0.0
         _found = bool(_sq) and (_ratio >= 0.85 or (_np and len(set(_np)) <= 2))
         if _found:
+            _hit = _secret_common_hit(_sq)
+            if _hit:
+                raise ValueError(
+                    f"MCP_TERRA_RUNNER_SECRET is an encoding of a weak/known phrase "
+                    f"({_hit!r} after decoding). Use python -c "
+                    f"'import secrets; print(secrets.token_urlsafe(32))'.")
+            if len(_sq) >= 16 and (_secret_walk_ratio(_sq) >= 0.5
+                                   or _secret_periodicity(_sq) >= 0.5):
+                raise ValueError(
+                    "MCP_TERRA_RUNNER_SECRET is an encoding of a predictable walk/"
+                    "repeated pattern. Use python -c "
+                    "'import secrets; print(secrets.token_urlsafe(32))'.")
             try:
                 _validate_secret_strength(_sq, _depth=_depth + 1)
             except ValueError as _e:

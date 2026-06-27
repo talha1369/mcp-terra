@@ -703,6 +703,16 @@ def resolve_locked_workspace() -> dict | None:
     try:
         ws = tc.rawls_get_workspace(token, namespace, name)
     except tc.TerraAPIError as e:
+        # Under controlled access, a resolution FAILURE (transient Rawls 503/
+        # timeout/ACL race) must not echo the locked namespace/name — that would
+        # turn a wrong-target agent call into a workspace-id oracle. Withhold the
+        # identifiers from the raised error (detail goes to stderr for the operator).
+        if controlled_access_enabled():
+            import sys as _sys
+            print("[mcp-terra] locked-workspace resolution failed (identifiers "
+                  f"withheld under MCP_TERRA_CONTROLLED_ACCESS): {type(e).__name__}",
+                  file=_sys.stderr)
+            raise PolicyError(_LOCK_DENIED_GENERIC)
         raise PolicyError(
             f"MCP_TERRA_WORKSPACE={namespace}/{name}: Rawls lookup failed: {e}. "
             f"Either you don't have access, or the workspace doesn't exist. "
@@ -712,6 +722,12 @@ def resolve_locked_workspace() -> dict | None:
     bucket = wsd.get("bucketName")
     project = wsd.get("googleProject")
     if not bucket or not project:
+        if controlled_access_enabled():
+            import sys as _sys
+            print("[mcp-terra] locked-workspace resolution incomplete (identifiers "
+                  "and Rawls response withheld under MCP_TERRA_CONTROLLED_ACCESS)",
+                  file=_sys.stderr)
+            raise PolicyError(_LOCK_DENIED_GENERIC)
         raise PolicyError(
             f"Locked workspace {namespace}/{name} resolved but missing "
             f"bucketName or googleProject. Rawls response: {ws}"

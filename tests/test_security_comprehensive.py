@@ -2905,6 +2905,18 @@ def _():
                _b64e.b64encode(("ACGT" * 20).encode()).decode()):
         assert not _audio_blocked(PRE + "data " + _r + " logged here today now ok."), \
             f"audio false-positive on recursive-decode of benign blob: {_r[:12]}"
+    # REGRESSION (R22): an encoded secret with a mod-group prose word glued to the
+    # base64 blob shifts alignment so an alnum byte lands right before the decoded
+    # token anchor — the \b in the anchored patterns then fails. The decode pass now
+    # also scans decoded bytes with the boundary-relaxed _DENSE_PATTERNS, so it is
+    # caught; random/hash glued the same way still render.
+    for _glsec in (_tok, "AKIAIOSFODNN7EXAMPLE", "ghp_" + "A" * 36):
+        _ge = _b64e.b64encode(_glsec.encode()).decode()
+        for _pw in ("data", "blob", "Prov"):     # 4-char (mod-4) prose words
+            assert _email_blocked("Provenance " + _pw + _ge + " was attached here today."), \
+                f"email leaked mod-4-glued encoded {_glsec[:6]} ({_pw})"
+    assert not _audio_blocked(PRE + "Provenance data" + _b64e.b64encode(__import__("os").urandom(30)).decode() + " attached here today now ok."), \
+        "audio false-positive on mod-4-glued random base64"
     # REGRESSION (R16): an encoded secret split by an inserted space/newline/tab
     # has no contiguous ≥24-char run in the fold but RE-CONTIGUATES in the
     # whitespace-collapsed `dense` form — the decode pass must scan dense too. A
@@ -3585,6 +3597,55 @@ def _():
     finally:
         policy.get_locked_workspace_id = orig_lock
         policy.controlled_access_enabled = orig_cc
+
+
+@case("CC-WDL", "lock-RESOLUTION failure is generic under controlled access (no ns/name/attrs leak)")
+def _():
+    # REGRESSION (R22): resolve_locked_workspace runs at the TOP of every
+    # assert_*_allowed, BEFORE the wrong-target comparison. If resolution raises
+    # (transient Rawls 503, or a malformed response carrying operator attributes),
+    # the raw error must NOT echo the locked namespace/name (or the Rawls dict) under
+    # MCP_TERRA_CONTROLLED_ACCESS — else it is a workspace-id oracle.
+    from mcp_terra import terra_client as _tc, auth as _auth
+    orig_lockid = policy.get_locked_workspace_id
+    orig_cc = policy.controlled_access_enabled
+    orig_get = _tc.rawls_get_workspace
+    orig_tok = _auth.get_access_token
+    policy.get_locked_workspace_id = lambda: ("SECRETcohortNS", "SECRETconsentNAME")
+    policy.controlled_access_enabled = lambda: True
+    _auth.get_access_token = lambda: "tok"
+    policy._LOCKED_RESOLVED = False
+    policy._LOCKED = None
+    try:
+        def _boom(*a, **k):
+            raise _tc.TerraAPIError("rawls", "GET",
+                                    "/api/workspaces/SECRETcohortNS/SECRETconsentNAME",
+                                    503, "upstream timeout SECRETcohortNS")
+        _tc.rawls_get_workspace = _boom
+        try:
+            policy.resolve_locked_workspace()
+            raise AssertionError("expected PolicyError on Rawls failure")
+        except policy.PolicyError as e:
+            _m = str(e)
+            assert "SECRETcohort" not in _m and "SECRETconsent" not in _m, f"503 path leaked: {_m}"
+        policy._LOCKED_RESOLVED = False
+        policy._LOCKED = None
+        _tc.rawls_get_workspace = lambda *a, **k: {"workspace": {
+            "namespace": "SECRETcohortNS", "name": "SECRETconsentNAME",
+            "attributes": {"phs_consent": "phs000123_DUC_alice"}}}
+        try:
+            policy.resolve_locked_workspace()
+            raise AssertionError("expected PolicyError on malformed response")
+        except policy.PolicyError as e:
+            _m = str(e)
+            assert "SECRETcohort" not in _m and "phs000123" not in _m, f"malformed path leaked: {_m}"
+    finally:
+        policy.get_locked_workspace_id = orig_lockid
+        policy.controlled_access_enabled = orig_cc
+        _tc.rawls_get_workspace = orig_get
+        _auth.get_access_token = orig_tok
+        policy._LOCKED_RESOLVED = False
+        policy._LOCKED = None
 
 
 @case("CC-WDL", "submit_workflow is SPEND-gated")

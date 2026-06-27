@@ -571,7 +571,20 @@ def scan_egress(text: str) -> list[dict]:
                 if not _dec:
                     continue
                 _total += len(_dec)
+                # Scan decoded bytes with BOTH the anchored patterns AND the
+                # boundary-relaxed _DENSE_PATTERNS. A prose word whose length is a
+                # multiple of the encoding group glues to the secret's base64 so the
+                # decoded bytes place an alnum byte immediately before the token
+                # anchor — the \b in the anchored patterns then fails, but the secret
+                # is fully present and recipient-recoverable. The \b-stripped
+                # _DENSE_PATTERNS catch it; random/hash/text decodes still match no
+                # distinctive prefix, so no false positive.
                 hits += scan_bytes(_dec, "egress-decoded")
+                for _dn, _dp, _dsev in _DENSE_PATTERNS:
+                    if _dp.search(_dec):
+                        hits.append({"pattern": _dn, "severity": _dsev,
+                                     "source": "egress-decoded-dense", "offset": 0,
+                                     "context": f"…[REDACTED—{_dn}]…"})
                 if _total > 4_000_000:   # pathological volume → refuse (fail closed)
                     hits.append({"pattern": "egress_decode_volume", "severity": "HIGH",
                                  "source": "egress", "offset": 0,
