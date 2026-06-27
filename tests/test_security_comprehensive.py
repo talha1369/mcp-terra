@@ -2561,12 +2561,16 @@ def _():
     ):
         must_raise(audio_summary._validate_text, audio_summary.AudioSummaryError,
                    PRE + tok + " end")
-    # NO false positives: legit non-ASCII prose (incl. a German umlaut compound
-    # and a digit-bearing sentence) must still render.
+    # NO false positives: legit non-ASCII prose (incl. a German umlaut compound,
+    # a digit-bearing sentence, and SPACE-LESS CJK with numbers — the worst case,
+    # since CJK cannot break a run with spaces) must still render.
     for clean in (
         "Αναλύσαμε τα δεδομένα και βρήκαμε σημαντικά αποτελέσματα στο σύνολο.",
         "Die Größenänderung des Rindfleischetikettierungsgesetzes lief 2024 gut genug.",
         "We processed 1000 samples and found 42 significant hits across 3 cohorts.",
+        # CJK results summary with numbers (≥50 chars) — must NOT be refused
+        "我们分析了1000个样本并在2024年得到了42个具有统计显著性的结果横跨三个队列总计样本数量充足结论稳健可靠值得报告",
+        "Kjøllefjord-prøve-2024 og Wałęsa-próbka-2024 ga gode resultater i alle batch.",
     ):
         audio_summary._validate_text(clean)   # must NOT raise
 

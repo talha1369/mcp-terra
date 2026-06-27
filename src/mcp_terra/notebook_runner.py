@@ -151,6 +151,25 @@ def _validate_secret_strength(secret) -> None:
     else:
         _alpha = 0
     _fmt_strong = bool(_alpha) and n * _math.log2(_alpha) >= 128.0
+    # A hex/base32 string that DECODES to mostly-printable ASCII is a hex-encoded
+    # human phrase/password (rockyou-class keyspace), NOT random bytes: random
+    # token_hex decodes to ~37% printable, a hex-encoded phrase to ~100%. Deny the
+    # strong-format exemption for those so they fall back to the full entropy
+    # floors below (which reject them); real openssl-rand-hex / token_hex / base32
+    # output is unaffected. Undecodable (e.g. odd-length hex) → also deny.
+    if _fmt_strong:
+        try:
+            if _alpha == 16:
+                _decoded = bytes.fromhex(secret)
+            else:
+                import base64 as _b64
+                _decoded = _b64.b32decode(secret + "=" * ((8 - len(secret) % 8) % 8))
+            _printable = (sum(1 for _b in _decoded if 0x20 <= _b <= 0x7e) / len(_decoded)
+                          if _decoded else 0.0)
+            if _printable >= 0.70:
+                _fmt_strong = False
+        except ValueError:   # binascii.Error subclasses ValueError
+            _fmt_strong = False
     # Character-diversity floor: ≥12 unique for a general secret; a recognized
     # strong-format key draws from a smaller alphabet, so a lower floor is
     # correct. It is set to 11 (not lower): a real token_hex(16) clears it

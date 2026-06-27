@@ -114,33 +114,69 @@ def fold_confusables(text: str) -> str:
     ASCII twin / re-contiguates, so the same byte-level scan catches it. NFKC
     alone folds neither cross-script confusables nor invisibles — this helper is
     the missing half of the homoglyph defense.
+
+    Uses NFKD (decompose), NOT NFKC: NFKC would COMPOSE an inserted combining
+    mark ('A' + U+0301) back into a precomposed letter ('Á') that survives the
+    strip and breaks the contiguous token match. NFKD splits it so the mark is
+    stripped and the body re-contiguates. NFKD also covers full-width/ligature
+    compatibility forms.
     """
     import unicodedata as _ud
-    t = _ud.normalize("NFKC", text)
+    t = _ud.normalize("NFKD", text)
     t = "".join(ch for ch in t
                 if ch in ("\t", "\n", " ") or _ud.category(ch) not in _STRIP_CATS)
     return t.translate(_CONFUSABLE_TABLE)
 
 
+# Common Latin-script letters WITHOUT an NFKD-to-ASCII decomposition (used in
+# real European text) → folded to ASCII for the homoglyph backstop ONLY, so a
+# legit Scandinavian/Polish/German word does not look like a non-Latin homoglyph.
+# Deliberately EXCLUDES small-caps / phonetic letters (ʏ ᴀ ɡ …) — those are
+# homoglyph vectors we WANT to flag, not legitimate prose letters.
+_LATIN_EXTRAS = {
+    "ø": "o", "Ø": "O", "ł": "l", "Ł": "L", "đ": "d", "Đ": "D",
+    "æ": "a", "Æ": "A", "œ": "o", "Œ": "O", "ß": "s", "þ": "t", "Þ": "T",
+    "ð": "d", "Ð": "D", "ħ": "h", "Ħ": "H", "ı": "i", "İ": "I",
+    "ŋ": "n", "Ŋ": "N", "ĸ": "k", "ŧ": "t", "Ŧ": "T",
+}
+_LATIN_EXTRAS_TABLE = {ord(k): v for k, v in _LATIN_EXTRAS.items()}
+
+
 def has_homoglyph_token_shape(text: str) -> bool:
     """True if `text` has a token-shaped run smuggling a NON-ASCII homoglyph.
 
-    A real OAuth / cloud / API token is PURE ASCII ([A-Za-z0-9_.-]). A contiguous
-    run of token-ish chars that is long (≥16), carries an ASCII digit, yet
-    contains a non-ASCII letter is a confusable-smuggled token shape the curated
-    fold may not cover (Armenian, Cherokee, small-caps/phonetic, Lisu, …). The
-    ASCII-digit requirement avoids false positives on long non-ASCII words (e.g.
-    German/agglutinative compounds with umlauts), which carry no digits.
+    A real OAuth / cloud / API token is PURE ASCII ([A-Za-z0-9_.-]). This is a
+    backstop for homoglyphs the curated fold does not map (Armenian, Cherokee,
+    small-caps/phonetic, Lisu, …). It must NOT fire on legitimate multilingual
+    prose, so it is deliberately PRECISE:
+
+      • NFKD + strip combining/format collapses accented Latin (é, ü, ñ) and
+        full-width forms to ASCII;
+      • the Cyrillic/Greek confusable map + a small Latin-extras map collapse the
+        remaining legitimate Latin-ish letters (α, ø, ß, …) to ASCII;
+      • a run is flagged only when it is PREDOMINANTLY ASCII (≥50% token chars),
+        carries an ASCII digit, AND still holds a non-ASCII letter — i.e. the
+        mostly-ASCII shape of a real token with a few homoglyph substitutions.
+        A CJK / Arabic / Devanagari summary is predominantly NON-ASCII, so it is
+        never flagged (CJK has no spaces, so this precision is essential).
     """
     import unicodedata as _ud
+    t = _ud.normalize("NFKD", text)
+    t = "".join(c for c in t
+                if c in ("\t", "\n", " ") or _ud.category(c) not in _STRIP_CATS)
+    t = t.translate(_CONFUSABLE_TABLE).translate(_LATIN_EXTRAS_TABLE)
 
     def _flag(r: str) -> bool:
-        return (len(r) >= 16
-                and any(c in "0123456789" for c in r)
-                and any(ord(c) > 127 for c in r))
+        if len(r) < 16:
+            return False
+        ascii_tok = sum(1 for c in r if c in _ASCII_TOKEN_CHARS)
+        has_digit = any(c in "0123456789" for c in r)
+        has_nonascii_letter = any(ord(c) > 127 and _ud.category(c)[0] == "L"
+                                  for c in r)
+        return has_digit and has_nonascii_letter and ascii_tok / len(r) >= 0.5
 
     run: list[str] = []
-    for ch in text:
+    for ch in t:
         if (ch in _ASCII_TOKEN_CHARS
                 or _ud.category(ch)[0] in ("L", "M")
                 or _ud.category(ch) == "Nd"):
