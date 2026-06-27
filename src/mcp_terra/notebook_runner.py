@@ -202,9 +202,17 @@ def _validate_secret_strength(secret, _depth: int = 0) -> None:
             _fmt_strong = False
         if _decoded:
             _runs = _re_fmt.findall(rb"[\x20-\x7e]{8,}", _decoded)
+            # SQUEEZE out every non-printable byte and screen the concatenated
+            # printable text for famous/placeholder phrases too — this catches a
+            # phrase that was NUL/control-INTERLEAVED ('c\x00o\x00r\x00r…') to keep
+            # every contiguous run below the 8-char threshold. A real random key
+            # squeezes to ~37% scattered printable chars that match no phrase, so
+            # there is no false-reject.
+            _squeezed_low = _re_fmt.sub(rb"[^\x20-\x7e]", b"", _decoded).decode(
+                "ascii", "replace").lower()
             _joined_low = b" ".join(_runs).decode("ascii", "replace").lower()
             for _w in _SECRET_COMMON + _SECRET_PLACEHOLDER:
-                if _w in _joined_low:
+                if _w in _joined_low or _w in _squeezed_low:
                     raise ValueError(
                         f"MCP_TERRA_RUNNER_SECRET is a hex/base32 encoding of a "
                         f"weak/known phrase ({_w!r} after decoding). Use python -c "

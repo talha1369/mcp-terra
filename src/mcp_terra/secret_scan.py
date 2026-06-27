@@ -39,11 +39,13 @@ _PATTERNS: list[tuple[str, re.Pattern[bytes], str]] = [
     # Slack bot/user tokens.
     ("slack_token",
      re.compile(rb"\bxox[abprs]-[A-Za-z0-9-]{10,}\b"), "HIGH"),
-    # AWS secret access key assignment. Quotes are OPTIONAL (common `.env` style
-    # `AWS_SECRET_ACCESS_KEY=wJalr…` is unquoted) and the separator may be `=` or
-    # `:` (YAML/JSON). The 40-char base64 value is the AWS secret-key shape.
+    # AWS secret access key assignment. Quotes are OPTIONAL around BOTH the key
+    # name and the value, and the separator may be `=` or `:` — so the `.env`,
+    # YAML, and JSON spellings of an AWS-secret-key assignment all match (key
+    # bare or quoted; value bare or quoted). The 40-char base64 value is the
+    # AWS secret-key shape.
     ("aws_secret_key_assignment",
-     re.compile(rb"aws_secret_access_key\s*[:=]\s*[\"']?[A-Za-z0-9/+=]{40}",
+     re.compile(rb"aws_secret_access_key[\"']?\s*[:=]\s*[\"']?[A-Za-z0-9/+=]{40}",
                 re.IGNORECASE),
      "CRITICAL"),
     # PEM certificate is NOT a secret — explicitly NOT matched.
@@ -138,6 +140,12 @@ _STRIP_CATS = frozenset({"Cf", "Cc", "Cs", "Co", "Cn", "Mn", "Me"})
 
 _ASCII_TOKEN_CHARS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-")
+# ASCII letters + digits only (NOT the separators _ . -). Used to detect an
+# INLINE homoglyph substitution: a suspect non-ASCII letter directly adjacent to
+# one of these is a substituted token char; one adjacent only to a separator is a
+# hyphenated foreign suffix (legit prose), not a smuggled token.
+_ASCII_ALNUM = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
 
 
 def fold_confusables(text: str) -> str:
@@ -200,10 +208,14 @@ def has_homoglyph_token_shape(text: str) -> bool:
         predominantly NON-ASCII (or ideographic-excluded), so it is never flagged.
     """
     import unicodedata as _ud
-    t = _ud.normalize("NFKD", text)
-    t = "".join(c for c in t
-                if c in ("\t", "\n", " ") or _ud.category(c) not in _STRIP_CATS)
-    t = t.translate(_CONFUSABLE_TABLE).translate(_LATIN_EXTRAS_TABLE)
+    # `orig` = NFKD-normalized text with invisibles/combining stripped (accents
+    # collapsed to ASCII; Cyrillic/Greek/… NOT yet folded). `fold` = orig with the
+    # confusable + Latin-extras maps applied. They are 1:1 aligned (each map entry
+    # is a single char), so orig[i] and fold[i] correspond.
+    orig = _ud.normalize("NFKD", text)
+    orig = "".join(c for c in orig
+                   if c in ("\t", "\n", " ") or _ud.category(c) not in _STRIP_CATS)
+    fold = orig.translate(_CONFUSABLE_TABLE).translate(_LATIN_EXTRAS_TABLE)
 
     def _suspect(c: str) -> bool:
         # A residual letter is a homoglyph SUSPECT unless it is a genuine-science
@@ -211,37 +223,49 @@ def has_homoglyph_token_shape(text: str) -> bool:
         # (Han/Hiragana/Katakana/Hangul, East_Asian_Width W/F — NOT [A-Za-z]
         # look-alikes; they appear glued to Latin gene-IDs in CJK research prose).
         # Everything else non-ASCII left after NFKD + the confusable/Latin-extras
-        # folds (Cyrillic/Greek/Armenian/Coptic/small-caps/… look-alikes) is
-        # treated as a smuggled homoglyph — this is script-AGNOSTIC, so an
-        # unmapped Latin-look-alike from ANY script is still caught.
+        # folds (Cyrillic/Greek/Armenian/Coptic/small-caps/… look-alikes) is a
+        # smuggled-homoglyph candidate — script-AGNOSTIC.
         return (ord(c) > 127 and _ud.category(c)[0] == "L"
                 and c not in _GREEK_SCIENCE
                 and _ud.east_asian_width(c) not in ("W", "F"))
 
-    def _flag(r: str) -> bool:
-        # A real OAuth/cloud token is PURE ASCII, so a predominantly-ASCII
-        # (≥50%) run of >=16 token chars that still holds a suspect non-ASCII
-        # letter is a homoglyph-smuggled token shape. No ASCII-digit requirement:
-        # digit-free secrets (AWS AKIA, GitHub/Slack/PEM signatures) must be
-        # caught too, and the legit cases a digit-gate used to protect (accented
-        # Latin, German umlaut compounds, CJK) are already handled by NFKD-collapse
-        # + the EAW/Greek-science exclusions above.
-        if len(r) < 16:
-            return False
-        ascii_tok = sum(1 for c in r if c in _ASCII_TOKEN_CHARS)
-        return any(_suspect(c) for c in r) and ascii_tok / len(r) >= 0.5
+    def _is_run_char(c: str) -> bool:
+        return (c in _ASCII_TOKEN_CHARS
+                or _ud.category(c)[0] in ("L", "M") or _ud.category(c) == "Nd")
 
-    run: list[str] = []
-    for ch in t:
-        if (ch in _ASCII_TOKEN_CHARS
-                or _ud.category(ch)[0] in ("L", "M")
-                or _ud.category(ch) == "Nd"):
-            run.append(ch)
-        else:
-            if _flag("".join(run)):
+    def _flag(s: int, e: int) -> bool:
+        # A real OAuth/cloud token is PURE ASCII, so a predominantly-ASCII (≥50%)
+        # run of ≥16 token chars holding a suspect non-ASCII letter that is
+        # INLINE — directly adjacent (in the ORIGINAL, pre-fold text) to an ASCII
+        # letter/digit, i.e. substituted for a token character — is a homoglyph-
+        # smuggled token. A suspect letter that touches only separators / other
+        # non-ASCII (a hyphenated foreign suffix like 'Western-blot-анализа' or a
+        # glued foreign word) is NOT inline and is NOT flagged. No ASCII-digit
+        # requirement (digit-free secrets like AKIA/ghp_ must be caught).
+        if e - s < 16:
+            return False
+        ascii_tok = sum(1 for i in range(s, e) if fold[i] in _ASCII_TOKEN_CHARS)
+        if ascii_tok / (e - s) < 0.5:
+            return False
+        for i in range(s, e):
+            if not _suspect(fold[i]):
+                continue
+            left_alnum = i > s and orig[i - 1] in _ASCII_ALNUM
+            right_alnum = i + 1 < e and orig[i + 1] in _ASCII_ALNUM
+            if left_alnum or right_alnum:
                 return True
-            run = []
-    return _flag("".join(run))
+        return False
+
+    s = None
+    for i, ch in enumerate(orig):
+        if _is_run_char(ch):
+            if s is None:
+                s = i
+        else:
+            if s is not None and _flag(s, i):
+                return True
+            s = None
+    return s is not None and _flag(s, len(orig))
 
 
 def scan_bytes(blob: bytes, source: str = "<bytes>") -> list[dict]:

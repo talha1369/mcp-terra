@@ -1116,6 +1116,21 @@ def _():
             must_raise(nbr._validate_secret_strength, ValueError,
                        _b64.b32encode(_padded).decode())
             must_raise(nbr._validate_secret_strength, ValueError, _padded.hex())
+        # NUL-INTERLEAVED famous/placeholder phrase (every <=7 chars) keeps each
+        # printable run below 8 — the squeeze screen must still recover the phrase
+        # via its common/placeholder substring and reject it. (Scoped to the
+        # famous/placeholder phrases the squeeze-substring screen targets; a
+        # NUL-interleaved WALK is a doubly-exotic accepted residual.)
+        if _phrase != b"abcdefghijklmnopqrstuvwx":
+            for _grp in (5, 6, 7):
+                _inter = bytearray()
+                for _i, _c in enumerate(_phrase):
+                    _inter.append(_c)
+                    if (_i + 1) % _grp == 0:
+                        _inter.append(0)
+                _ib = bytes(_inter).ljust(40, b"\x00")
+                must_raise(nbr._validate_secret_strength, ValueError,
+                           _b64.b32encode(_ib).decode())
     # real random (padded) base32 secrets are NOT broadly rejected (random bytes
     # have no long contiguous printable run).
     b32rej = sum(1 for _ in range(3000)
@@ -2367,9 +2382,11 @@ def _():
     from mcp_terra import secret_scan
     KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"  # pragma: allowlist secret
     for line in (
-        f'AWS_SECRET_ACCESS_KEY="{KEY}"',            # quoted
-        f"AWS_SECRET_ACCESS_KEY={KEY}",              # UNQUOTED .env (was missed)
+        f'AWS_SECRET_ACCESS_KEY="{KEY}"',            # quoted value
+        f"AWS_SECRET_ACCESS_KEY={KEY}",              # UNQUOTED .env
         f"aws_secret_access_key: {KEY}",             # YAML ':' separator
+        f'{{"aws_secret_access_key": "{KEY}"}}',     # JSON: quoted KEY name + value
+        f"'aws_secret_access_key' = '{KEY}'",        # quoted key + value, '=' sep
     ):
         hits = secret_scan.scan_bytes(line.encode())
         assert any(h["pattern"] == "aws_secret_key_assignment" for h in hits), \
@@ -2739,6 +2756,21 @@ def _():
     aws_env = "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"  # pragma: allowlist secret
     assert _audio_blocked(PRE + aws_env + " end"), "audio leaked unquoted AWS secret key"
     assert _email_blocked("results " + aws_env), "email leaked unquoted AWS secret key"
+    # an INLINE unmapped-script homoglyph (Cyrillic 'Ԝ' substituted into a token,
+    # adjacent to ASCII) must still be caught script-agnostically.
+    inline = "AKIAԜPQRSTUVWXYZLMN0"  # Ԝ U+051C between ASCII letters  # pragma: allowlist secret
+    assert _audio_blocked(PRE + inline + " end"), "audio leaked inline homoglyph"
+    assert _email_blocked("results " + inline), "email leaked inline homoglyph"
+    # NO false positive: Russian/Cyrillic biomedical prose with HYPHENATED Latin
+    # technical terms (Latin head '-' Cyrillic suffix, no inline substitution) —
+    # ubiquitous in real summaries — must render in BOTH channels.
+    for ok in (
+        "Результаты Western-blot-анализа показали повышение уровня белка значительно здесь.",
+        "Метод CRISPR-Cas9-опосредованного редактирования генома применялся в исследовании.",
+        "Образцы тестировали методом RT-PCR-диагностики на SARS-CoV-2-инфекцию в лаборатории.",
+    ):
+        assert not _audio_blocked(ok), f"audio false-positive (Cyrillic prose): {ok[:30]}"
+        assert not _email_blocked("Рез " + ok[:8]), f"email false-positive (Cyrillic prose): {ok[:30]}"
     # NO false positive: legit lowercase-Greek scientific identifiers (β/γ/μ/λ/δ/σ)
     # with digits — common nomenclature — must render in BOTH channels.
     for ok in ("Expression of TGFβ1-2024-batch7 rose; IFNγ-clone-2024-rev3 was stable here.",
