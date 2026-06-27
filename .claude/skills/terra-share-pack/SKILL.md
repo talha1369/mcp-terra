@@ -121,7 +121,7 @@ This is the mcp-terra v0.2.0 share-pack from <user's name>.
 - `SOP.md` — the full daily-workflow runbook
 - `SECURITY.md` — threat model + how the no-destruction guarantees hold
 - `docs/error_codes.md` — what the structured error envelope means
-- `README.md` — reference docs for all 21 tools
+- `README.md` — reference docs for all 45 tools
 - `CHANGELOG.md` — what each release added
 
 ## Skills shipped with this MCP

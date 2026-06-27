@@ -43,6 +43,7 @@ esac
 # "$k=$v"` assigns the value as a literal string — variable expansion does NOT
 # recursively evaluate command substitution, so a value like $(cmd) is inert.
 while IFS= read -r _line || [ -n "$_line" ]; do
+  _line="${_line%$'\r'}"   # tolerate CRLF-edited config.env (strip trailing CR)
   case "$_line" in ''|\#*) continue ;; esac
   _k="${_line%%=*}"; _v="${_line#*=}"
   case "$_k" in

@@ -90,7 +90,7 @@ In the session:
 > *"Run terra_health"*
 
 You should see your Terra email, the workspace lock resolved, runner secret
-configured + strength_ok, and 41 tools registered:
+configured + strength_ok, and 45 tools registered:
 
 ```jsonc
 {
@@ -98,7 +98,7 @@ configured + strength_ok, and 41 tools registered:
   "workspace_lock": {"namespace":"your-namespace","name":"...","bucketName":"fc-secure-..."},
   "runner_secret": {"configured": true, "strength_ok": true},
   "audit_chain": {"ok": true, "reason": "chain intact"},
-  "tools_count": 41
+  "tools_count": 45
 }
 ```
 

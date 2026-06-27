@@ -139,7 +139,7 @@ python tests/test_security_comprehensive.py
 | C-PromptInjection | 9 | ASCII `<\|im_start\|>`, Unicode full-width (U+FF5C), `[INST]`, `<system>`, C0/C1/DEL stripping; newline+tab preserved; output truncation |
 | D-Bucket | 6 | Non-`gs://` scheme, `http://`, non-workspace bucket, empty URI, bare `gs://`, CRLF in bucket URI |
 | E-Policy | 5 | Writes default OFF; ON only with `MCP_TERRA_ALLOW_WRITES=1`; non-truthy stays OFF; rate limiter raises on burst |
-| F-Tools | 3 | No destruction primitive registered; **44 tools** registered exactly; every spend/write tool has the correct action class |
+| F-Tools | 3 | No destruction primitive registered; **45 tools** registered exactly; every spend/write tool has the correct action class |
 | G-Edge | 6 | Valid identifiers accepted; empty/leading-non-alphanum refused; name-length cap; versioned-name shape; `Path(None)` handled |
 | H-Supply | 5 | No `eval`/`exec`/`pickle.load*`/`shell=True` anywhere; dependency upper bounds present |
 | I-Output | 1 | Token-leak defense-in-depth wired into `_ok()` |

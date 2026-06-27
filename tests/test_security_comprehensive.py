@@ -1338,12 +1338,33 @@ def _():
     # must never fail open
     assert "MCP_TERRA_BUDGET_USD" in sh and "MCP_TERRA_BUDGET_WINDOW_DAYS" in sh, \
         "launcher drops the rolling-budget keys"
-    # the notification keys MUST be allowlisted too: the README tells plugin users
-    # to put Slack/SMTP secrets in config.env, so dropping them silently disables
-    # the headline email + audio + Slack feature.
-    for _k in ("MCP_TERRA_SLACK_BOT_TOKEN", "MCP_TERRA_SLACK_CHANNEL", "MCP_TERRA_SLACK_WEBHOOK",
-               "MCP_TERRA_SMTP_HOST", "MCP_TERRA_SMTP_PORT", "MCP_TERRA_SMTP_USER", "MCP_TERRA_SMTP_PASS"):
-        assert _k in sh, f"launcher drops notification key {_k} (config.env setup would silently fail)"
+    # EXECUTABLE: the notification keys must actually be EXPORTED by the launcher,
+    # not merely appear somewhere in the file (a key surviving in a comment would
+    # satisfy a bare substring). Run the REAL launcher against a config.env that
+    # carries every notification key + a bogus key, and confirm export vs. ignore.
+    import os
+    import tempfile
+    import subprocess
+    import pathlib
+    fake = pathlib.Path(tempfile.mkdtemp())
+    (fake / ".mcp-terra" / "venv" / "bin").mkdir(parents=True)
+    vpy = fake / ".mcp-terra" / "venv" / "bin" / "python"
+    vpy.write_text('#!/bin/sh\nenv | grep "^MCP_TERRA_"\n'); vpy.chmod(0o755)
+    _notif = ["MCP_TERRA_SLACK_WEBHOOK", "MCP_TERRA_SLACK_BOT_TOKEN", "MCP_TERRA_SLACK_CHANNEL",
+              "MCP_TERRA_SMTP_HOST", "MCP_TERRA_SMTP_PORT", "MCP_TERRA_SMTP_USER", "MCP_TERRA_SMTP_PASS"]
+    cfg = fake / ".mcp-terra" / "config.env"
+    cfg.write_text("MCP_TERRA_WORKSPACE=ns/ws\n" + "".join("%s=val_%s\n" % (k, k) for k in _notif)
+                   + "MCP_TERRA_BOGUS_KEY=nope\n")
+    cfg.chmod(0o600)
+    env = dict(os.environ); env["HOME"] = str(fake)
+    r = subprocess.run(["bash", str(REPO_ROOT / "scripts" / "terra-mcp-launch.sh")],
+                       env=env, capture_output=True, text=True, timeout=15)
+    for _k in _notif:
+        assert "%s=val_%s" % (_k, _k) in r.stdout, \
+            "launcher did not EXPORT %s from config.env (allowlist regression)" % _k
+    assert "MCP_TERRA_BOGUS_KEY" not in r.stdout, "launcher exported a non-allowlisted key"
+    assert "ignoring unrecognized config key: MCP_TERRA_BOGUS_KEY" in r.stderr, \
+        "launcher must report ignoring a non-allowlisted key"
 
 @case("CC-Hardening", "start_runner_on_vm binds the heartbeat to the requested runtime")
 def _():
@@ -1379,7 +1400,19 @@ def _():
 @case("CC-Hardening", "plugin .mcp.json is valid and uses the mcpServers schema")
 def _():
     import json
-    raw = (REPO_ROOT / ".mcp.json").read_text()
+    import subprocess
+    # Validate the COMMITTED/shipped .mcp.json (what a plugin user actually gets).
+    # A local working tree may intentionally empty this file for development
+    # (scope-conflict avoidance via git skip-worktree), so prefer the committed
+    # blob; fall back to the on-disk file when git is unavailable (e.g. a tarball).
+    raw = None
+    try:
+        raw = subprocess.run(["git", "-C", str(REPO_ROOT), "show", "HEAD:.mcp.json"],
+                             capture_output=True, text=True, check=True).stdout
+        if not raw.strip():
+            raise ValueError("empty")
+    except Exception:
+        raw = (REPO_ROOT / ".mcp.json").read_text()
     d = json.loads(raw)   # must be valid JSON
     # Claude Code requires a top-level mcpServers record; a bare {"terra": {...}}
     # fails to parse ("mcpServers: expected record, received undefined") and the
@@ -1391,13 +1424,47 @@ def _():
 
 @case("CC-Hardening", "install.sh propagates exported Slack/SMTP vars (config.env + registration)")
 def _():
+    import re
     sh = (REPO_ROOT / "install.sh").read_text()
     # notifications are the headline feature; a fresh install must carry them when
     # the user exported them, into BOTH the plugin config.env and `claude mcp add`.
-    assert "NOTIFY_KEYS" in sh and "NOTIFY_ENV_ARGS" in sh
+    # Anchor the keys to the NOTIFY_KEYS LIST (a key surviving only in a comment
+    # must not satisfy this), and verify the wiring into both sinks.
+    m = re.search(r'NOTIFY_KEYS="([^"]*)"', sh, re.S)
+    assert m, "install.sh has no NOTIFY_KEYS assignment"
+    keylist = m.group(1)
+    for _k in ("MCP_TERRA_SLACK_WEBHOOK", "MCP_TERRA_SLACK_BOT_TOKEN", "MCP_TERRA_SLACK_CHANNEL",
+               "MCP_TERRA_SMTP_HOST", "MCP_TERRA_SMTP_PORT", "MCP_TERRA_SMTP_USER", "MCP_TERRA_SMTP_PASS"):
+        assert _k in keylist, "%s missing from install.sh NOTIFY_KEYS list" % _k
     assert 'NOTIFY_ENV_ARGS[@]+"${NOTIFY_ENV_ARGS[@]}"' in sh, \
         "must use the bash-3.2-safe empty-array expansion (macOS default bash)"
-    assert "MCP_TERRA_SLACK_BOT_TOKEN" in sh and "MCP_TERRA_SMTP_HOST" in sh
+    # wired into BOTH sinks: the plugin config.env AND the claude mcp add registration
+    assert "$NOTIFY_CONFIG_LINES" in sh and '>> "$CONFIG_FILE"' in sh, \
+        "notification vars not appended to config.env"
+
+@case("CC-Hardening", "doc tool-counts stay in sync with the live registered tool count")
+def _():
+    import contextlib
+    import io
+    # Derive the count from the live registry so the docs auto-track future changes
+    # (no hardcoded number to drift). The audit found SOP/SECURITY/share-pack each
+    # claiming a different stale count (41/44/21) while the registry was 45.
+    with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+        from mcp_terra import server as _s
+        n = len(list(_s.server._tool_manager.list_tools()))
+    checks = [
+        ("SOP.md", "%d tools registered" % n),
+        ("SOP.md", '"tools_count": %d' % n),
+        ("SECURITY.md", "**%d tools** registered exactly" % n),
+        ("skills/terra-share-pack/SKILL.md", "all %d tools" % n),
+        (".claude/skills/terra-share-pack/SKILL.md", "all %d tools" % n),
+    ]
+    for rel, needle in checks:
+        p = REPO_ROOT / rel
+        if not p.exists():
+            continue
+        assert needle in p.read_text(), \
+            "%s is stale: live tool count is %d but it does not contain %r" % (rel, n, needle)
 
 @case("CC-Hardening", "terra_client redacts the file-backed runner secret too")
 def _():
@@ -5333,20 +5400,42 @@ def _():
         _os.environ["MCP_TERRA_BUDGET_WINDOW_DAYS"] = "30"
         base = pathlib.Path(tempfile.mkdtemp())
         now = 1_000_000_000.0
-        # (a) ledger EXISTS, holds a PRIOR commitment, but its bytes cannot be read
-        # (chmod 000). reserve must FAIL CLOSED on the read error — NOT treat it as
-        # $0-spent and OVERWRITE it (dropping the prior commitment). A directory was
-        # the old probe, but os.replace onto a dir trips the WRITE guard too, so it
-        # passed even if the strict READ guard were removed. An unreadable regular
-        # file isolates the read guard: the containing dir stays writable, so a
-        # broken (lenient) reserve WOULD overwrite — and this test would then fail.
+        # (a0) PERM-INDEPENDENT (runs even as root, unlike chmod-000): force the
+        # ledger READ to raise OSError and confirm reserve FAILS CLOSED with
+        # E_BUDGET_LEDGER_READ rather than treating it as $0-spent and overwriting.
+        # This covers the OSError strict-read branch; the non-UTF-8 test covers the
+        # separate *decode* (ValueError) branch — they are different code paths.
+        mp = base / "mp.jsonl"
+        policy._SPEND_LEDGER = mp
+        policy._SPEND_LEDGER_LOCK = base / "mp.lock"
+        policy.record_run_cost(95, "prior_mp", now)   # ledger exists with a prior commitment
+        _real_rb = pathlib.Path.read_bytes
+        def _boom(self, *a, **k):
+            if str(self) == str(mp):
+                raise OSError("simulated unreadable ledger")
+            return _real_rb(self, *a, **k)
+        pathlib.Path.read_bytes = _boom
+        try:
+            e = must_raise(policy.reserve_within_budget, policy.PolicyError, 10, "rmp", now)
+            assert getattr(e, "code", None) == "E_BUDGET_LEDGER_READ", \
+                "OSError on ledger read must fail closed with E_BUDGET_LEDGER_READ, got %r" % getattr(e, "code", None)
+        finally:
+            pathlib.Path.read_bytes = _real_rb
+        assert "prior_mp" in mp.read_text(), "read-error guard removed: ledger overwritten on OSError"
+        # (a) BONUS on non-root: an actually-unreadable (chmod 000) regular file.
+        # reserve must FAIL CLOSED — NOT treat it as $0-spent and OVERWRITE it
+        # (dropping the prior commitment). A directory was the old probe, but
+        # os.replace onto a dir trips the WRITE guard too, so it passed even if the
+        # strict READ guard were removed. An unreadable regular file isolates the
+        # read guard: the dir stays writable, so a broken reserve WOULD overwrite.
         unread = base / "u.jsonl"
         policy._SPEND_LEDGER = unread
         policy._SPEND_LEDGER_LOCK = base / "u.lock"
         policy.record_run_cost(95, "prior_commit", now)   # seed $95 of the $100 budget
         unread.chmod(0o000)
-        # skip the read-error assertion only where perms are not enforced (e.g. root,
-        # which can read 000 files); the non-UTF-8 test covers the read guard there.
+        # skip THIS variant only where perms are not enforced (e.g. root, which can
+        # read 000 files); the OSError read guard is still covered there by the
+        # perm-independent monkeypatch probe (a0) above.
         _really_unreadable = True
         try:
             unread.read_bytes()
@@ -5809,6 +5898,50 @@ def _():
     blob = out + err
     assert rc == 0 and "watchdog armed" in blob and "RUNNER-LAUNCHED" in blob, \
         "valid cap/rate must arm and launch (rc=%s)" % rc
+
+
+@case("CC-SpendCap", "spend cap is locale-proof: a decimal-comma locale must not disable the watchdog")
+def _():
+    import re
+    import os
+    import subprocess
+    import tempfile
+    import pathlib
+    import time
+    from mcp_terra import notebook_runner as nbr
+    snip = nbr.spend_watchdog_snippet()
+    runner = nbr.runner_script_template()
+    # SOURCE GUARD (always runs): every spend-math `awk -v` MUST force LC_ALL=C.
+    # Without it, printf emits a comma in de_DE/fr_FR/... locales and the comma
+    # estimate is STRING-compared against the dotted cap -> the over-cap VM is
+    # never stopped (a silent fail-OPEN of the spend control).
+    for label, text in (("watchdog", snip), ("runner", runner)):
+        bare = [m.start() for m in re.finditer(r"awk -v", text)
+                if not text[max(0, m.start() - 9):m.start()].endswith("LC_ALL=C ")]
+        assert not bare, "%s: %d spend-math 'awk -v' not pinned to LC_ALL=C (locale fail-open)" % (label, len(bare))
+    # EXECUTABLE (best-effort): under a REAL comma-decimal locale, an over-cap
+    # watchdog must actually STOP the VM. Skips only if no such locale is installed.
+    avail = subprocess.run(["locale", "-a"], capture_output=True, text=True).stdout.lower()
+    comma = next((loc for loc in ("de_de.utf-8", "fr_fr.utf-8", "nl_nl.utf-8", "de_de.utf8", "fr_fr.utf8")
+                  if loc in avail), None)
+    if comma:
+        d = pathlib.Path(tempfile.mkdtemp()); sb = d / "bin"; sb.mkdir(); ev = d / "ev"; ev.write_text("")
+        for t in ("gcloud", "gsutil", "pkill", "sudo", "shutdown", "poweroff", "setsid"):
+            p = sb / t; p.write_text('#!/bin/sh\necho "%s" >> "%s"\nexit 0\n' % (t, ev)); p.chmod(0o755)
+        cu = sb / "curl"
+        cu.write_text('#!/bin/sh\ncase "$*" in *name*) printf vm;; *zone*) printf p/zones/z;; esac\nexit 0\n'); cu.chmod(0o755)
+        (d / "accum").write_text("201600\n")   # 56h @ $0.9/h = $50.40, cap $6.5 -> WAY over
+        env = dict(os.environ); env["PATH"] = "%s:/usr/bin:/bin:/usr/sbin:/sbin" % sb
+        env["MCP_TERRA_BUCKET"] = "gs://f"; env["MCP_TERRA_SPEND_ACCUM_FILE"] = str(d / "accum")
+        env["MCP_TERRA_MAX_COST_USD"] = "6.5"; env["MCP_TERRA_VM_HOURLY_USD"] = "0.9"; env["LC_ALL"] = comma
+        subprocess.run(["bash", "-c", "set -euo pipefail\n" + snip + "\necho RUNNER-LAUNCHED\n"],
+                       env=env, capture_output=True, text=True, timeout=20)
+        stopped = False
+        for _ in range(40):   # background monitor loop checks immediately; poll ~10s
+            if "pkill" in ev.read_text() or "gcloud" in ev.read_text():
+                stopped = True; break
+            time.sleep(0.25)
+        assert stopped, "watchdog did NOT stop an over-cap VM under locale %s (fail-open)" % comma
 
 
 # ──────────────────────────────────────────────────────────────────────────
